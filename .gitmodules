@@ -1,0 +1,3 @@
+[submodule "dcusshk8s"]
+	path = dcusshk8s
+	url = https://github.com/DCUSnSLab/dcusshk8s.git
