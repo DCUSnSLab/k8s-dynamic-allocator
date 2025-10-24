@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller
+  namespace: swlabpods
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: controller
+  template:
+    metadata:
+      labels:
+        app: controller
+    spec:
+      containers:
+      - name: controller
+        image: harbor.cu.ac.kr/k8s_dynamic_allocator/rest_api:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 9001
+        env:
+        - name: DJANGO_SETTINGS_MODULE
+          value: "config.settings"
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: controller-service
+  namespace: swlabpods
+spec:
+  selector:
+    app: controller
+  ports:
+  - protocol: TCP
+    port: 9001
+    targetPort: 9001
+  type: ClusterIP
