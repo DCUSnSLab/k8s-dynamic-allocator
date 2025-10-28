@@ -1,12 +1,19 @@
 """
 Django settings for Controller Pod REST API
-
-DB 없이 단순 요청 수신 및 로깅만 수행
 """
 
+import sys
 from pathlib import Path
 
+# BASE_DIR: rest_api/ 경로
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# CONTROLLER_DIR: controller/ 경로 (services가 있는 곳)
+CONTROLLER_DIR = BASE_DIR.parent
+
+# Python 경로에 controller/ 추가 (services import를 위해)
+if str(CONTROLLER_DIR) not in sys.path:
+    sys.path.insert(0, str(CONTROLLER_DIR))
 
 SECRET_KEY = 'django-insecure-controller-pod-secret-key-change-in-production'
 
@@ -79,5 +86,11 @@ LOGGING = {
             'level': 'DEBUG',
             'propagate': False,
         },
+        'services': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
     },
 }
+

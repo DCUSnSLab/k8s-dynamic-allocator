@@ -4,6 +4,8 @@ import json
 import logging
 from datetime import datetime
 
+from services import BackendOrchestrator
+
 logger = logging.getLogger(__name__)
 
 
@@ -11,9 +13,6 @@ logger = logging.getLogger(__name__)
 def execute_command(request):
     """
     Frontend Pod로부터 Backend Pod 실행 요청을 받는 API
-    
-    현재 단계: 요청 수신 및 로깅만 수행 (테스트용)
-    향후: services/pod_manager.py의 로직 호출 예정
     
     Request Body:
         {
@@ -25,8 +24,9 @@ def execute_command(request):
         {
             "status": "success" | "error",
             "message": "응답 메시지",
-            "received": {...},
-            "timestamp": "2025-10-22T..."
+            "pod_name": "생성된 Pod 이름",
+            "namespace": "네임스페이스",
+            "created_at": "2025-10-28T..."
         }
     """
     if request.method != 'POST':
@@ -40,35 +40,45 @@ def execute_command(request):
         username = data.get('username', '')
         command = data.get('command', '')
         
+        # 입력 검증
+        if not username:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'username은 필수입니다'
+            }, status=400)
+        
+        if not command:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'command는 필수입니다'
+            }, status=400)
+        
         logger.info("=" * 60)
-        logger.info("[Controller Pod] 새로운 요청 수신")
+        logger.info("[Controller] 새로운 Backend Pod 생성 요청 수신")
         logger.info(f"  Username: {username}")
         logger.info(f"  Command: {command}")
         logger.info(f"  Timestamp: {datetime.now().isoformat()}")
         logger.info("=" * 60)
         
-        # TODO: services/pod_manager.py 구현 후 호출
-        # from services.pod_manager import PodManager
-        # pod_manager = PodManager()
-        # result = pod_manager.create_backend_pod(username, command)
-        # return JsonResponse(result)
+        # Backend Pod 생성
+        orchestrator = BackendOrchestrator()
+        result = orchestrator.create_backend_pod(username, command)
         
-        response_data = {
-            'status': 'success',
-            'message': '요청을 정상적으로 수신했습니다 (현재는 테스트 모드)',
-            'received': {
-                'username': username,
-                'command': command
-            },
-            'timestamp': datetime.now().isoformat(),
-            'note': 'services/pod_manager.py 구현 후 실제 Pod 생성 예정'
-        }
+        # 로그 출력
+        if result['status'] == 'success':
+            logger.info(f"[Controller] Pod 생성 성공: {result.get('pod_name')}")
+        else:
+            logger.error(f"[Controller] Pod 생성 실패: {result.get('message')}")
         
-        logger.info(f"[Controller Pod] 응답 전송: {response_data['status']}")
-        return JsonResponse(response_data)
+        logger.info("=" * 60)
+        
+        # HTTP 상태 코드 결정
+        status_code = 200 if result['status'] == 'success' else 500
+        
+        return JsonResponse(result, status=status_code)
         
     except json.JSONDecodeError as e:
-        logger.error(f"[Controller Pod] JSON 파싱 에러: {str(e)}")
+        logger.error(f"[Controller] JSON 파싱 에러: {str(e)}")
         return JsonResponse({
             'status': 'error',
             'message': '잘못된 JSON 형식입니다',
@@ -76,7 +86,7 @@ def execute_command(request):
         }, status=400)
         
     except Exception as e:
-        logger.error(f"[Controller Pod] 예상치 못한 에러: {str(e)}", exc_info=True)
+        logger.error(f"[Controller] 예상치 못한 에러: {str(e)}", exc_info=True)
         return JsonResponse({
             'status': 'error',
             'message': '서버 내부 에러가 발생했습니다',
@@ -89,8 +99,16 @@ def health_check(request):
     """
     컨트롤러 Pod 헬스 체크 엔드포인트
     """
+    try:
+        orchestrator = BackendOrchestrator()
+        result = orchestrator.health_check()
+
+    except Exception as e:
+        result = "[error] " + str(e)
+
     return JsonResponse({
         'status': 'healthy',
         'service': 'Controller Pod REST API',
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat(),
+        'result': result
     })
