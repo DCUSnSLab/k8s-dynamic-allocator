@@ -13,9 +13,10 @@ spec:
       labels:
         app: controller
     spec:
+      serviceAccountName: controller-sa
       containers:
       - name: controller
-        image: harbor.cu.ac.kr/k8s_dynamic_allocator/rest_api:latest
+        image: harbor.cu.ac.kr/k8s_dynamic_allocator/rest_api:test
         imagePullPolicy: Always
         ports:
         - containerPort: 9001

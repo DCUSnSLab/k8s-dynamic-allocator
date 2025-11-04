@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: controller-sa
+  namespace: swlabpods
+  labels:
+    app: controller
+
+---
+
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: controller-role
+  namespace: swlabpods
+  labels:
+    app: controller
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/exec", "pods/portforward", "persistentvolumeclaims"]
+  verbs: ["get", "watch", "list", "create", "delete"]
+
+---
+
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: controller-rolebinding
+  namespace: swlabpods
+subjects:
+- kind: ServiceAccount
+  name: controller-sa
+  namespace: swlabpods
+roleRef:
+  kind: Role
+  name: controller-role
+  apiGroup: rbac.authorization.k8s.io
