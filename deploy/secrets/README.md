@@ -1,7 +1,7 @@
 # SSHFS 연결 테스트
 **이 가이드는 Frontend Pod와 Backend Pod 간의 SSHFS 역방향 마운트 기능을 검증하기 위한 절차입니다.**
 
-**`/k8s-dynamic-allocator/deploy/secrets/` 경로에서 진행하세요.**
+**경로 : `/k8s-dynamic-allocator/deploy/secrets/`**
 
 **namespaces : `swlabpods`**
 
@@ -12,7 +12,7 @@
 ```shell
 ssh-keygen -t rsa -b 4096 -C "backend-to-frontend" -f backend_ssh_key -N ""
 ```
-
+<br/>
 
 ### K8s 리소스 배포
 
@@ -22,13 +22,15 @@ k8s 리소스 파일(Secret, ConfigMap)은 보안 이슈로 스크립트로 배�
 chmod +x apply-secrets.sh
 ./apply-secrets.sh
 ```
+<br/>
 
--------------
+
 ## 2. 테스트용 Pod 배포
 ```shell
 k apply -f sshfs-test-pods.yaml
 ```
 
+<br/>
 
 pod 배포 결과 : `test-frontend` pod IP 확인
 ```shell
@@ -36,11 +38,13 @@ NAME                          READY   STATUS    RESTARTS      AGE     IP        
 test-backend                  1/1     Running   0          6m15s   172.31.189.72    worker2   <none>           <none>
 test-frontend                 1/1     Running   0          6m15s   172.31.189.93    worker2   <none>           <none>
 ```
---------------
+
+<br/>
+
 ## 3. 연결 테스트
 ### Backend 접속 및 마운트 시도
 ```shell
-k exec - it test-backend -- bash
+k exec -it test-backend -- bash
 ```
 
 `test-backend` 내부에서 진행
@@ -55,6 +59,8 @@ sshfs -o IdentityFile=/root/.ssh/id_rsa -o StrictHostKeyChecking=no root@<$FRONT
 ls -l /mnt/frontend
 cat /mnt/frontend/hello.txt
 ```
+<br/>
+
 `hello.txt` 파일 출력 결과가 `Hello from Frontend!` 이면 성공
 
 **실행 결과**
@@ -67,9 +73,10 @@ total 4
 root@test-backend:/# cat /mnt/frontend/hello.txt
 Hello from Frontend!
 ```
------------
+<br/>
+
 ## 테스트 종료
 ### 리소스 정리
 ```shell
-k delete pods -f sshfs-test-pods.yaml 
+k delete -f sshfs-test-pods.yaml 
 ```
