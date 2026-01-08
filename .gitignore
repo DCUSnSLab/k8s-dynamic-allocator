@@ -32,3 +32,5 @@ deploy/secrets/backend_ssh_key
 deploy/secrets/backend_ssh_key.pub
 *.pem
 *.key
+
+kubeconfig.yaml
