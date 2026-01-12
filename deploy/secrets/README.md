@@ -32,6 +32,8 @@ k apply -f sshfs-test-pods.yaml
 
 <br/>
 
+`test-frontend` pod에 SSHFS 설정이 완료되면 `Running` 상태가 됩니다. 
+
 pod 배포 결과 : `test-frontend` pod IP 확인
 ```shell
 NAME                          READY   STATUS    RESTARTS      AGE     IP               NODE      NOMINATED NODE   READINESS GATES
@@ -52,7 +54,7 @@ k exec -it test-backend -- bash
 # 마운트 포인트 생성
 mkdir -p /mnt/frontend
 
-# SSHFS 마운트 수행 (<$FRONTEND_IP>는 위에서 확인한 주소 사용)
+# SSHFS 마운트 수행 (<$FRONTEND_IP>는 `test-frontend` pod IP 사용)
 sshfs -o IdentityFile=/root/.ssh/id_rsa -o StrictHostKeyChecking=no root@<$FRONTEND_IP>:/root /mnt/frontend
 
 # 검증: Frontend에 생성된 파일 내용 확인
