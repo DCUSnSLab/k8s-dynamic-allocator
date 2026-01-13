@@ -117,7 +117,7 @@ class BackendOrchestrator:
         # Container 정의
         container = client.V1Container(
             name="backend",
-            image="ubuntu:22.04",  # 기본 이미지 (나중에 커스텀 이미지로 변경 가능)
+            image="harbor.cu.ac.kr/k8s_dynamic_allocator/backend:latest",
             command=["/bin/bash", "-c"],
             args=[command],
             resources=client.V1ResourceRequirements(
