@@ -1,0 +1,149 @@
+# dcusshk8s Frontend Pod 테스트용 YAML (PVC + SSH 설정 포함)
+# 이 파일로 먼저 테스트 후, 문제없으면 pod.py에 적용
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ssh-test-frontend-pvc
+  namespace: swlabpods
+spec:
+  accessModes: ["ReadWriteOnce"]
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: openebs-hostpath
+
+---
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ssh-test-frontend
+  namespace: swlabpods
+  labels:
+    kubessh: userpods
+spec:
+  automountServiceAccountToken: false
+  nodeSelector:
+    kubessh: general_node
+  
+  initContainers:
+  - name: init-setup
+    image: harbor.cu.ac.kr/swlabpods/dbuntu:sshfs-test
+    imagePullPolicy: Always
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      mkdir -p /mnt/usr /mnt/lib /mnt/etc /mnt/var/lib/dpkg /mnt/var/lib/apt /mnt/var/cache/apt /mnt/home;
+      if [ ! -f /mnt/usr/bin/bash ]; then
+        cp -a /usr/* /mnt/usr/;
+        cp -a /lib/* /mnt/lib/;
+        cp -a /etc/* /mnt/etc/;
+        cp -a /var/* /mnt/var/;
+        chmod 4755 /mnt/usr/bin/sudo;
+      fi;
+      chmod 755 /mnt /mnt/home /mnt/usr /mnt/lib /mnt/etc /mnt/var
+    env:
+    - name: PATH
+      value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    securityContext:
+      runAsUser: 0
+    volumeMounts:
+    - name: poddata
+      mountPath: /mnt/usr
+      subPath: usr
+    - name: poddata
+      mountPath: /mnt/lib
+      subPath: lib
+    - name: poddata
+      mountPath: /mnt/etc
+      subPath: etc
+    - name: poddata
+      mountPath: /mnt/var
+      subPath: var
+    - name: poddata
+      mountPath: /mnt/home
+      subPath: home
+
+  containers:
+  - name: shell
+    image: harbor.cu.ac.kr/swlabpods/dbuntu:sshfs-test
+    imagePullPolicy: Always
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      sudo chown dcuuser:dcuuser /home/dcuuser;
+      cp -n /etc/skel/.* /home/dcuuser/;
+      if [ ! -f /home/dcuuser/.vimrc ]; then
+        echo -e 'if has ("syntax")\n    syntax on\nendif\n\nset autoindent\nset cindent\nset nu\n\nset smartindent\nset tabstop=4\nset shiftwidth=4' > /home/dcuuser/.vimrc;
+      fi;
+      
+      # ========== SSH 설정 (PVC의 /etc에 대해 런타임 수정) ==========
+      # sshd_config 수정 (PVC에서 온 기존 설정 덮어쓰기)
+      sudo sed -i 's/UsePAM yes/UsePAM no/g' /etc/ssh/sshd_config;
+      sudo sed -i '/Subsystem sftp/d' /etc/ssh/sshd_config;
+      echo "Subsystem sftp /usr/lib/openssh/sftp-server" | sudo tee -a /etc/ssh/sshd_config;
+      echo "PubkeyAuthentication yes" | sudo tee -a /etc/ssh/sshd_config;
+      echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config;
+      
+      # SSH 키 설정
+      sudo mkdir -p /home/dcuuser/.ssh;
+      sudo cp /etc/ssh-key-source/id_rsa.pub /home/dcuuser/.ssh/authorized_keys;
+      sudo chown -R dcuuser:dcuuser /home/dcuuser/.ssh;
+      sudo chmod 700 /home/dcuuser/.ssh;
+      sudo chmod 600 /home/dcuuser/.ssh/authorized_keys;
+      
+      # sshd 시작
+      sudo /usr/sbin/sshd;
+      echo "[SSH] sshd started successfully";
+      
+      # 대기 상태 유지
+      while true; do sleep 10; done
+    env:
+    - name: PATH
+      value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: POD_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.podIP
+    stdin: true
+    tty: true
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "150Mi"
+      limits:
+        cpu: "100m"
+        memory: "200Mi"
+    volumeMounts:
+    - name: poddata
+      mountPath: /usr
+      subPath: usr
+    - name: poddata
+      mountPath: /lib
+      subPath: lib
+    - name: poddata
+      mountPath: /etc
+      subPath: etc
+    - name: poddata
+      mountPath: /var
+      subPath: var
+    - name: poddata
+      mountPath: /home
+      subPath: home
+    - name: ssh-public-key
+      mountPath: /etc/ssh-key-source
+      readOnly: true
+
+  volumes:
+  - name: poddata
+    persistentVolumeClaim:
+      claimName: ssh-test-frontend-pvc
+  - name: ssh-public-key
+    configMap:
+      name: backend-public-key

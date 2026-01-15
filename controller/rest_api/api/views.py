@@ -17,7 +17,8 @@ def execute_command(request):
     Request Body:
         {
             "username": "사용자명",
-            "command": "실행할 명령어"
+            "command": "실행할 명령어",
+            "frontend_pod": "Frontend Pod 이름"
         }
     
     Response:
@@ -39,6 +40,7 @@ def execute_command(request):
         data = json.loads(request.body)
         username = data.get('username', '')
         command = data.get('command', '')
+        frontend_pod = data.get('frontend_pod', '')
         
         # 입력 검증
         if not username:
@@ -57,12 +59,13 @@ def execute_command(request):
         logger.info("[Controller] 새로운 Backend Pod 생성 요청 수신")
         logger.info(f"  Username: {username}")
         logger.info(f"  Command: {command}")
+        logger.info(f"  Frontend Pod: {frontend_pod}")
         logger.info(f"  Timestamp: {datetime.now().isoformat()}")
         logger.info("=" * 60)
         
         # Backend Pod 생성
         orchestrator = BackendOrchestrator()
-        result = orchestrator.create_backend_pod(username, command)
+        result = orchestrator.create_backend_pod(username, command, frontend_pod)
         
         # 로그 출력
         if result['status'] == 'success':
