@@ -1,18 +1,31 @@
-FROM python:3.6.8-alpine
+FROM python:3.11-alpine
 
-WORKDIR /root
+WORKDIR /app
 
-RUN apk add build-base
-# RUN apk add pip
-RUN apk add libffi-dev
-RUN apk add openssh-keygen
-RUN apk add vim
-RUN apk add curl
+# 시스템 패키지 설치
+RUN apk add --no-cache \
+    build-base \
+    libffi-dev \
+    openssh-keygen \
+    vim \
+    curl \
+    sshfs \
+    bash \
+    fuse
 
-RUN apk add sshfs bash
+# Python 의존성 설치
+COPY backend_agent/requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-RUN pip install --upgrade pip
+# Agent 코드 복사
+COPY backend_agent/ .
 
-RUN curl -L https://storage.googleapis.com/kubernetes-release/release/v1.16.0/bin/linux/amd64/kubectl > /usr/local/bin/kubectl
-RUN chmod +x /usr/local/bin/kubectl
+# 마운트 포인트 생성
+RUN mkdir -p /mnt/frontend /root/.ssh
 
+# Agent 포트 노출
+EXPOSE 8080
+
+# Agent 서버 실행
+CMD ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "8080"]
