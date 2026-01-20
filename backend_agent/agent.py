@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from mount_manager import MountManager
@@ -37,7 +38,18 @@ mount_manager = MountManager()
 task_executor = TaskExecutor()
 
 
-# === Request/Response 모델 ===
+class FormattedJSONResponse(JSONResponse):
+    """들여쓰기된 JSON 응답 (끝에 줄바꿈 포함)"""
+    def render(self, content) -> bytes:
+        import json
+        return (json.dumps(
+            content,
+            indent=2,
+            ensure_ascii=False
+        ) + "\n").encode("utf-8")
+
+
+# Request/Response 모델
 
 class MountRequest(BaseModel):
     """마운트 요청"""
@@ -51,23 +63,13 @@ class MountResponse(BaseModel):
     message: Optional[str] = None
 
 
-class StatusResponse(BaseModel):
-    """상태 응답"""
-    status: str  # idle, mounting, running, completed, error
-    frontend_ip: Optional[str] = None
-    command: Optional[str] = None
-    result: Optional[str] = None
-    started_at: Optional[str] = None
-    completed_at: Optional[str] = None
-
-
 class UnmountResponse(BaseModel):
     """마운트 해제 응답"""
     status: str
     message: Optional[str] = None
 
 
-# === 상태 관리 ===
+# 상태 관리
 
 class AgentState:
     """Agent 상태 관리"""
@@ -128,37 +130,57 @@ class AgentState:
 state = AgentState()
 
 
-# === API 엔드포인트 ===
+# API 엔드포인트
 
 @app.get("/")
 async def root():
     """루트 엔드포인트"""
-    return {"service": "Backend Agent", "status": "running"}
+    return FormattedJSONResponse({
+        "service": "Backend Agent",
+        "status": "running"
+    })
 
 
-@app.get("/status", response_model=StatusResponse)
+@app.get("/status")
 async def get_status():
     """
     Agent 상태 조회
     
-    Returns:
-        StatusResponse: 현재 상태
+    결과에 개행 문자가 포함된 경우 읽기 쉽게 표시
     """
-    return StatusResponse(**state.to_dict())
+    data = state.to_dict()
+    return FormattedJSONResponse(data)
 
 
-@app.post("/mount", response_model=MountResponse)
+@app.get("/result")
+async def get_result():
+    """
+    실행 결과만 plain text로 반환
+    
+    터미널에서 직접 실행한 것처럼 결과 확인 가능
+    """
+    from fastapi.responses import PlainTextResponse
+    
+    if state.result is None:
+        return PlainTextResponse(
+            content="(결과 없음)\n",
+            status_code=200
+        )
+    
+    # 결과 끝에 줄바꿈 추가
+    result_text = state.result
+    if not result_text.endswith("\n"):
+        result_text += "\n"
+    
+    return PlainTextResponse(content=result_text, status_code=200)
+
+
+@app.post("/mount")
 async def mount(request: MountRequest):
     """
     Frontend에 SSHFS 마운트 및 명령 실행
     
     비동기로 실행되며 즉시 반환
-    
-    Args:
-        request: 마운트 요청 (frontend_ip, command)
-        
-    Returns:
-        MountResponse: 요청 수락 응답
     """
     if state.status not in ["idle", "completed", "error"]:
         raise HTTPException(
@@ -166,87 +188,107 @@ async def mount(request: MountRequest):
             detail=f"Agent is busy (status: {state.status})"
         )
     
-    logger.info(f"Mount request received: frontend={request.frontend_ip}, command={request.command}")
+    logger.info("=" * 50)
+    logger.info("[Agent] 마운트 요청 수신")
+    logger.info(f"  Frontend IP: {request.frontend_ip}")
+    logger.info(f"  Command: {request.command}")
+    logger.info("=" * 50)
     
     # 백그라운드 태스크로 실행
     asyncio.create_task(execute_mount_and_run(request.frontend_ip, request.command))
     
-    return MountResponse(status="accepted", message="Mount and execute task started")
+    return FormattedJSONResponse({
+        "status": "accepted",
+        "message": "Mount and execute task started",
+        "frontend_ip": request.frontend_ip,
+        "command": request.command
+    })
 
 
-@app.post("/unmount", response_model=UnmountResponse)
+@app.post("/unmount")
 async def unmount():
     """
     SSHFS 마운트 해제 및 상태 초기화
-    
-    Returns:
-        UnmountResponse: 마운트 해제 결과
     """
-    logger.info("Unmount request received")
+    logger.info("[Agent] 마운트 해제 요청 수신")
     
     try:
-        # 마운트 해제
         success = await mount_manager.unmount()
         
         if success:
             await state.reset()
-            return UnmountResponse(status="success", message="Unmounted and reset")
+            return FormattedJSONResponse({
+                "status": "success",
+                "message": "Unmounted and reset"
+            })
         else:
-            return UnmountResponse(status="warning", message="Unmount completed with warnings")
+            return FormattedJSONResponse({
+                "status": "warning",
+                "message": "Unmount completed with warnings"
+            })
     except Exception as e:
         logger.error(f"Unmount error: {e}")
-        return UnmountResponse(status="error", message=str(e))
+        return FormattedJSONResponse({
+            "status": "error",
+            "message": str(e)
+        })
 
 
-# === 백그라운드 태스크 ===
+# 백그라운드 태스크
 
 async def execute_mount_and_run(frontend_ip: str, command: str):
     """
     마운트 및 명령 실행 (백그라운드)
-    
-    Args:
-        frontend_ip: Frontend Pod IP
-        command: 실행할 명령어
     """
     try:
         # 1. 상태 업데이트: mounting
         await state.set_mounting(frontend_ip, command)
+        logger.info("[Agent] Step 1: 마운트 시작...")
         
         # 2. SSHFS 마운트
-        logger.info(f"Mounting frontend: {frontend_ip}")
         mount_success = await mount_manager.mount(frontend_ip)
         
         if not mount_success:
+            logger.error("[Agent] 마운트 실패!")
             await state.set_error("SSHFS mount failed")
             return
         
+        logger.info("[Agent] Step 2: 마운트 성공")
+        
         # 3. 상태 업데이트: running
         await state.set_running()
+        logger.info("[Agent] Step 3: 명령 실행 중...")
+        logger.info(f"  Command: {command}")
         
         # 4. 명령 실행
-        logger.info(f"Executing command: {command}")
         result = await task_executor.execute(command, cwd="/mnt/frontend")
         
         # 5. 상태 업데이트: completed
         await state.set_completed(result)
-        logger.info(f"Command completed: {result[:100]}...")
+        
+        logger.info("[Agent] Step 4: 명령 실행 완료")
+        logger.info("-" * 50)
+        logger.info("[Result]")
+        logger.info(result)
+        logger.info("-" * 50)
         
     except Exception as e:
-        logger.error(f"Execute error: {e}")
+        logger.error(f"[Agent] 실행 에러: {e}")
         await state.set_error(str(e))
 
 
-# === 시작 시 초기화 ===
+# 시작 시 초기화
 
 @app.on_event("startup")
 async def startup():
     """앱 시작 시 초기화"""
-    logger.info("Backend Agent starting...")
+    logger.info("=" * 50)
+    logger.info("[Agent] Backend Agent 시작")
     
-    # SSH 키 설정
     mount_manager.setup_ssh_key()
     
-    logger.info("Backend Agent ready")
+    logger.info("[Agent] 준비 완료")
+    logger.info("=" * 50)
 
 
 if __name__ == "__main__":

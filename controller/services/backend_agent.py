@@ -12,7 +12,6 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
-# === 설정 상수 ===
 AGENT_PORT = 8080
 AGENT_TIMEOUT = 30.0  # 초
 

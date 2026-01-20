@@ -16,7 +16,6 @@ from .kubernetes_client import KubernetesClient
 logger = logging.getLogger(__name__)
 
 
-# === 설정 상수 ===
 POOL_SIZE = 3
 POOL_PREFIX = "backend-pool"
 BACKEND_IMAGE = "harbor.cu.ac.kr/k8s_dynamic_allocator/backend:latest"
@@ -61,7 +60,7 @@ class BackendPool(KubernetesClient):
         results = {"created": [], "existing": [], "failed": []}
         
         for i in range(self.pool_size):
-            pod_name = f"{self.pool_prefix}-{i}"
+            pod_name = f"{self.pool_prefix}-{i + 1}"
             
             if self.pod_exists(pod_name):
                 logger.info(f"Pool pod {pod_name} already exists")
@@ -110,7 +109,7 @@ class BackendPool(KubernetesClient):
                 logger.warning("No available pool pods found")
                 return None
             
-            # 현재는 첫 번째 Pod 반환 (향후: 선택 알고리즘 적용)
+            # [임시] 첫 번째 Pod 반환
             selected_pod = running_pods[0].metadata.name
             logger.info(f"Selected available pod: {selected_pod}")
             return selected_pod
@@ -206,14 +205,13 @@ class BackendPool(KubernetesClient):
         Pool Pod 스펙 생성
         
         Args:
-            index: Pod 인덱스 (이름에 사용)
+            index: Pod 인덱스
             
         Returns:
             V1Pod: Kubernetes Pod 스펙
         """
         pod_name = f"{self.pool_prefix}-{index}"
         
-        # Container 정의 (Agent 서버 실행)
         container = client.V1Container(
             name="backend-agent",
             image=self.backend_image,
@@ -226,7 +224,7 @@ class BackendPool(KubernetesClient):
                 limits={"cpu": "500m", "memory": "512Mi"}
             ),
             security_context=client.V1SecurityContext(
-                privileged=True  # FUSE 마운트에 필요
+                privileged=True
             ),
             volume_mounts=[
                 client.V1VolumeMount(
@@ -237,7 +235,6 @@ class BackendPool(KubernetesClient):
             ]
         )
         
-        # SSH 개인키 볼륨 (Secret)
         ssh_key_volume = client.V1Volume(
             name="ssh-private-key",
             secret=client.V1SecretVolumeSource(
@@ -245,8 +242,7 @@ class BackendPool(KubernetesClient):
                 default_mode=0o600
             )
         )
-        
-        # Pod 메타데이터 (Pool Label 포함)
+
         metadata = client.V1ObjectMeta(
             name=pod_name,
             labels={
@@ -257,11 +253,10 @@ class BackendPool(KubernetesClient):
             }
         )
         
-        # Pod 스펙
         spec = client.V1PodSpec(
             containers=[container],
             volumes=[ssh_key_volume],
-            restart_policy="Always"  # Agent 서버 유지
+            restart_policy="Always"
         )
         
         return client.V1Pod(
