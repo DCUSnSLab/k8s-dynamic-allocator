@@ -1,31 +1,17 @@
-FROM python:3.11-alpine
+FROM alpine:3.18
 
-WORKDIR /app
-
-# 시스템 패키지 설치
+# 시스템 패키지 설치 (sshfs + fuse만)
 RUN apk add --no-cache \
-    build-base \
-    libffi-dev \
-    openssh-keygen \
-    vim \
-    curl \
     sshfs \
+    fuse \
     bash \
-    fuse
-
-# Python 의존성 설치
-COPY backend_agent/requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
-# Agent 코드 복사
-COPY backend_agent/ .
+    openssh-client
 
 # 마운트 포인트 생성
-RUN mkdir -p /mnt/frontend /root/.ssh
+RUN mkdir -p /mnt/rootfs /root/.ssh
 
-# Agent 포트 노출
-EXPOSE 8080
+# FUSE 설정
+RUN echo "user_allow_other" >> /etc/fuse.conf
 
-# Agent 서버 실행
-CMD ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "8080"]
+# 대기 상태 유지 (kubectl exec 대기)
+CMD ["tail", "-f", "/dev/null"]

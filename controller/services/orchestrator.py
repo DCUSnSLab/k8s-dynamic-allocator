@@ -1,16 +1,16 @@
 """
 Orchestrator
 
-Backend Pool과 Agent를 조율하는 메인 Orchestrator 클래스
-모든 Backend 관련 요청의 진입점
+Backend Pool을 조율하는 메인 Orchestrator 클래스
+kubectl exec 기반으로 마운트/실행 관리
 """
 
 import logging
+import subprocess
 from datetime import datetime
 from typing import Dict
 
 from .backend_pool import BackendPool
-from .backend_agent import BackendAgent
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +20,8 @@ class Orchestrator:
     Backend Pod 조율 Orchestrator
     
     - Pool에서 사용 가능한 Pod 선택
-    - Agent에 마운트/실행 요청
-    - 작업 상태 관리
+    - kubectl exec로 마운트/언마운트
+    - Interactive 세션 관리
     """
     
     def __init__(self):
@@ -36,8 +36,6 @@ class Orchestrator:
         """
         Backend Pool 초기화
         
-        Controller 시작 시 호출하여 Pool Pod 생성
-        
         Returns:
             Dict: 초기화 결과
         """
@@ -46,24 +44,22 @@ class Orchestrator:
         logger.info(f"Pool initialization result: {result}")
         return result
     
-    def execute_command(self, username: str, command: str, frontend_pod: str) -> Dict:
+    def interactive_start(self, frontend_pod: str) -> Dict:
         """
-        Backend Pod에서 명령 실행
+        Interactive 세션 시작
         
         1. Pool에서 사용 가능한 Pod 선택
         2. Pod를 Frontend에 할당
-        3. Agent에 마운트 및 실행 요청
+        3. kubectl exec로 SSHFS 마운트 (루트 전체)
         
         Args:
-            username: 사용자명
-            command: 실행할 명령어
             frontend_pod: Frontend Pod 이름
             
         Returns:
-            Dict: 실행 결과
+            Dict: backend_pod, pod_ip 포함
         """
         try:
-            logger.info(f"Execute request: user={username}, command={command}, frontend={frontend_pod}")
+            logger.info(f"Interactive start: frontend={frontend_pod}")
             
             # 1. Frontend Pod IP 조회
             frontend_ip = self.pool.get_pod_ip(frontend_pod)
@@ -78,7 +74,7 @@ class Orchestrator:
             if not backend_pod:
                 return {
                     "status": "error",
-                    "message": "사용 가능한 Backend Pod가 없습니다. 잠시 후 다시 시도해주세요."
+                    "message": "사용 가능한 Backend Pod가 없습니다"
                 }
             
             # 3. Pod 할당 (Label 업데이트)
@@ -91,47 +87,129 @@ class Orchestrator:
             # 4. Backend Pod IP 조회
             backend_ip = self.pool.get_pod_ip(backend_pod)
             if not backend_ip:
-                # 할당 롤백
                 self.pool.release_pod(backend_pod)
                 return {
                     "status": "error",
                     "message": f"Backend Pod '{backend_pod}'의 IP를 찾을 수 없습니다"
                 }
             
-            # 5. Agent 클라이언트 생성 및 마운트 요청
-            agent = BackendAgent(backend_ip)
-            try:
-                agent_response = agent.mount(frontend_ip, command)
-            finally:
-                agent.close()
-            
-            if agent_response.get("status") == "error":
-                # 할당 롤백
+            # 5. kubectl exec로 SSHFS 마운트
+            mount_result = self._mount_frontend(backend_pod, frontend_ip)
+            if not mount_result["success"]:
                 self.pool.release_pod(backend_pod)
                 return {
                     "status": "error",
-                    "message": f"Agent 요청 실패: {agent_response.get('message')}"
+                    "message": f"마운트 실패: {mount_result['error']}"
                 }
             
-            logger.info(f"Command submitted to backend {backend_pod}")
+            logger.info(f"Interactive session started: {backend_pod} -> {frontend_pod}")
             
             return {
                 "status": "success",
-                "message": "Backend Pod에 명령이 전달되었습니다",
+                "message": "Interactive 세션이 시작되었습니다",
                 "backend_pod": backend_pod,
                 "backend_ip": backend_ip,
                 "frontend_pod": frontend_pod,
                 "frontend_ip": frontend_ip,
-                "command": command,
-                "submitted_at": datetime.now().isoformat()
+                "started_at": datetime.now().isoformat()
             }
             
         except Exception as e:
-            logger.error(f"Unexpected error in execute_command: {e}", exc_info=True)
+            logger.error(f"Error in interactive_start: {e}", exc_info=True)
             return {
                 "status": "error",
                 "message": f"예상치 못한 에러: {str(e)}"
             }
+    
+    def interactive_end(self, backend_pod: str) -> Dict:
+        """
+        Interactive 세션 종료
+        
+        1. kubectl exec로 SSHFS 언마운트
+        2. Pool로 반환
+        
+        Args:
+            backend_pod: Backend Pod 이름
+            
+        Returns:
+            Dict: 해제 결과
+        """
+        try:
+            logger.info(f"Interactive end: backend={backend_pod}")
+            
+            # 1. kubectl exec로 언마운트
+            self._unmount_frontend(backend_pod)
+            
+            # 2. Pool로 반환
+            if self.pool.release_pod(backend_pod):
+                return {
+                    "status": "success",
+                    "message": f"Backend Pod '{backend_pod}'가 Pool로 반환되었습니다"
+                }
+            else:
+                return {
+                    "status": "error",
+                    "message": f"Backend Pod '{backend_pod}' 해제 실패"
+                }
+                
+        except Exception as e:
+            logger.error(f"Error in interactive_end: {e}", exc_info=True)
+            return {
+                "status": "error",
+                "message": str(e)
+            }
+    
+    def _mount_frontend(self, backend_pod: str, frontend_ip: str) -> Dict:
+        """
+        kubectl exec로 SSHFS 마운트
+        
+        Frontend 루트 전체를 /mnt/rootfs에 마운트
+        """
+        namespace = self.pool.namespace
+        mount_cmd = (
+            f"mkdir -p /mnt/rootfs && "
+            f"sshfs -o StrictHostKeyChecking=no,allow_other "
+            f"dcuuser@{frontend_ip}:/ /mnt/rootfs"
+        )
+        
+        try:
+            result = subprocess.run(
+                ["kubectl", "exec", "-n", namespace, backend_pod, "--", "sh", "-c", mount_cmd],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"Mount successful: {backend_pod} -> {frontend_ip}")
+                return {"success": True}
+            else:
+                logger.error(f"Mount failed: {result.stderr}")
+                return {"success": False, "error": result.stderr}
+                
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Mount timeout"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    def _unmount_frontend(self, backend_pod: str) -> bool:
+        """
+        kubectl exec로 SSHFS 언마운트
+        """
+        namespace = self.pool.namespace
+        unmount_cmd = "fusermount -uz /mnt/rootfs || umount -l /mnt/rootfs || true"
+        
+        try:
+            subprocess.run(
+                ["kubectl", "exec", "-n", namespace, backend_pod, "--", "sh", "-c", unmount_cmd],
+                capture_output=True,
+                timeout=10
+            )
+            logger.info(f"Unmount completed: {backend_pod}")
+            return True
+        except Exception as e:
+            logger.error(f"Unmount error: {e}")
+            return False
     
     def get_pool_status(self) -> Dict:
         """
@@ -154,40 +232,6 @@ class Orchestrator:
     
     def release_backend(self, backend_pod: str) -> Dict:
         """
-        Backend Pod 할당 해제
-        
-        작업 완료 후 호출하여 Pod를 Pool로 반환
-        
-        Args:
-            backend_pod: Backend Pod 이름
-            
-        Returns:
-            Dict: 해제 결과
+        Backend Pod 할당 해제 (interactive_end와 동일)
         """
-        try:
-            # Pod IP 조회하여 Agent에 unmount 요청
-            backend_ip = self.pool.get_pod_ip(backend_pod)
-            if backend_ip:
-                agent = BackendAgent(backend_ip)
-                try:
-                    agent.unmount()
-                finally:
-                    agent.close()
-            
-            # Pool로 반환
-            if self.pool.release_pod(backend_pod):
-                return {
-                    "status": "success",
-                    "message": f"Backend Pod '{backend_pod}'가 Pool로 반환되었습니다"
-                }
-            else:
-                return {
-                    "status": "error",
-                    "message": f"Backend Pod '{backend_pod}' 해제 실패"
-                }
-        except Exception as e:
-            logger.error(f"Error releasing backend {backend_pod}: {e}")
-            return {
-                "status": "error",
-                "message": str(e)
-            }
+        return self.interactive_end(backend_pod)
