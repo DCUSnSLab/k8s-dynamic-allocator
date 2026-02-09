@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 POOL_SIZE = 3
 POOL_PREFIX = "backend-pool"
-BACKEND_IMAGE = "harbor.cu.ac.kr/k8s_dynamic_allocator/backend:latest"
+BACKEND_IMAGE = "harbor.cu.ac.kr/k8s_dynamic_allocator/backend:interactive"
 
 
 class BackendPool(KubernetesClient):

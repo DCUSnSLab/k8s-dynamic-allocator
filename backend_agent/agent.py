@@ -260,8 +260,8 @@ async def execute_mount_and_run(frontend_ip: str, command: str):
         logger.info("[Agent] Step 3: 명령 실행 중...")
         logger.info(f"  Command: {command}")
         
-        # 4. 명령 실행
-        result = await task_executor.execute(command, cwd="/mnt/frontend")
+        # 4. 명령 실행 (PTY + 파일 I/O)
+        result = await task_executor.execute_interactive(command, cwd="/mnt/frontend")
         
         # 5. 상태 업데이트: completed
         await state.set_completed(result)
