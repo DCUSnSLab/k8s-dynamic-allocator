@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from mount_manager import MountManager
 from task_executor import TaskExecutor
+from tcp_terminal import tcp_terminal
 
 # 로깅 설정
 logging.basicConfig(
@@ -178,9 +179,7 @@ async def get_result():
 @app.post("/mount")
 async def mount(request: MountRequest):
     """
-    Frontend에 SSHFS 마운트 및 명령 실행
-    
-    비동기로 실행되며 즉시 반환
+    Frontend에 SSHFS 마운트 (명령 실행은 TCP 서버에서 처리)
     """
     if state.status not in ["idle", "completed", "error"]:
         raise HTTPException(
@@ -194,14 +193,29 @@ async def mount(request: MountRequest):
     logger.info(f"  Command: {request.command}")
     logger.info("=" * 50)
     
-    # 백그라운드 태스크로 실행
-    asyncio.create_task(execute_mount_and_run(request.frontend_ip, request.command))
+    # 상태 업데이트
+    await state.set_mounting(request.frontend_ip, request.command)
+    logger.info("[Agent] Step 1: 마운트 시작...")
+    
+    # SSHFS 마운트 (동기 실행)
+    mount_success = await mount_manager.mount(request.frontend_ip)
+    
+    if not mount_success:
+        logger.error("[Agent] 마운트 실패!")
+        await state.set_error("SSHFS mount failed")
+        return FormattedJSONResponse({
+            "status": "error",
+            "message": "SSHFS mount failed"
+        }, status_code=500)
+    
+    logger.info("[Agent] Step 2: 마운트 성공")
+    await state.set_running()
     
     return FormattedJSONResponse({
-        "status": "accepted",
-        "message": "Mount and execute task started",
+        "status": "success",
+        "message": "Mount completed, ready for TCP connection",
         "frontend_ip": request.frontend_ip,
-        "command": request.command
+        "tcp_port": 8081
     })
 
 
@@ -287,8 +301,18 @@ async def startup():
     
     mount_manager.setup_ssh_key()
     
+    # TCP 터미널 서버 시작
+    await tcp_terminal.start()
+    
     logger.info("[Agent] 준비 완료")
     logger.info("=" * 50)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """앱 종료 시 정리"""
+    await tcp_terminal.stop()
+    logger.info("[Agent] Backend Agent 종료")
 
 
 if __name__ == "__main__":
