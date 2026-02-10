@@ -16,7 +16,7 @@ spec:
       serviceAccountName: controller-sa
       containers:
       - name: controller
-        image: harbor.cu.ac.kr/k8s_dynamic_allocator/controller:interactive
+        image: harbor.cu.ac.kr/k8s_dynamic_allocator/controller:session-mgmt
         imagePullPolicy: Always
         ports:
         - containerPort: 9001

@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 POOL_SIZE = 3
 POOL_PREFIX = "backend-pool"
-BACKEND_IMAGE = "harbor.cu.ac.kr/k8s_dynamic_allocator/backend:interactive"
+BACKEND_IMAGE = "harbor.cu.ac.kr/k8s_dynamic_allocator/backend:session-mgmt"
 
 
 class BackendPool(KubernetesClient):
@@ -215,6 +215,7 @@ class BackendPool(KubernetesClient):
         container = client.V1Container(
             name="backend-agent",
             image=self.backend_image,
+            image_pull_policy="Always",
             command=["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "8080"],
             ports=[
                 client.V1ContainerPort(container_port=8080, name="agent")
