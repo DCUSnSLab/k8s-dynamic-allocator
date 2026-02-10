@@ -26,6 +26,7 @@ RUN mkdir -p /mnt/frontend /root/.ssh
 
 # Agent 포트 노출
 EXPOSE 8080
+EXPOSE 8081
 
 # Agent 서버 실행
 CMD ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "8080"]

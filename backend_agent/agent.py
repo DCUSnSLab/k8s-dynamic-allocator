@@ -17,7 +17,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from mount_manager import MountManager
-from task_executor import TaskExecutor
 from tcp_terminal import tcp_terminal
 
 # 로깅 설정
@@ -36,7 +35,6 @@ app = FastAPI(
 
 # 컴포넌트 인스턴스
 mount_manager = MountManager()
-task_executor = TaskExecutor()
 
 
 class FormattedJSONResponse(JSONResponse):
@@ -247,48 +245,6 @@ async def unmount():
             "message": str(e)
         })
 
-
-# 백그라운드 태스크
-
-async def execute_mount_and_run(frontend_ip: str, command: str):
-    """
-    마운트 및 명령 실행 (백그라운드)
-    """
-    try:
-        # 1. 상태 업데이트: mounting
-        await state.set_mounting(frontend_ip, command)
-        logger.info("[Agent] Step 1: 마운트 시작...")
-        
-        # 2. SSHFS 마운트
-        mount_success = await mount_manager.mount(frontend_ip)
-        
-        if not mount_success:
-            logger.error("[Agent] 마운트 실패!")
-            await state.set_error("SSHFS mount failed")
-            return
-        
-        logger.info("[Agent] Step 2: 마운트 성공")
-        
-        # 3. 상태 업데이트: running
-        await state.set_running()
-        logger.info("[Agent] Step 3: 명령 실행 중...")
-        logger.info(f"  Command: {command}")
-        
-        # 4. 명령 실행 (PTY + 파일 I/O)
-        result = await task_executor.execute_interactive(command, cwd="/mnt/frontend")
-        
-        # 5. 상태 업데이트: completed
-        await state.set_completed(result)
-        
-        logger.info("[Agent] Step 4: 명령 실행 완료")
-        logger.info("-" * 50)
-        logger.info("[Result]")
-        logger.info(result)
-        logger.info("-" * 50)
-        
-    except Exception as e:
-        logger.error(f"[Agent] 실행 에러: {e}")
-        await state.set_error(str(e))
 
 
 # 시작 시 초기화

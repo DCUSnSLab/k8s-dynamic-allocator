@@ -120,6 +120,7 @@ class Orchestrator:
                 "message": "Backend Pod에 명령이 전달되었습니다",
                 "backend_pod": backend_pod,
                 "backend_ip": backend_ip,
+                "tcp_port": 8081,
                 "frontend_pod": frontend_pod,
                 "frontend_ip": frontend_ip,
                 "command": command,
