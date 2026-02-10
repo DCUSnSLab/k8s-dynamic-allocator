@@ -166,9 +166,16 @@ class TCPTerminalServer:
             # SSHFS 전체 마운트된 Frontend 경로 우선 참조
             f_usr = "/mnt/f/usr"
             f_lib = "/mnt/f/lib"
-            f_home = "/mnt/f/home"
+            
+            # 주의: MOUNTS[0]이 ("/home/dcuuser", "/mnt/frontend") 이므로
+            # 홈 디렉토리의 로컬 경로는 /mnt/frontend 입니다.
+            f_home = "/mnt/frontend"
+
             if os.path.isdir(f_usr):
                 env["PATH"] = f"{f_usr}/local/bin:{f_usr}/bin:{env.get('PATH', '')}"
+                # /lib 마운트가 실패할 수 있으므로 /mnt/f/lib가 존재할 때만 추가하거나,
+                # /usr/lib가 있으므로 /lib는 제외할 수도 있음.
+                # 일단 /mnt/f/lib를 포함하되, 존재하지 않아도 ld가 무시함.
                 env["LD_LIBRARY_PATH"] = f"{f_usr}/local/lib:{f_usr}/lib:{f_lib}"
                 cwd = f_home
                 env["HOME"] = f_home

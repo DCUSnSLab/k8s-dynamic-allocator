@@ -178,11 +178,20 @@ class MountManager:
 
         # 역순으로 해제 (시스템 디렉토리 먼저, 홈 마지막)
         for remote_path, local_path in reversed(self.MOUNTS):
+            # 마운트되어 있는지 확인
+            if not os.path.ismount(local_path):
+                logger.info(f"Skipping unmount for {local_path} (not mounted)")
+                continue
+
             if not await self._fusermount(local_path):
                 # 강제 해제 시도
                 if not await self._fusermount(local_path, force=True):
-                    all_success = False
-                    logger.error(f"Failed to unmount {local_path}")
+                    # 홈 디렉토리(필수) 해제 실패 시에만 실패로 간주
+                    if local_path == self.MOUNTS[0][1]:
+                        all_success = False
+                        logger.error(f"Failed to unmount critical path {local_path}")
+                    else:
+                        logger.warning(f"Failed to unmount optional path {local_path}")
                 else:
                     logger.info(f"Force unmounted {local_path}")
             else:
