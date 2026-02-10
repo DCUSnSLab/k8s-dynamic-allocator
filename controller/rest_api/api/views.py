@@ -198,3 +198,36 @@ def release_backend(request):
             'status': 'error',
             'message': str(e)
         }, status=500)
+
+
+@csrf_exempt
+def check_stale(request):
+    """
+    비정상 할당 감지 및 자동 해제
+
+    K8s API로 할당된 Backend의 Frontend Pod 상태를 확인하여
+    존재하지 않거나 Running이 아닌 Frontend에 할당된 Backend를 해제
+    """
+    if request.method != 'POST':
+        return json_response({
+            'status': 'error',
+            'message': 'POST 메서드만 지원합니다'
+        }, status=405)
+
+    try:
+        result = orchestrator.check_stale_allocations()
+        logger.info(
+            f"[Controller] Stale check: {result['checked']} checked, "
+            f"{len(result['released'])} released"
+        )
+        return json_response({
+            'status': 'success',
+            **result
+        })
+    except Exception as e:
+        logger.error(f"[Controller] Stale check 에러: {str(e)}", exc_info=True)
+        return json_response({
+            'status': 'error',
+            'message': str(e)
+        }, status=500)
+

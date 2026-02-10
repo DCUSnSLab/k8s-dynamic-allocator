@@ -7,4 +7,5 @@ urlpatterns = [
     path('pool/status/', views.pool_status, name='pool_status'),
     path('pool/initialize/', views.initialize_pool, name='initialize_pool'),
     path('pool/release/', views.release_backend, name='release_backend'),
+    path('pool/check-stale/', views.check_stale, name='check_stale'),
 ]

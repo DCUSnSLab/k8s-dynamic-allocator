@@ -148,6 +148,7 @@ async def get_status():
     결과에 개행 문자가 포함된 경우 읽기 쉽게 표시
     """
     data = state.to_dict()
+    data["sessions"] = tcp_terminal.get_sessions()
     return FormattedJSONResponse(data)
 
 

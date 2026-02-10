@@ -5,6 +5,7 @@ Frontend의 터미널과 직접 연결하여 PTY 입출력을 처리하는 TCP �
 """
 
 import asyncio
+import glob
 import logging
 import os
 import pty
@@ -14,6 +15,7 @@ import termios
 import struct
 import fcntl
 import json
+from datetime import datetime
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -22,19 +24,18 @@ logger = logging.getLogger(__name__)
 class TCPTerminalServer:
     """
     TCP 기반 터미널 서버
-    
+
     - Frontend와 TCP로 직접 연결
     - PTY를 통한 터미널 에뮬레이션
     - 실시간 입출력 전달, 터미널 설정 동기화
+    - 동시 접속 지원 (세션별 로컬 변수 관리)
     """
-    
+
     def __init__(self, port: int = 8081):
         self.port = port
         self.server: Optional[asyncio.Server] = None
-        self.current_process: Optional[subprocess.Popen] = None
-        self.master_fd: Optional[int] = None
-        self._verase_byte: bytes = b'\x7f'
-    
+        self._active_sessions = {}  # {session_id: {process, addr, started_at, command}}
+
     async def start(self):
         """TCP 서버 시작"""
         self.server = await asyncio.start_server(
@@ -43,32 +44,59 @@ class TCPTerminalServer:
             port=self.port
         )
         logger.info(f"TCP Terminal Server started on port {self.port}")
-    
+
     async def stop(self):
-        """TCP 서버 중지"""
+        """TCP 서버 중지 — 모든 활성 세션 정리"""
+        for sid, info in list(self._active_sessions.items()):
+            process = info.get("process")
+            if process and process.poll() is None:
+                process.terminate()
+                logger.info(f"Terminated process for session {sid}")
+        self._active_sessions.clear()
+
         if self.server:
             self.server.close()
             await self.server.wait_closed()
             logger.info("TCP Terminal Server stopped")
-    
+
+    def get_sessions(self):
+        """활성 세션 목록 반환 (모니터링용)"""
+        return [
+            {
+                "id": sid,
+                "addr": str(info["addr"]),
+                "command": info.get("command", ""),
+                "started_at": info["started_at"].isoformat(),
+            }
+            for sid, info in self._active_sessions.items()
+        ]
+
     async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """
         클라이언트 연결 처리
-        
+
         프로토콜:
         1. 첫 줄: JSON Header ({command, rows, cols, term, settings})
         2. 이후: 터미널 입출력
+
+        모든 세션 상태는 로컬 변수로 관리 (dcusshk8s 패턴)
         """
         addr = writer.get_extra_info('peername')
-        logger.info(f"TCP connection from {addr}")
-        
+        session_id = id(writer)
+        logger.info(f"TCP connection from {addr} (session {session_id})")
+
+        # 세션별 로컬 변수
+        process = None
+        master_fd = None
+        verase_byte = b'\x7f'
+
         try:
             # 1. 헤더 수신 (JSON)
             line = await reader.readline()
             if not line:
                 logger.warning("No data received, closing connection")
                 return
-            
+
             try:
                 # JSON 파싱 시도 (새 프로토콜)
                 header = json.loads(line.decode('utf-8').strip())
@@ -86,26 +114,19 @@ class TCPTerminalServer:
                 logger.warning("Received legacy command format")
 
             logger.info(f"Executing command: {command} (Size: {rows}x{cols}, Term: {term_env})")
-            
+
             # 2. PTY 생성 및 프로세스 시작
             master_fd, slave_fd = pty.openpty()
-            self.master_fd = master_fd
-            
+
             # 윈도우 크기 설정
             try:
                 fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
             except Exception as e:
                 logger.warning(f"Failed to set window size: {e}")
-            
+
             # PTY 설정: canonical mode, echo ON, backspace 지원
-            verase_byte = b'\x7f'  # 기본값 (인스턴스 변수로 저장하여 read_tcp에서 사용)
             try:
                 attrs = termios.tcgetattr(slave_fd)
-                # ICANON: 라인 편집 활성화
-                # ECHO: 에코 활성화 (Frontend가 Raw Mode이므로)
-                # ECHOE: VERASE 입력 시 \b \b 시퀀스로 화면에서 문자 삭제
-                # ECHOK: VKILL 입력 시 줄 삭제
-                # ISIG: Ctrl+C(SIGINT), Ctrl+Z(SIGTSTP) 등 시그널 처리
                 attrs[3] = attrs[3] | termios.ICANON | termios.ECHO | termios.ECHOE | termios.ECHOK | termios.ISIG
                 # 입력 처리
                 attrs[0] = attrs[0] | termios.ICRNL
@@ -138,53 +159,87 @@ class TCPTerminalServer:
             except Exception as e:
                 logger.warning(f"Failed to configure PTY: {e}")
 
-            self._verase_byte = verase_byte
-            
-            self.current_process = subprocess.Popen(
+            # 프로세스 환경변수 설정 (Frontend 환경 미러링)
+            env = {**os.environ, "TERM": term_env}
+            cwd = "/mnt/frontend"
+
+            # SSHFS 전체 마운트된 Frontend 경로 우선 참조
+            f_usr = "/mnt/f/usr"
+            f_lib = "/mnt/f/lib"
+            f_home = "/mnt/f/home"
+            if os.path.isdir(f_usr):
+                env["PATH"] = f"{f_usr}/local/bin:{f_usr}/bin:{env.get('PATH', '')}"
+                env["LD_LIBRARY_PATH"] = f"{f_usr}/local/lib:{f_usr}/lib:{f_lib}"
+                cwd = f_home
+                env["HOME"] = f_home
+
+            process = subprocess.Popen(
                 command,
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
                 shell=True,
-                cwd="/mnt/frontend",
-                env={**os.environ, "TERM": term_env}
+                cwd=cwd,
+                env=env
             )
             os.close(slave_fd)
-            
+
+            # 세션 추적 등록
+            self._active_sessions[session_id] = {
+                "process": process,
+                "addr": addr,
+                "command": command,
+                "started_at": datetime.now(),
+            }
+
             # 3. 비동기 I/O 처리
-            await self._handle_io(reader, writer, master_fd)
-            
+            await self._handle_io(reader, writer, master_fd, process, verase_byte)
+
         except Exception as e:
             logger.error(f"Connection error: {e}")
         finally:
-            # 정리
-            if self.master_fd:
+            # 정리: master_fd 닫기
+            if master_fd is not None:
                 try:
-                    os.close(self.master_fd)
+                    os.close(master_fd)
                 except OSError:
                     pass
-                self.master_fd = None
-            
-            if self.current_process and self.current_process.poll() is None:
-                self.current_process.terminate()
-                self.current_process = None
-            
+
+            # 정리: 프로세스 강제 종료 (dcusshk8s 패턴)
+            if process and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    logger.warning(f"Force killed process for session {session_id}")
+
+            # 세션 추적 제거
+            self._active_sessions.pop(session_id, None)
+
             writer.close()
             await writer.wait_closed()
-            logger.info(f"Connection closed: {addr}")
-    
-    async def _handle_io(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, master_fd: int):
-        """PTY와 TCP 간 I/O 처리"""
-        
+            logger.info(f"Connection closed: {addr} (session {session_id})")
+
+    async def _handle_io(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        master_fd: int,
+        process: subprocess.Popen,
+        verase_byte: bytes,
+    ):
+        """PTY와 TCP 간 I/O 처리 — 세션별 파라미터로 격리"""
+
         # PTY를 non-blocking으로 설정
         flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
         fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-        
+
         process_done = asyncio.Event()
-        
+
         async def read_pty():
             """PTY에서 읽어서 TCP로 전송"""
-            while self.current_process and self.current_process.poll() is None:
+            while process and process.poll() is None:
                 try:
                     readable, _, _ = select.select([master_fd], [], [], 0.01)
                     if readable:
@@ -195,7 +250,7 @@ class TCPTerminalServer:
                 except (OSError, BlockingIOError):
                     pass
                 await asyncio.sleep(0.01)
-            
+
             # 프로세스 종료 후 남은 출력 읽기
             for _ in range(10):
                 try:
@@ -211,21 +266,20 @@ class TCPTerminalServer:
                         break
                 except (OSError, BlockingIOError):
                     break
-            
+
             # 프로세스 종료 신호
             process_done.set()
-        
+
         async def read_tcp():
             """TCP에서 읽어서 PTY로 전송 (Raw 바이트)"""
-            verase = self._verase_byte
             while not process_done.is_set():
                 try:
                     data = await asyncio.wait_for(reader.read(1024), timeout=0.1)
                     if data:
                         # BS(\x08)와 DEL(\x7f) 모두 PTY의 VERASE 값으로 통일
-                        data = data.replace(b'\x08', verase)
-                        if verase != b'\x7f':
-                            data = data.replace(b'\x7f', verase)
+                        data = data.replace(b'\x08', verase_byte)
+                        if verase_byte != b'\x7f':
+                            data = data.replace(b'\x7f', verase_byte)
                         os.write(master_fd, data)
                     elif reader.at_eof():
                         break
@@ -233,7 +287,7 @@ class TCPTerminalServer:
                     pass
                 except (OSError, BrokenPipeError):
                     break
-        
+
         # 두 태스크 동시 실행
         await asyncio.gather(
             read_pty(),

@@ -192,3 +192,57 @@ class Orchestrator:
                 "status": "error",
                 "message": str(e)
             }
+
+    def check_stale_allocations(self) -> Dict:
+        """
+        K8s API로 할당된 Backend의 Frontend Pod 상태를 확인하여
+        비정상 할당을 감지하고 자동 해제
+
+        확인 항목:
+        - Frontend Pod가 존재하는지 (삭제됨?)
+        - Frontend Pod가 Running 상태인지 (재시작됨?)
+        """
+        pool_list = self.pool.list_pool_status()
+        assigned = [p for p in pool_list if p["pool_status"] == "assigned"]
+
+        released = []
+        errors = []
+
+        for pod_info in assigned:
+            frontend_pod = pod_info.get("assigned_frontend", "")
+            backend_pod = pod_info["name"]
+
+            if not frontend_pod:
+                continue
+
+            # K8s API로 Frontend Pod 상태 확인
+            frontend_status = self.pool.get_pod_status(frontend_pod)
+
+            if frontend_status is None:
+                # Frontend Pod가 존재하지 않음 → 릴리즈
+                logger.warning(
+                    f"Frontend '{frontend_pod}' not found, releasing backend '{backend_pod}'"
+                )
+                result = self.release_backend(backend_pod)
+                if result["status"] == "success":
+                    released.append(backend_pod)
+                else:
+                    errors.append({"pod": backend_pod, "error": result["message"]})
+
+            elif frontend_status != "Running":
+                # Frontend Pod가 Running이 아님 → 릴리즈
+                logger.warning(
+                    f"Frontend '{frontend_pod}' is {frontend_status}, "
+                    f"releasing backend '{backend_pod}'"
+                )
+                result = self.release_backend(backend_pod)
+                if result["status"] == "success":
+                    released.append(backend_pod)
+                else:
+                    errors.append({"pod": backend_pod, "error": result["message"]})
+
+        return {
+            "checked": len(assigned),
+            "released": released,
+            "errors": errors,
+        }
