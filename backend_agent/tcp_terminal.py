@@ -18,6 +18,8 @@ import json
 from datetime import datetime
 from typing import Optional
 
+from mount_manager import MountManager
+
 logger = logging.getLogger(__name__)
 
 
@@ -159,26 +161,32 @@ class TCPTerminalServer:
             except Exception as e:
                 logger.warning(f"Failed to configure PTY: {e}")
 
-            # 프로세스 환경변수 설정 (Frontend 환경 미러링)
+            # 프로세스 환경변수 설정
+            # Chroot 환경이므로 Frontend 미러링 불필요 (그대로 사용)
+            # PATH도 Frontend의 것이 그대로 사용됨
             env = {**os.environ, "TERM": term_env}
-            cwd = "/mnt/frontend"
-
-            # SSHFS 전체 마운트된 Frontend 경로 우선 참조
-            f_usr = "/mnt/f/usr"
-            f_lib = "/mnt/f/lib"
             
-            # 주의: MOUNTS[0]이 ("/home/dcuuser", "/mnt/frontend") 이므로
-            # 홈 디렉토리의 로컬 경로는 /mnt/frontend 입니다.
-            f_home = "/mnt/frontend"
+            # Client에서 받은 PATH가 있다면 적용? 
+            # Chroot에서는 Frontend의 /bin, /usr/bin이 그대로 보이므로
+            # Client PATH가 Frontend 기준이라면 그대로 적용하면 됨.
+            client_path = header.get('env', {}).get('PATH', '')
+            if client_path:
+                 env["PATH"] = client_path
 
-            if os.path.isdir(f_usr):
-                env["PATH"] = f"{f_usr}/local/bin:{f_usr}/bin:{env.get('PATH', '')}"
-                # /lib 마운트가 실패할 수 있으므로 /mnt/f/lib가 존재할 때만 추가하거나,
-                # /usr/lib가 있으므로 /lib는 제외할 수도 있음.
-                # 일단 /mnt/f/lib를 포함하되, 존재하지 않아도 ld가 무시함.
-                env["LD_LIBRARY_PATH"] = f"{f_usr}/local/lib:{f_usr}/lib:{f_lib}"
-                cwd = f_home
-                env["HOME"] = f_home
+            # preexec_fn 정의 (Chroot & Namespace 설정)
+            def preexec():
+                # 1. New Session (setsid)
+                os.setsid()
+                
+                # 2. Controlling Terminal 설정
+                try:
+                    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+                except Exception:
+                    pass
+
+                # 3. Mount Namespace & Chroot (Mount Manager 위임)
+                # 이 함수는 내부적으로 unshare -> mount -> chroot -> chdir 수행
+                MountManager.setup_chroot_namespace(addr[0])
 
             process = subprocess.Popen(
                 command,
@@ -186,7 +194,7 @@ class TCPTerminalServer:
                 stdout=slave_fd,
                 stderr=slave_fd,
                 shell=True,
-                cwd=cwd,
+                preexec_fn=preexec,
                 env=env
             )
             os.close(slave_fd)
