@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y \
     vim \
     iputils-ping \
     net-tools \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
 
 # fuse.conf 설정 (user_allow_other)

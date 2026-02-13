@@ -161,18 +161,26 @@ class TCPTerminalServer:
             except Exception as e:
                 logger.warning(f"Failed to configure PTY: {e}")
 
-            # 프로세스 환경변수 설정
-            # Chroot 환경이므로 Frontend 미러링 불필요 (그대로 사용)
-            # PATH도 Frontend의 것이 그대로 사용됨
-            env = {**os.environ, "TERM": term_env}
+            # Chroot 환경에서 /etc/profile, ~/.profile 등을 로드하여
+            # Frontend의 PATH 설정을 자동으로 가져오도록 함.
+            # 이를 위해 Command를 Login Shell 형태로 실행
             
-            # Client에서 받은 PATH가 있다면 적용? 
-            # Chroot에서는 Frontend의 /bin, /usr/bin이 그대로 보이므로
-            # Client PATH가 Frontend 기준이라면 그대로 적용하면 됨.
-            client_path = header.get('env', {}).get('PATH', '')
-            if client_path:
-                 env["PATH"] = client_path
+            # 기존 Command가 단순 쉘(/bin/bash)인 경우 -> /bin/bash -l
+            # 특정 명령어인 경우 -> /bin/bash -l -c "command"
+            
+            if command.endswith("bash") or command.endswith("sh"):
+                final_command = [command, "-l"]
+            else:
+                final_command = ["/bin/bash", "-l", "-c", command]
 
+            # env 변수 정의 (TERM 포함)
+            # Login Shell이므로 PATH 등은 /etc/profile에서 로드되지만,
+            # TERM은 전달해주는 것이 좋음 (xterm-256color 등)
+            # 중요: HOME을 /home/dcuuser로 설정해야 .bash_profile 권한 오류 해결됨
+            env = {**os.environ, "TERM": term_env, "HOME": "/home/dcuuser", "USER": "dcuuser"}
+
+            # PATH 수동 추가 로직 제거 (Login Shell이 처리함)
+            
             # preexec_fn 정의 (Chroot & Namespace 설정)
             def preexec():
                 # 1. New Session (setsid)
@@ -189,11 +197,11 @@ class TCPTerminalServer:
                 MountManager.setup_chroot_namespace(addr[0])
 
             process = subprocess.Popen(
-                command,
+                final_command,
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
-                shell=True,
+                shell=False,  # shell=True 대신 리스트 형태 사용 (Login Shell 인자 전달 위해)
                 preexec_fn=preexec,
                 env=env
             )
