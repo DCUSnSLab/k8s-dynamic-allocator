@@ -26,7 +26,7 @@ class TaskExecutor:
         """
         단순 명령어 실행 (비대화형)
         """
-        work_dir = cwd or "/mnt/frontend"
+        work_dir = cwd or "/mnt/chroot"
         
         logger.info(f"Executing command: {command} in {work_dir}")
         

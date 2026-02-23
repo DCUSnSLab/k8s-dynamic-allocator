@@ -93,12 +93,9 @@ class MountManager:
         return True
 
     @staticmethod
-    def setup_chroot_namespace(frontend_ip: str):
+    def setup_chroot_namespace(frontend_ip: str, cwd: str = "/home/dcuuser"):
         """
-        [Child Process Only]
-        새로운 Mount Namespace를 생성하고 Chroot 환경을 구성
-        
-        이 함수는 subprocess의 preexec_fn에서 호출됨
+        Mount Namespace를 생성하고 Chroot 환경을 구성 (subprocess의 preexec_fn에서 호출)
         """
         try:
             import ctypes
@@ -110,22 +107,16 @@ class MountManager:
             MS_PRIVATE = 262144
             MS_BIND = 4096
 
-            # 1. New Mount Namespace 생성 (CLONE_NEWNS)
+            # 1. Mount Namespace 생성
             if libc.unshare(CLONE_NEWNS) != 0:
                 raise OSError("Failed to create mount namespace")
             
             # 2. Mount Propagation 설정 (Private)
-            # 호스트의 마운트 이벤트가 전파되지 않도록 설정
             if libc.mount(b"none", b"/", b"none", MS_REC | MS_PRIVATE, None) != 0:
                  raise OSError("Failed to set mount propagation to private")
 
-            # 3. Frontend Root Mount (SSHFS)
-            # /mnt/chroot 생성
+            # 3. SSHFS로 Frontend Root 마운트 (sudo sftp-server로 root 권한 접근)
             os.makedirs(MountManager.CHROOT_PATH, exist_ok=True)
-            
-            # sshfs 명령어 실행 (os.system 사용 - namespace 내부이므로 안전)
-            # 중요: Remote에서 root 권한으로 파일에 접근하기 위해 sftp-server를 sudo로 실행
-            # (dcuuser가 NOPASSWD sudo 권한을 가지고 있다고 가정)
             ssh_cmd = (
                 f"sshfs dcuuser@{frontend_ip}:/ {MountManager.CHROOT_PATH} "
                 "-o allow_other,suid,StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null "
@@ -134,26 +125,16 @@ class MountManager:
             if os.system(ssh_cmd) != 0:
                 raise OSError(f"Failed to mount SSHFS from {frontend_ip}")
 
-            # 4. Bind Mounts (Overlay)
-            # Backend의 /proc, /sys, /dev를 Chroot 내부로 덮어쓰기
-            # 4. Bind Mounts (Overlay)
-            # Backend의 /proc, /sys, /dev를 Chroot 내부로 덮어쓰기
+            # 4. Bind Mounts
             
-            # [Secure Bin Strategy]
-            # SSHFS 상에서 SUID가 제대로 동작하지 않는 문제를 해결하기 위해
-            # Tmpfs(메모리 파일시스템)를 생성하고 거기에 sudo를 복사한 뒤 SUID 설정
-            # 중요: Frontend에 흔적을 남기지 않기 위해 Chroot 외부 경로(/tmp/secure_bin) 사용
+            # Secure Bin: SSHFS에서 SUID가 동작하지 않으므로 sudo를 로컬에 복사하여 SUID 설정
             
             secure_bin_path = "/tmp/secure_bin"
             if os.path.exists(secure_bin_path):
                 shutil.rmtree(secure_bin_path)
             os.makedirs(secure_bin_path, exist_ok=True)
             
-            # 1. Tmpfs 마운트 (Optional: 컨테이너 /tmp가 이미 램디스크거나 로컬이면 굳이 필요없지만 확실히 하기 위해)
-            # 여기서는 로컬 디스크(/tmp)를 그대로 사용해도 SUID가 지원되므로 Tmpfs 마운트 생략 가능하나
-            # 깔끔한 정리를 위해 파일 카피만 수행
-            
-            # 2. sudo 바이너리 복사 및 권한 설정
+            # sudo 바이너리 복사 및 권한 설정
             local_sudo = "/usr/bin/sudo"
             target_sudo_tmp = f"{secure_bin_path}/sudo"
             
@@ -161,7 +142,7 @@ class MountManager:
                 shutil.copy(local_sudo, target_sudo_tmp)
                 os.chmod(target_sudo_tmp, 0o4755) # rwsr-xr-x (SUID)
             
-            # sudo를 제외한 일반 Bind Mount 목록
+            # Bind Mount 대상
             bind_mounts = ["proc", "sys", "dev", "usr/lib/sudo"]
             
             for d in bind_mounts:
@@ -180,20 +161,17 @@ class MountManager:
                                 os.makedirs(parent, exist_ok=True)
                             open(target, 'a').close()
 
-                    # Bind Mount 실행
-                    # 중요: /dev/pts 등 하위 마운트 포인트까지 포함하기 위해 MS_REC(Recursive) 플래그 추가
-                    # MS_REC = 16384
+                    # Bind Mount 실행 (MS_REC으로 하위 마운트 포인트도 포함)
                     if libc.mount(src, target, b"none", MS_BIND | MS_REC, None) != 0:
                         raise OSError(f"Failed to bind mount {d}")
                 else:
                     logger.warning(f"Source {d} not found, skipping bind mount")
 
-            # 3. Secure Bin의 sudo를 /usr/bin/sudo로 Bind Mount
-            # 이제 원본은 SSHFS가 아닌 Tmpfs에 있으므로 확실하게 SUID가 동작함
+            # Secure Bin의 sudo를 Chroot 내 /usr/bin/sudo로 Bind Mount
             final_sudo_target_str = f"{MountManager.CHROOT_PATH}/usr/bin/sudo"
             final_sudo_target = final_sudo_target_str.encode('utf-8')
             
-             # 타겟 파일 생성 (없을 경우) - SSHFS라 존재하겠지만 안전하게
+            # 타겟 파일 생성 (없을 경우)
             if not os.path.exists(final_sudo_target):
                  open(final_sudo_target, 'a').close()
             
@@ -201,14 +179,11 @@ class MountManager:
             if libc.mount(safe_sudo_src, final_sudo_target, b"none", MS_BIND, None) != 0:
                  logger.warning("Failed to bind mount secure sudo")
             
-            # [CRITICAL] Bind Mount된 파일에 대해 명시적으로 SUID 허용 Remount 수행
-            # 상위 마운트(SSHFS)가 nosuid일 경우, 하위 Bind Mount도 nosuid를 상속받으므로 이를 해제해야 함
+            # SUID Remount (SSHFS의 nosuid가 상속되므로 명시적으로 해제)
             if os.system(f"mount -o remount,bind,suid {final_sudo_target_str}") != 0:
                  logger.warning("Failed to remount secure sudo with suid")
 
-            # [Hostname Fix]
-            # sudo 실행 시 "unable to resolve host" 경고 해결을 위해
-            # Frontend의 /etc/hosts에 Backend의 Hostname을 추가하여 Bind Mount
+            # Hostname Fix: sudo "unable to resolve host" 경고 해결
             try:
                 chroot_hosts = f"{MountManager.CHROOT_PATH}/etc/hosts"
                 temp_hosts = "/tmp/hosts_overlay"
@@ -219,7 +194,7 @@ class MountManager:
                     with open(chroot_hosts, 'r') as f:
                         hosts_content = f.read()
                 
-                # 2. 현재 Hostname 추가 (이미 있으면 생략)
+                # 2. 현재 Hostname 추가
                 current_hostname = os.uname().nodename
                 if current_hostname not in hosts_content:
                     hosts_content += f"\n127.0.0.1\t{current_hostname}\n"
@@ -229,24 +204,38 @@ class MountManager:
                     f.write(hosts_content)
                 
                 # 4. Bind Mount (/tmp/hosts_overlay -> /mnt/chroot/etc/hosts)
-                # 이것도 Bind Mount이므로, 원본(SSHFS)은 수정되지 않음
+                # Bind Mount이므로, 원본(SSHFS)은 수정되지 않음
                 if libc.mount(temp_hosts.encode('utf-8'), chroot_hosts.encode('utf-8'), b"none", MS_BIND, None) != 0:
                      logger.warning("Failed to bind mount overlay hosts file")
                      
             except Exception as e:
                 logger.warning(f"Failed to setup hosts overlay: {e}")
 
+            # Apt Fix: Sandbox 비활성화 (권한 문제 방지)
+            try:
+                apt_conf_d = f"{MountManager.CHROOT_PATH}/etc/apt/apt.conf.d"
+                apt_conf_file = f"{apt_conf_d}/99nosandbox"
+                
+                if os.path.exists(apt_conf_d):
+                    config_content = 'APT::Sandbox::User "root";\n'
+                    with open(apt_conf_file, 'w') as f:
+                        f.write(config_content)
+            except Exception as e:
+                logger.warning(f"Failed to setup apt sandbox config: {e}")
+
             # 5. Chroot 진입
             os.chroot(MountManager.CHROOT_PATH)
-            os.chdir("/home/dcuuser")
+            
+            # CWD 설정
+            try:
+                os.chdir(cwd)
+            except (FileNotFoundError, PermissionError):
+                os.chdir("/home/dcuuser")
 
-            # 6. Drop Privileges (Switch to dcuuser: 1000)
-            # 순서 중요: setgid 먼저, 그 다음 setuid
-            # (만약 setuid를 먼저 하면 root 권한을 잃어서 setgid 불가능)
+            # 6. Drop Privileges (setgid 먼저, setuid 나중)
             os.setgid(1000)
             os.setuid(1000)
             
-            # HOME 환경변수 재설정 (Login shell이 올바르게 로드하도록)
             os.environ["HOME"] = "/home/dcuuser"
             os.environ["USER"] = "dcuuser"
             
