@@ -1,11 +1,14 @@
 """
 Backend Pod Pool Manager
 
-Backend Pod Pool을 생성, 관리, 할당하는 클래스
-미리 생성된 Pool에서 사용 가능한 Pod를 선택하여 할당
+Deployment 기반 Backend Pool 관리 클래스
+manifests/ 디렉토리의 YAML 파일을 자동 스캔하여 Deployment 생성 및 관리
 """
 
+import glob
 import logging
+import os
+import yaml
 from typing import Dict, List, Optional
 
 from kubernetes import client
@@ -16,22 +19,17 @@ from .kubernetes_client import KubernetesClient
 logger = logging.getLogger(__name__)
 
 
-POOL_SIZE = 3
-POOL_PREFIX = "backend-pool"
-BACKEND_IMAGE = "harbor.cu.ac.kr/k8s_dynamic_allocator/backend:chroot"
+MANIFESTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "manifests")
 
 
 class BackendPool(KubernetesClient):
     """
-    Backend Pod Pool 관리 클래스
+    Deployment 기반 Backend Pod Pool 관리 클래스
     
-    - Pool Pod 생성/삭제
+    - manifests/*.yaml 자동 스캔하여 Deployment 생성
     - 사용 가능한 Pod 조회 (Label 기반)
     - Pod 할당/해제 (Label 업데이트)
-    
-    향후 확장:
-    - Frontend 수에 따른 Pool 크기 동적 조절
-    - 작업 유형별 Pod 선택 알고리즘
+    - ReplicaSet이 Pod 자동 복구 담당
     """
     
     # Pool Pod Label 상수
@@ -46,38 +44,49 @@ class BackendPool(KubernetesClient):
     def __init__(self):
         """Backend Pool 초기화"""
         super().__init__()
-        self.pool_size = POOL_SIZE
-        self.pool_prefix = POOL_PREFIX
-        self.backend_image = BACKEND_IMAGE
+        self.apps_v1 = client.AppsV1Api()
     
     def initialize_pool(self) -> Dict:
         """
-        Pool Pod 초기화 (N개 미리 생성)
+        manifests/ 하위 모든 YAML을 스캔하여 Deployment 생성
+        
+        이미 존재하는 Deployment는 건너뛰고, 없는 것만 생성
         
         Returns:
             Dict: 초기화 결과
         """
         results = {"created": [], "existing": [], "failed": []}
         
-        for i in range(self.pool_size):
-            pod_name = f"{self.pool_prefix}-{i + 1}"
-            
-            if self.pod_exists(pod_name):
-                logger.info(f"Pool pod {pod_name} already exists")
-                results["existing"].append(pod_name)
-                continue
-            
+        yaml_files = glob.glob(os.path.join(MANIFESTS_DIR, "*.yaml"))
+        
+        if not yaml_files:
+            logger.warning(f"No YAML files found in {MANIFESTS_DIR}")
+            return results
+        
+        for yaml_file in yaml_files:
             try:
-                pod_spec = self._create_pool_pod_spec(i)
-                self.v1.create_namespaced_pod(
+                with open(yaml_file) as f:
+                    spec = yaml.safe_load(f)
+                
+                name = spec["metadata"]["name"]
+                
+                self.apps_v1.create_namespaced_deployment(
                     namespace=self.namespace,
-                    body=pod_spec
+                    body=spec
                 )
-                logger.info(f"Created pool pod: {pod_name}")
-                results["created"].append(pod_name)
+                logger.info(f"Created deployment: {name}")
+                results["created"].append(name)
+                
             except ApiException as e:
-                logger.error(f"Failed to create pool pod {pod_name}: {e}")
-                results["failed"].append({"name": pod_name, "error": str(e)})
+                if e.status == 409:
+                    logger.info(f"Deployment {name} already exists")
+                    results["existing"].append(name)
+                else:
+                    logger.error(f"Failed to create deployment from {yaml_file}: {e}")
+                    results["failed"].append({"file": os.path.basename(yaml_file), "error": str(e)})
+            except Exception as e:
+                logger.error(f"Failed to load {yaml_file}: {e}")
+                results["failed"].append({"file": os.path.basename(yaml_file), "error": str(e)})
         
         return results
     
@@ -86,8 +95,6 @@ class BackendPool(KubernetesClient):
         사용 가능한 Pool Pod 조회
         
         Label selector를 사용하여 available 상태인 Pod 중 하나 반환
-        
-        향후 확장: 작업 유형에 따른 적합한 Pod 선택 알고리즘 추가
         
         Returns:
             Optional[str]: 사용 가능한 Pod 이름 (없으면 None)
@@ -190,6 +197,7 @@ class BackendPool(KubernetesClient):
                 status_list.append({
                     "name": pod.metadata.name,
                     "phase": pod.status.phase,
+                    "backend_type": pod.metadata.labels.get("backend-type", "unknown"),
                     "pool_status": pod.metadata.labels.get(self.LABEL_STATUS, "unknown"),
                     "assigned_frontend": pod.metadata.labels.get(self.LABEL_FRONTEND, ""),
                     "ip": pod.status.pod_ip
@@ -199,70 +207,3 @@ class BackendPool(KubernetesClient):
         except ApiException as e:
             logger.error(f"Failed to list pool status: {e}")
             return []
-    
-    def _create_pool_pod_spec(self, index: int) -> client.V1Pod:
-        """
-        Pool Pod 스펙 생성
-        
-        Args:
-            index: Pod 인덱스
-            
-        Returns:
-            V1Pod: Kubernetes Pod 스펙
-        """
-        pod_name = f"{self.pool_prefix}-{index}"
-        
-        container = client.V1Container(
-            name="backend-agent",
-            image=self.backend_image,
-            image_pull_policy="Always",
-            command=["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "8080"],
-            ports=[
-                client.V1ContainerPort(container_port=8080, name="agent")
-            ],
-            resources=client.V1ResourceRequirements(
-                requests={"cpu": "100m", "memory": "128Mi"},
-                limits={"cpu": "500m", "memory": "512Mi"}
-            ),
-            security_context=client.V1SecurityContext(
-                privileged=True
-            ),
-            volume_mounts=[
-                client.V1VolumeMount(
-                    name="ssh-private-key",
-                    mount_path="/etc/ssh-key",
-                    read_only=True
-                )
-            ]
-        )
-        
-        ssh_key_volume = client.V1Volume(
-            name="ssh-private-key",
-            secret=client.V1SecretVolumeSource(
-                secret_name="backend-ssh-key",
-                default_mode=0o600
-            )
-        )
-
-        metadata = client.V1ObjectMeta(
-            name=pod_name,
-            labels={
-                "app": self.LABEL_APP,
-                self.LABEL_STATUS: self.STATUS_AVAILABLE,
-                self.LABEL_FRONTEND: "",
-                "created-by": "controller"
-            }
-        )
-        
-        spec = client.V1PodSpec(
-            containers=[container],
-            volumes=[ssh_key_volume],
-            restart_policy="Always"
-        )
-        
-        return client.V1Pod(
-            api_version="v1",
-            kind="Pod",
-            metadata=metadata,
-            spec=spec
-        )

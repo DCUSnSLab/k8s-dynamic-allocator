@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-general
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: backend-pool
+      backend-type: general
+  template:
+    metadata:
+      labels:
+        app: backend-pool
+        backend-type: general
+        pool-status: available
+        assigned-frontend: ""
+        created-by: controller
+    spec:
+      containers:
+      - name: backend-agent
+        image: harbor.cu.ac.kr/k8s_dynamic_allocator/backend:chroot
+        imagePullPolicy: Always
+        command: ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "8080"]
+        ports:
+        - containerPort: 8080
+          name: agent
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: ssh-private-key
+          mountPath: /etc/ssh-key
+          readOnly: true
+      volumes:
+      - name: ssh-private-key
+        secret:
+          secretName: backend-ssh-key
+          defaultMode: 384
