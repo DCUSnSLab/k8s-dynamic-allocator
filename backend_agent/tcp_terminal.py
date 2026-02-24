@@ -167,7 +167,7 @@ class TCPTerminalServer:
             else:
                 final_command = ["/bin/bash", "-l", "-c", command]
 
-            env = {**os.environ, "TERM": term_env, "HOME": "/home/dcuuser", "USER": "dcuuser"}
+            env = {**os.environ, "TERM": term_env, "HOME": "/home/dcuuser", "USER": "dcuuser", "RUN_SESSION": "1"}
 
             def preexec():
                 # 1. New Session (setsid)
