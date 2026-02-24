@@ -45,6 +45,7 @@ class BackendPool(KubernetesClient):
         """Backend Pool 초기화"""
         super().__init__()
         self.apps_v1 = client.AppsV1Api()
+        self.owner_ref = self._get_owner_deployment()
     
     def initialize_pool(self) -> Dict:
         """
@@ -70,6 +71,10 @@ class BackendPool(KubernetesClient):
                 
                 name = spec["metadata"]["name"]
                 
+                # OwnerReference 주입 (Controller Deployment 삭제 시 같이 삭제)
+                if self.owner_ref:
+                    spec.setdefault("metadata", {})["ownerReferences"] = [self.owner_ref]
+                
                 self.apps_v1.create_namespaced_deployment(
                     namespace=self.namespace,
                     body=spec
@@ -89,6 +94,51 @@ class BackendPool(KubernetesClient):
                 results["failed"].append({"file": os.path.basename(yaml_file), "error": str(e)})
         
         return results
+    
+    def _get_owner_deployment(self) -> Optional[Dict]:
+        """
+        자신의 Pod → ReplicaSet → Deployment 소유 체인을 추적하여
+        Controller Deployment의 OwnerReference 정보를 반환
+        
+        Returns:
+            Optional[Dict]: ownerReference dict (없으면 None)
+        """
+        try:
+            pod_name = os.getenv("HOSTNAME")
+            if not pod_name:
+                logger.warning("HOSTNAME not set, skipping OwnerReference")
+                return None
+            
+            # Pod → ReplicaSet
+            pod = self.v1.read_namespaced_pod(pod_name, self.namespace)
+            if not pod.metadata.owner_references:
+                logger.warning("Pod has no ownerReferences")
+                return None
+            
+            rs_ref = pod.metadata.owner_references[0]
+            rs = self.apps_v1.read_namespaced_replica_set(rs_ref.name, self.namespace)
+            
+            # ReplicaSet → Deployment
+            if not rs.metadata.owner_references:
+                logger.warning("ReplicaSet has no ownerReferences")
+                return None
+            
+            deploy_ref = rs.metadata.owner_references[0]
+            
+            owner_ref = {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "name": deploy_ref.name,
+                "uid": deploy_ref.uid,
+                "blockOwnerDeletion": True,
+            }
+            
+            logger.info(f"Owner deployment: {deploy_ref.name} (uid={deploy_ref.uid})")
+            return owner_ref
+            
+        except Exception as e:
+            logger.warning(f"Failed to get owner deployment: {e}")
+            return None
     
     def get_available_pod(self) -> Optional[str]:
         """

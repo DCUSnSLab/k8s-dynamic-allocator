@@ -15,7 +15,6 @@ spec:
         backend-type: general
         pool-status: available
         assigned-frontend: ""
-        created-by: controller
     spec:
       containers:
       - name: backend-agent
