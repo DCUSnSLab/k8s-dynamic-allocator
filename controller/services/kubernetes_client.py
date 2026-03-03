@@ -14,89 +14,72 @@ from kubernetes.client.rest import ApiException
 
 logger = logging.getLogger(__name__)
 
+# K8s config는 프로세스당 1회만 로드
+_config_loaded = False
+
 
 class KubernetesClient(ABC):
     """
     Kubernetes API 클라이언트 기본 클래스
     
-    다른 서비스 클래스들이 상속받아 K8s API와 통신할 때 사용
+    하위 레이어: 에러 시 exception raise (로그 없음)
+    config 로드는 프로세스당 1회만 실행 + 로그
     """
     
     def __init__(self, namespace: str = None):
-        """
-        Kubernetes 클라이언트 초기화
+        global _config_loaded
         
-        클러스터 내부에서 실행 시 InClusterConfig 사용
-        로컬 개발 시 ~/.kube/config 사용
-        
-        Args:
-            namespace: 작업할 네임스페이스 (기본값: 환경변수 또는 "swlabpods")
-        """
-        try:
-            # 클러스터 내부에서 실행 중인 경우
-            config.load_incluster_config()
-            logger.info("Kubernetes InClusterConfig loaded successfully")
-        except config.ConfigException:
-            # 로컬 개발 환경인 경우
+        if not _config_loaded:
             try:
-                config.load_kube_config()
-                logger.info("Kubernetes KubeConfig loaded successfully")
-            except config.ConfigException as e:
-                logger.error(f"Failed to load Kubernetes config: {e}")
-                raise
+                config.load_incluster_config()
+                logger.info("Kubernetes InClusterConfig loaded successfully")
+            except config.ConfigException:
+                try:
+                    config.load_kube_config()
+                    logger.info("Kubernetes KubeConfig loaded successfully")
+                except config.ConfigException as e:
+                    raise RuntimeError(f"Failed to load Kubernetes config: {e}")
+            _config_loaded = True
         
         self.v1 = client.CoreV1Api()
         self.namespace = namespace or os.getenv("K8S_NAMESPACE", "swlabpods")
     
     def get_pod_ip(self, pod_name: str) -> Optional[str]:
         """
-        Pod 이름으로 IP 주소 조회
+        Pod IP 조회
         
-        Args:
-            pod_name: Pod 이름
-            
-        Returns:
-            Optional[str]: Pod IP 주소 (없으면 None)
+        Raises:
+            ApiException: K8s API 에러 (404 제외 — None 반환)
         """
         try:
             pod = self.v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
             return pod.status.pod_ip
         except ApiException as e:
-            logger.error(f"Failed to get Pod IP for {pod_name}: {e}")
-            return None
+            if e.status == 404:
+                return None
+            raise
     
     def get_pod_status(self, pod_name: str) -> Optional[str]:
         """
-        Pod 상태 조회
+        Pod 상태 조회 (Running, Pending 등)
         
-        Args:
-            pod_name: Pod 이름
-            
         Returns:
-            Optional[str]: Pod 상태 (Running, Pending, Succeeded, Failed 등)
+            Optional[str]: Pod 상태 (존재하지 않으면 None)
         """
         try:
             pod = self.v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
             return pod.status.phase
         except ApiException as e:
-            logger.error(f"Failed to get Pod status for {pod_name}: {e}")
-            return None
+            if e.status == 404:
+                return None
+            raise
     
     def pod_exists(self, pod_name: str) -> bool:
-        """
-        Pod 존재 여부 확인
-        
-        Args:
-            pod_name: Pod 이름
-            
-        Returns:
-            bool: Pod 존재 여부
-        """
+        """Pod 존재 여부 확인"""
         try:
             self.v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
             return True
         except ApiException as e:
             if e.status == 404:
                 return False
-            logger.error(f"Failed to check Pod existence for {pod_name}: {e}")
-            return False
+            raise

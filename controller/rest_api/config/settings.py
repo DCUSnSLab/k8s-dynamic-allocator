@@ -2,7 +2,10 @@
 Django settings for Controller Pod REST API
 """
 
+import itertools
+import logging
 import sys
+import threading
 from pathlib import Path
 
 # BASE_DIR: rest_api/ 경로
@@ -26,9 +29,46 @@ INSTALLED_APPS = [
     'api',
 ]
 
+# ──────────────────────────────────────────────
+# Request ID (요청별 로그 추적용)
+# ──────────────────────────────────────────────
+_local = threading.local()
+_counter = itertools.count()
+_conn_map = {}  # backend_pod → conn_id
+
+
+def get_request_id():
+    return getattr(_local, 'request_id', '-')
+
+
+def set_request_id(conn_id):
+    _local.request_id = conn_id
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record):
+        record.request_id = get_request_id()
+        return True
+
+
+def next_conn_id():
+    """Generate next conn=N id (called only from execute view)"""
+    return f"conn={next(_counter)}"
+
+
+class RequestIdMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        _local.request_id = '-'
+        return self.get_response(request)
+
+
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.middleware.common.CommonMiddleware',
+    'config.settings.RequestIdMiddleware',
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -60,15 +100,21 @@ LOGGING = {
     'disable_existing_loggers': False,
     'formatters': {
         'detailed': {
-            'format': '[{levelname}] {asctime} | {module}.{funcName} | {message}',
+            'format': '[{asctime}] [{levelname}] [{request_id}] {message}',
             'style': '{',
             'datefmt': '%Y-%m-%d %H:%M:%S',
+        },
+    },
+    'filters': {
+        'request_id': {
+            '()': 'config.settings.RequestIdFilter',
         },
     },
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
             'formatter': 'detailed',
+            'filters': ['request_id'],
         },
     },
     'root': {
@@ -81,6 +127,16 @@ LOGGING = {
             'level': 'INFO',
             'propagate': False,
         },
+        'django.server': {
+            'handlers': ['console'],
+            'level': 'CRITICAL',
+            'propagate': False,
+        },
+        'django.request': {
+            'handlers': ['console'],
+            'level': 'CRITICAL',
+            'propagate': False,
+        },
         'api': {
             'handlers': ['console'],
             'level': 'DEBUG',
@@ -91,6 +147,10 @@ LOGGING = {
             'level': 'DEBUG',
             'propagate': False,
         },
+        'httpx': {
+            'handlers': ['console'],
+            'level': 'WARNING',
+            'propagate': False,
+        },
     },
 }
-

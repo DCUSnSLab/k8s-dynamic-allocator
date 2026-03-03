@@ -2,122 +2,108 @@
 Orchestrator
 
 Backend Pool과 Agent를 조율하는 메인 Orchestrator 클래스
-모든 Backend 관련 요청의 진입점
+모든 Backend 관련 요청의 진입점 + 유일한 로그 출력 지점
 """
 
 import logging
 from datetime import datetime
 from typing import Dict
 
-from .backend_pool import BackendPool
+import httpx
+from kubernetes.client.rest import ApiException
+
+from .backend_pool import BackendPool, PodConflictError
 from .backend_agent import BackendAgent
 
 logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    """
-    Backend Pod 조율 Orchestrator
+    """Backend Pod 조율 Orchestrator"""
     
-    - Pool에서 사용 가능한 Pod 선택
-    - Agent에 마운트/실행 요청
-    - 작업 상태 관리
-    """
+    MAX_RETRIES = 3
     
     def __init__(self):
-        """Orchestrator 초기화"""
         self.pool = BackendPool()
     
     def health_check(self) -> str:
-        """헬스 체크"""
         return "Orchestrator healthy"
     
     def initialize_pool(self) -> Dict:
-        """
-        Backend Pool 초기화
-        
-        Controller 시작 시 호출하여 Pool Pod 생성
-        
-        Returns:
-            Dict: 초기화 결과
-        """
-        logger.info("Initializing Backend Pool...")
-        result = self.pool.initialize_pool()
-        logger.info(f"Pool initialization result: {result}")
-        return result
+        """Backend Pool 초기화 (시작 시 1회)"""
+        return self.pool.initialize_pool()
     
     def execute_command(self, username: str, command: str, frontend_pod: str) -> Dict:
         """
         Backend Pod에서 명령 실행
-        
-        1. Pool에서 사용 가능한 Pod 선택
-        2. Pod를 Frontend에 할당
+
+        1. Frontend Pod IP 조회
+        2. Pool에서 Pod 선택 + 할당 (경쟁 시 재시도)
         3. Agent에 마운트 및 실행 요청
-        
-        Args:
-            username: 사용자명
-            command: 실행할 명령어
-            frontend_pod: Frontend Pod 이름
-            
-        Returns:
-            Dict: 실행 결과
         """
+        backend_pod = None
+        
         try:
-            logger.info(f"Execute request: user={username}, command={command}, frontend={frontend_pod}")
-            
-            # 1. Frontend Pod IP 조회
+            # 1. Frontend Pod IP
             frontend_ip = self.pool.get_pod_ip(frontend_pod)
             if not frontend_ip:
+                logger.error(f"[FAILED] Execute: Frontend pod IP not found ({frontend_pod})")
                 return {
                     "status": "error",
-                    "message": f"Frontend Pod '{frontend_pod}'의 IP를 찾을 수 없습니다"
+                    "message": f"Frontend pod IP not found: {frontend_pod}"
                 }
             
-            # 2. Pool에서 사용 가능한 Pod 선택
-            backend_pod = self.pool.get_available_pod()
+            # 2. Pod 선택 + 할당 (경쟁 시 재시도)
+            for attempt in range(self.MAX_RETRIES):
+                backend_pod = self.pool.get_available_pod()
+                if not backend_pod:
+                    logger.error("[FAILED] Execute: No available backend pods")
+                    return {
+                        "status": "error",
+                        "message": "No available backend pods"
+                    }
+
+                # 2-1. 할당 전 1초 대기 (경쟁 완화)
+                import time
+                time.sleep(1)
+
+                try:
+                    self.pool.assign_pod(backend_pod, frontend_pod)
+                    break
+                except PodConflictError:
+                    logger.warning(f"{backend_pod} already assigned, retrying...")
+                    backend_pod = None
+                    continue
+            
             if not backend_pod:
+                logger.error(f"[FAILED] Execute: Assignment contention after {self.MAX_RETRIES} retries")
                 return {
                     "status": "error",
-                    "message": "사용 가능한 Backend Pod가 없습니다. 잠시 후 다시 시도해주세요."
+                    "message": "Backend pod assignment failed due to contention"
                 }
             
-            # 3. Pod 할당 (Label 업데이트)
-            if not self.pool.assign_pod(backend_pod, frontend_pod):
-                return {
-                    "status": "error",
-                    "message": f"Backend Pod '{backend_pod}' 할당 실패"
-                }
-            
-            # 4. Backend Pod IP 조회
+            # 3. Backend Pod IP
             backend_ip = self.pool.get_pod_ip(backend_pod)
             if not backend_ip:
-                # 할당 롤백
                 self.pool.release_pod(backend_pod)
+                logger.error(f"[FAILED] Execute: Backend pod IP not found ({backend_pod})")
                 return {
                     "status": "error",
-                    "message": f"Backend Pod '{backend_pod}'의 IP를 찾을 수 없습니다"
+                    "message": f"Backend pod IP not found: {backend_pod}"
                 }
             
-            # 5. Agent 클라이언트 생성 및 마운트 요청
+            # 4. Agent mount
             agent = BackendAgent(backend_ip)
             try:
-                agent_response = agent.mount(frontend_ip, command)
+                agent.mount(frontend_ip, command)
             finally:
                 agent.close()
             
-            if agent_response.get("status") == "error":
-                # 할당 롤백
-                self.pool.release_pod(backend_pod)
-                return {
-                    "status": "error",
-                    "message": f"Agent 요청 실패: {agent_response.get('message')}"
-                }
-            
-            logger.info(f"Command submitted to backend {backend_pod}")
+            logger.info(f"[SUCCESS] Execute: {frontend_pod} <-> {backend_pod} ({backend_ip})")
             
             return {
                 "status": "success",
-                "message": "Backend Pod에 명령이 전달되었습니다",
+                "message": "Command submitted to backend",
                 "backend_pod": backend_pod,
                 "backend_ip": backend_ip,
                 "tcp_port": 8081,
@@ -127,20 +113,32 @@ class Orchestrator:
                 "submitted_at": datetime.now().isoformat()
             }
             
-        except Exception as e:
-            logger.error(f"Unexpected error in execute_command: {e}", exc_info=True)
+        except httpx.HTTPError as e:
+            if backend_pod:
+                try:
+                    self.pool.release_pod(backend_pod)
+                except Exception:
+                    pass
+            logger.error(f"[FAILED] Execute: Agent communication error ({e})")
             return {
                 "status": "error",
-                "message": f"예상치 못한 에러: {str(e)}"
+                "message": f"Agent communication error: {str(e)}"
+            }
+        except ApiException as e:
+            logger.error(f"[FAILED] Execute: K8s API error ({e.status} {e.reason})")
+            return {
+                "status": "error",
+                "message": f"K8s API error: {e.reason}"
+            }
+        except Exception as e:
+            logger.error(f"[FAILED] Execute: Unexpected error ({e})")
+            return {
+                "status": "error",
+                "message": f"Unexpected error: {str(e)}"
             }
     
     def get_pool_status(self) -> Dict:
-        """
-        Pool 전체 상태 조회
-        
-        Returns:
-            Dict: Pool 상태
-        """
+        """Pool 전체 상태 조회"""
         pool_list = self.pool.list_pool_status()
         
         available_count = sum(1 for p in pool_list if p["pool_status"] == "available")
@@ -154,19 +152,12 @@ class Orchestrator:
         }
     
     def release_backend(self, backend_pod: str) -> Dict:
-        """
-        Backend Pod 할당 해제
-        
-        작업 완료 후 호출하여 Pod를 Pool로 반환
-        
-        Args:
-            backend_pod: Backend Pod 이름
-            
-        Returns:
-            Dict: 해제 결과
-        """
+        """Backend Pod 할당 해제"""
         try:
-            # Pod IP 조회하여 Agent에 unmount 요청
+            # 해제 전 연결 정보 조회
+            pod = self.pool.v1.read_namespaced_pod(backend_pod, self.pool.namespace)
+            frontend = pod.metadata.labels.get(self.pool.LABEL_FRONTEND, "unknown")
+
             backend_ip = self.pool.get_pod_ip(backend_pod)
             if backend_ip:
                 agent = BackendAgent(backend_ip)
@@ -175,19 +166,14 @@ class Orchestrator:
                 finally:
                     agent.close()
             
-            # Pool로 반환
-            if self.pool.release_pod(backend_pod):
-                return {
-                    "status": "success",
-                    "message": f"Backend Pod '{backend_pod}'가 Pool로 반환되었습니다"
-                }
-            else:
-                return {
-                    "status": "error",
-                    "message": f"Backend Pod '{backend_pod}' 해제 실패"
-                }
+            self.pool.release_pod(backend_pod)
+            logger.info(f"[SUCCESS] Released: {frontend} <-> {backend_pod} ({backend_ip})")
+            return {
+                "status": "success",
+                "message": f"Released: {backend_pod}"
+            }
         except Exception as e:
-            logger.error(f"Error releasing backend {backend_pod}: {e}")
+            logger.error(f"[FAILED] Release: {backend_pod} ({e})")
             return {
                 "status": "error",
                 "message": str(e)
@@ -195,12 +181,8 @@ class Orchestrator:
 
     def check_stale_allocations(self) -> Dict:
         """
-        K8s API로 할당된 Backend의 Frontend Pod 상태를 확인하여
-        비정상 할당을 감지하고 자동 해제
-
-        확인 항목:
-        - Frontend Pod가 존재하는지 (삭제됨?)
-        - Frontend Pod가 Running 상태인지 (재시작됨?)
+        비정상 할당 감지 및 자동 해제
+        Frontend Pod가 존재하지 않거나 Running이 아닌 경우 해제
         """
         pool_list = self.pool.list_pool_status()
         assigned = [p for p in pool_list if p["pool_status"] == "assigned"]
@@ -215,13 +197,11 @@ class Orchestrator:
             if not frontend_pod:
                 continue
 
-            # K8s API로 Frontend Pod 상태 확인
             frontend_status = self.pool.get_pod_status(frontend_pod)
 
             if frontend_status is None:
-                # Frontend Pod가 존재하지 않음 → 릴리즈
                 logger.warning(
-                    f"Frontend '{frontend_pod}' not found, releasing backend '{backend_pod}'"
+                    f"Frontend '{frontend_pod}' not found, releasing '{backend_pod}'"
                 )
                 result = self.release_backend(backend_pod)
                 if result["status"] == "success":
@@ -230,10 +210,9 @@ class Orchestrator:
                     errors.append({"pod": backend_pod, "error": result["message"]})
 
             elif frontend_status != "Running":
-                # Frontend Pod가 Running이 아님 → 릴리즈
                 logger.warning(
                     f"Frontend '{frontend_pod}' is {frontend_status}, "
-                    f"releasing backend '{backend_pod}'"
+                    f"releasing '{backend_pod}'"
                 )
                 result = self.release_backend(backend_pod)
                 if result["status"] == "success":

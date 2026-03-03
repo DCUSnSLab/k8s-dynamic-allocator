@@ -4,12 +4,14 @@ import json
 import logging
 from datetime import datetime
 
-from services import Orchestrator
+from config.settings import _conn_map, get_request_id, set_request_id, next_conn_id
 
 logger = logging.getLogger(__name__)
 
-# Orchestrator 인스턴스
-orchestrator = Orchestrator()
+
+def _get_orchestrator():
+    from api.apps import orchestrator_instance
+    return orchestrator_instance
 
 
 def json_response(data, status=200):
@@ -32,7 +34,7 @@ def execute_command(request):
     if request.method != 'POST':
         return json_response({
             'status': 'error',
-            'message': 'POST 메서드만 지원합니다'
+            'message': 'Only POST method is allowed'
         }, status=405)
     
     try:
@@ -45,52 +47,43 @@ def execute_command(request):
         if not username:
             return json_response({
                 'status': 'error',
-                'message': 'username은 필수입니다'
+                'message': 'username is required'
             }, status=400)
         
         if not command:
             return json_response({
                 'status': 'error',
-                'message': 'command는 필수입니다'
+                'message': 'command is required'
             }, status=400)
         
-        logger.info("=" * 60)
-        logger.info("[Controller] 새로운 명령 실행 요청 수신")
-        logger.info(f"  Username: {username}")
-        logger.info(f"  Command: {command}")
-        logger.info(f"  Frontend Pod: {frontend_pod}")
-        logger.info(f"  Timestamp: {datetime.now().isoformat()}")
-        logger.info("=" * 60)
-        
+        set_request_id(next_conn_id())
+        logger.info(f"Execute request: frontend={frontend_pod}, user={username}, command={command}")
+
         # Backend Pod 할당 및 실행 요청
-        result = orchestrator.execute_command(username, command, frontend_pod)
-        
-        # 로그 출력
+        result = _get_orchestrator().execute_command(username, command, frontend_pod)
+
+        # conn mapping
         if result['status'] == 'success':
-            logger.info(f"[Controller] 명령 전달 성공: {result.get('backend_pod')}")
-        else:
-            logger.error(f"[Controller] 명령 전달 실패: {result.get('message')}")
-        
-        logger.info("=" * 60)
+            _conn_map[result.get('backend_pod')] = get_request_id()
         
         # HTTP 상태 코드 결정
-        status_code = 200 if result['status'] == 'success' else 500
+        status_code = 200 if result['status'] == 'success' else 503
         
         return json_response(result, status=status_code)
         
     except json.JSONDecodeError as e:
-        logger.error(f"[Controller] JSON 파싱 에러: {str(e)}")
+        logger.error(f"JSON parse error: {str(e)}")
         return json_response({
             'status': 'error',
-            'message': '잘못된 JSON 형식입니다',
+            'message': 'Invalid JSON format',
             'detail': str(e)
         }, status=400)
         
     except Exception as e:
-        logger.error(f"[Controller] 예상치 못한 에러: {str(e)}", exc_info=True)
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
         return json_response({
             'status': 'error',
-            'message': '서버 내부 에러가 발생했습니다',
+            'message': 'Internal server error',
             'detail': str(e)
         }, status=500)
 
@@ -101,7 +94,7 @@ def health_check(request):
     컨트롤러 Pod 헬스 체크 엔드포인트
     """
     try:
-        result = orchestrator.health_check()
+        result = _get_orchestrator().health_check()
     except Exception as e:
         result = "[error] " + str(e)
 
@@ -121,14 +114,14 @@ def pool_status(request):
     if request.method != 'GET':
         return json_response({
             'status': 'error',
-            'message': 'GET 메서드만 지원합니다'
+            'message': 'Only GET method is allowed'
         }, status=405)
     
     try:
-        result = orchestrator.get_pool_status()
+        result = _get_orchestrator().get_pool_status()
         return json_response(result)
     except Exception as e:
-        logger.error(f"[Controller] Pool 상태 조회 에러: {str(e)}", exc_info=True)
+        logger.error(f"Pool status error: {str(e)}", exc_info=True)
         return json_response({
             'status': 'error',
             'message': str(e)
@@ -143,18 +136,18 @@ def initialize_pool(request):
     if request.method != 'POST':
         return json_response({
             'status': 'error',
-            'message': 'POST 메서드만 지원합니다'
+            'message': 'Only POST method is allowed'
         }, status=405)
     
     try:
-        result = orchestrator.initialize_pool()
+        result = _get_orchestrator().initialize_pool()
         return json_response({
             'status': 'success',
-            'message': 'Pool 초기화 완료',
+            'message': 'Pool initialized',
             'result': result
         })
     except Exception as e:
-        logger.error(f"[Controller] Pool 초기화 에러: {str(e)}", exc_info=True)
+        logger.error(f"Pool init error: {str(e)}", exc_info=True)
         return json_response({
             'status': 'error',
             'message': str(e)
@@ -169,7 +162,7 @@ def release_backend(request):
     if request.method != 'POST':
         return json_response({
             'status': 'error',
-            'message': 'POST 메서드만 지원합니다'
+            'message': 'Only POST method is allowed'
         }, status=405)
     
     try:
@@ -179,10 +172,15 @@ def release_backend(request):
         if not backend_pod:
             return json_response({
                 'status': 'error',
-                'message': 'backend_pod는 필수입니다'
+                'message': 'backend_pod is required'
             }, status=400)
-        
-        result = orchestrator.release_backend(backend_pod)
+
+        # execute 때 저장한 conn 복원
+        conn_id = _conn_map.pop(backend_pod, None)
+        if conn_id:
+            set_request_id(conn_id)
+
+        result = _get_orchestrator().release_backend(backend_pod)
         
         status_code = 200 if result['status'] == 'success' else 500
         return json_response(result, status=status_code)
@@ -190,10 +188,10 @@ def release_backend(request):
     except json.JSONDecodeError as e:
         return json_response({
             'status': 'error',
-            'message': '잘못된 JSON 형식입니다'
+            'message': 'Invalid JSON format'
         }, status=400)
     except Exception as e:
-        logger.error(f"[Controller] Backend 해제 에러: {str(e)}", exc_info=True)
+        logger.error(f"Release error: {str(e)}", exc_info=True)
         return json_response({
             'status': 'error',
             'message': str(e)
@@ -211,13 +209,13 @@ def check_stale(request):
     if request.method != 'POST':
         return json_response({
             'status': 'error',
-            'message': 'POST 메서드만 지원합니다'
+            'message': 'Only POST method is allowed'
         }, status=405)
 
     try:
-        result = orchestrator.check_stale_allocations()
+        result = _get_orchestrator().check_stale_allocations()
         logger.info(
-            f"[Controller] Stale check: {result['checked']} checked, "
+            f"Stale check: {result['checked']} checked, "
             f"{len(result['released'])} released"
         )
         return json_response({
@@ -225,7 +223,7 @@ def check_stale(request):
             **result
         })
     except Exception as e:
-        logger.error(f"[Controller] Stale check 에러: {str(e)}", exc_info=True)
+        logger.error(f"Stale check error: {str(e)}", exc_info=True)
         return json_response({
             'status': 'error',
             'message': str(e)

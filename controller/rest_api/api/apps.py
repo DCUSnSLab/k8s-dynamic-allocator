@@ -3,6 +3,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# apps.py에서 생성한 인스턴스를 views.py에서 import
+orchestrator_instance = None
+
 
 class ApiConfig(AppConfig):
     default_auto_field = 'django.db.models.BigAutoField'
@@ -10,10 +13,11 @@ class ApiConfig(AppConfig):
     
     def ready(self):
         """
-        앱 시작 시 호출됨
-        
-        Backend Pool 자동 초기화
+        Called on app startup.
+        Auto-initializes Backend Pool.
         """
+        global orchestrator_instance
+        
         # Django 개발 서버의 reloader 중복 실행 방지
         import os
         if os.environ.get('RUN_MAIN', None) != 'true':
@@ -22,15 +26,16 @@ class ApiConfig(AppConfig):
         try:
             from services import Orchestrator
             
-            logger.info("=" * 60)
-            logger.info("[Controller] 앱 시작 - Backend Pool 초기화 중...")
+            logger.info("Controller starting - initializing backend pool...")
             
-            orchestrator = Orchestrator()
-            result = orchestrator.initialize_pool()
+            orchestrator_instance = Orchestrator()
+            result = orchestrator_instance.initialize_pool()
             
-            logger.info(f"[Controller] Pool 초기화 결과: {result}")
-            logger.info("=" * 60)
+            created = len(result.get('created', []))
+            existing = len(result.get('existing', []))
+            failed = len(result.get('failed', []))
+            logger.info(f"Pool init complete: {created} created, {existing} existing, {failed} failed")
             
         except Exception as e:
-            logger.error(f"[Controller] Pool 초기화 실패: {e}")
-            # 초기화 실패해도 앱은 시작하도록 함
+            logger.error(f"Pool init failed: {e}")
+

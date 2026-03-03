@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 MANIFESTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "manifests")
 
 
+class PodConflictError(Exception):
+    """Pod 할당 충돌 (422) — 다른 Controller가 이미 할당함"""
+    pass
+
+
 class BackendPool(KubernetesClient):
     """
     Deployment 기반 Backend Pod Pool 관리 클래스
@@ -50,18 +55,14 @@ class BackendPool(KubernetesClient):
     def initialize_pool(self) -> Dict:
         """
         manifests/ 하위 모든 YAML을 스캔하여 Deployment 생성
-        
-        이미 존재하는 Deployment는 건너뛰고, 없는 것만 생성
-        
-        Returns:
-            Dict: 초기화 결과
+        (시작 시 1회성 — 로그 유지)
         """
         results = {"created": [], "existing": [], "failed": []}
         
         yaml_files = glob.glob(os.path.join(MANIFESTS_DIR, "*.yaml"))
         
         if not yaml_files:
-            logger.warning(f"No YAML files found in {MANIFESTS_DIR}")
+            logger.warning(f"No manifest files found in {MANIFESTS_DIR}")
             return results
         
         for yaml_file in yaml_files:
@@ -79,40 +80,46 @@ class BackendPool(KubernetesClient):
                     namespace=self.namespace,
                     body=spec
                 )
-                logger.info(f"Created deployment: {name}")
+                logger.info(f"Deployment created: {name}")
                 results["created"].append(name)
                 
             except ApiException as e:
                 if e.status == 409:
-                    logger.info(f"Deployment {name} already exists")
+                    logger.info(f"Deployment exists: {name}")
                     results["existing"].append(name)
                 else:
-                    logger.error(f"Failed to create deployment from {yaml_file}: {e}")
+                    logger.error(f"Deployment creation failed ({os.path.basename(yaml_file)}): {e}")
                     results["failed"].append({"file": os.path.basename(yaml_file), "error": str(e)})
             except Exception as e:
-                logger.error(f"Failed to load {yaml_file}: {e}")
+                logger.error(f"Manifest load failed ({os.path.basename(yaml_file)}): {e}")
                 results["failed"].append({"file": os.path.basename(yaml_file), "error": str(e)})
         
         return results
     
+    # 클래스 레벨 캐시 — 프로세스당 1회만 조회
+    _cached_owner_ref = None
+    _owner_ref_resolved = False
+
     def _get_owner_deployment(self) -> Optional[Dict]:
         """
-        자신의 Pod → ReplicaSet → Deployment 소유 체인을 추적하여
-        Controller Deployment의 OwnerReference 정보를 반환
-        
-        Returns:
-            Optional[Dict]: ownerReference dict (없으면 None)
+        Pod → ReplicaSet → Deployment 소유 체인 추적
+        (프로세스당 1회만 실행, 결과 캐시)
         """
+        if BackendPool._owner_ref_resolved:
+            return BackendPool._cached_owner_ref
+
         try:
             pod_name = os.getenv("HOSTNAME")
             if not pod_name:
                 logger.warning("HOSTNAME not set, skipping OwnerReference")
+                BackendPool._owner_ref_resolved = True
                 return None
             
             # Pod → ReplicaSet
             pod = self.v1.read_namespaced_pod(pod_name, self.namespace)
             if not pod.metadata.owner_references:
                 logger.warning("Pod has no ownerReferences")
+                BackendPool._owner_ref_resolved = True
                 return None
             
             rs_ref = pod.metadata.owner_references[0]
@@ -121,6 +128,7 @@ class BackendPool(KubernetesClient):
             # ReplicaSet → Deployment
             if not rs.metadata.owner_references:
                 logger.warning("ReplicaSet has no ownerReferences")
+                BackendPool._owner_ref_resolved = True
                 return None
             
             deploy_ref = rs.metadata.owner_references[0]
@@ -133,127 +141,110 @@ class BackendPool(KubernetesClient):
                 "blockOwnerDeletion": True,
             }
             
-            logger.info(f"Owner deployment: {deploy_ref.name} (uid={deploy_ref.uid})")
+            logger.info(f"OwnerRef resolved: {deploy_ref.name} (uid={deploy_ref.uid})")
+            BackendPool._cached_owner_ref = owner_ref
+            BackendPool._owner_ref_resolved = True
             return owner_ref
             
         except Exception as e:
             logger.warning(f"Failed to get owner deployment: {e}")
+            BackendPool._owner_ref_resolved = True
             return None
     
     def get_available_pod(self) -> Optional[str]:
         """
         사용 가능한 Pool Pod 조회
         
-        Label selector를 사용하여 available 상태인 Pod 중 하나 반환
-        
         Returns:
-            Optional[str]: 사용 가능한 Pod 이름 (없으면 None)
+            Optional[str]: Pod 이름 (없으면 None)
+        Raises:
+            ApiException: K8s API 에러
         """
-        try:
-            label_selector = f"app={self.LABEL_APP},{self.LABEL_STATUS}={self.STATUS_AVAILABLE}"
-            pods = self.v1.list_namespaced_pod(
-                namespace=self.namespace,
-                label_selector=label_selector
-            )
-            
-            # Running 상태인 Pod만 필터링
-            running_pods = [
-                pod for pod in pods.items
-                if pod.status.phase == "Running"
-            ]
-            
-            if not running_pods:
-                logger.warning("No available pool pods found")
-                return None
-            
-            # [임시] 첫 번째 Pod 반환
-            selected_pod = running_pods[0].metadata.name
-            logger.info(f"Selected available pod: {selected_pod}")
-            return selected_pod
-            
-        except ApiException as e:
-            logger.error(f"Failed to list available pods: {e}")
+        label_selector = f"app={self.LABEL_APP},{self.LABEL_STATUS}={self.STATUS_AVAILABLE}"
+        pods = self.v1.list_namespaced_pod(
+            namespace=self.namespace,
+            label_selector=label_selector
+        )
+        
+        running_pods = [
+            pod for pod in pods.items
+            if pod.status.phase == "Running"
+        ]
+        
+        if not running_pods:
             return None
-    
-    def assign_pod(self, pod_name: str, frontend_pod: str) -> bool:
-        """
-        Pod를 Frontend에 할당 (Label 업데이트)
         
-        Args:
-            pod_name: 할당할 Pool Pod 이름
-            frontend_pod: 연결할 Frontend Pod 이름
-            
-        Returns:
-            bool: 할당 성공 여부
+        return running_pods[0].metadata.name
+    
+    def assign_pod(self, pod_name: str, frontend_pod: str) -> None:
+        """
+        Pod를 Frontend에 할당 (JSON Patch + test로 경쟁 방지)
+        
+        Raises:
+            PodConflictError: 422 — 이미 다른 Controller가 할당
+            ApiException: 그 외 K8s API 에러
         """
         try:
-            patch = {
-                "metadata": {
-                    "labels": {
-                        self.LABEL_STATUS: self.STATUS_ASSIGNED,
-                        self.LABEL_FRONTEND: frontend_pod
-                    }
-                }
-            }
-            self.v1.patch_namespaced_pod(pod_name, self.namespace, patch)
-            logger.info(f"Assigned pod {pod_name} to frontend {frontend_pod}")
-            return True
+            patch = [
+                {"op": "test", "path": "/metadata/labels/pool-status", "value": self.STATUS_AVAILABLE},
+                {"op": "replace", "path": "/metadata/labels/pool-status", "value": self.STATUS_ASSIGNED},
+                {"op": "replace", "path": "/metadata/labels/assigned-frontend", "value": frontend_pod}
+            ]
+            self.v1.api_client.call_api(
+                '/api/v1/namespaces/{namespace}/pods/{name}',
+                'PATCH',
+                path_params={'namespace': self.namespace, 'name': pod_name},
+                body=patch,
+                header_params={'Content-Type': 'application/json-patch+json'},
+                response_type='V1Pod',
+                auth_settings=['BearerToken'],
+                _return_http_data_only=True,
+                _preload_content=True
+            )
         except ApiException as e:
-            logger.error(f"Failed to assign pod {pod_name}: {e}")
-            return False
+            if e.status == 422:
+                raise PodConflictError(f"{pod_name} already taken")
+            raise
     
-    def release_pod(self, pod_name: str) -> bool:
+    def release_pod(self, pod_name: str) -> None:
         """
         Pod 할당 해제 (Label 업데이트)
         
-        Args:
-            pod_name: 해제할 Pool Pod 이름
-            
-        Returns:
-            bool: 해제 성공 여부
+        Raises:
+            ApiException: K8s API 에러
         """
-        try:
-            patch = {
-                "metadata": {
-                    "labels": {
-                        self.LABEL_STATUS: self.STATUS_AVAILABLE,
-                        self.LABEL_FRONTEND: ""
-                    }
+        patch = {
+            "metadata": {
+                "labels": {
+                    self.LABEL_STATUS: self.STATUS_AVAILABLE,
+                    self.LABEL_FRONTEND: ""
                 }
             }
-            self.v1.patch_namespaced_pod(pod_name, self.namespace, patch)
-            logger.info(f"Released pod {pod_name}")
-            return True
-        except ApiException as e:
-            logger.error(f"Failed to release pod {pod_name}: {e}")
-            return False
+        }
+        self.v1.patch_namespaced_pod(pod_name, self.namespace, patch)
     
     def list_pool_status(self) -> List[Dict]:
         """
         Pool 전체 상태 조회
         
-        Returns:
-            List[Dict]: Pool Pod 상태 목록
+        Raises:
+            ApiException: K8s API 에러
         """
-        try:
-            label_selector = f"app={self.LABEL_APP}"
-            pods = self.v1.list_namespaced_pod(
-                namespace=self.namespace,
-                label_selector=label_selector
-            )
-            
-            status_list = []
-            for pod in pods.items:
-                status_list.append({
-                    "name": pod.metadata.name,
-                    "phase": pod.status.phase,
-                    "backend_type": pod.metadata.labels.get("backend-type", "unknown"),
-                    "pool_status": pod.metadata.labels.get(self.LABEL_STATUS, "unknown"),
-                    "assigned_frontend": pod.metadata.labels.get(self.LABEL_FRONTEND, ""),
-                    "ip": pod.status.pod_ip
-                })
-            
-            return status_list
-        except ApiException as e:
-            logger.error(f"Failed to list pool status: {e}")
-            return []
+        label_selector = f"app={self.LABEL_APP}"
+        pods = self.v1.list_namespaced_pod(
+            namespace=self.namespace,
+            label_selector=label_selector
+        )
+        
+        status_list = []
+        for pod in pods.items:
+            status_list.append({
+                "name": pod.metadata.name,
+                "phase": pod.status.phase,
+                "backend_type": pod.metadata.labels.get("backend-type", "unknown"),
+                "pool_status": pod.metadata.labels.get(self.LABEL_STATUS, "unknown"),
+                "assigned_frontend": pod.metadata.labels.get(self.LABEL_FRONTEND, ""),
+                "ip": pod.status.pod_ip
+            })
+        
+        return status_list
