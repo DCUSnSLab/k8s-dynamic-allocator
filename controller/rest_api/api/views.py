@@ -4,7 +4,9 @@ import json
 import logging
 from datetime import datetime
 
-from config.settings import _conn_map, get_request_id, set_request_id, next_conn_id
+from django.core.cache import cache
+
+from config.settings import get_request_id, set_request_id, next_conn_id
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +31,7 @@ def json_response(data, status=200):
 @csrf_exempt
 def execute_command(request):
     """
-    Frontend Pod로부터 Backend Pod 실행 요청을 받는 API
+    Frontend Pod로부터 Backend 명령 실행 요청을 수신하여 할당을 Trigger 하는 API
     """
     if request.method != 'POST':
         return json_response({
@@ -64,7 +66,9 @@ def execute_command(request):
 
         # conn mapping
         if result['status'] == 'success':
-            _conn_map[result.get('backend_pod')] = get_request_id()
+            backend_pod = result.get('backend_pod')
+            if backend_pod:
+                cache.set(f"conn_map_{backend_pod}", get_request_id(), timeout=86400)
         
         # HTTP 상태 코드 결정
         status_code = 200 if result['status'] == 'success' else 503
@@ -91,7 +95,7 @@ def execute_command(request):
 @csrf_exempt
 def health_check(request):
     """
-    컨트롤러 Pod 헬스 체크 엔드포인트
+    컨트롤러 생존 상태 검사용 헬스 체크 API
     """
     try:
         result = _get_orchestrator().health_check()
@@ -176,9 +180,10 @@ def release_backend(request):
             }, status=400)
 
         # execute 때 저장한 conn 복원
-        conn_id = _conn_map.pop(backend_pod, None)
+        conn_id = cache.get(f"conn_map_{backend_pod}")
         if conn_id:
             set_request_id(conn_id)
+            cache.delete(f"conn_map_{backend_pod}")
 
         result = _get_orchestrator().release_backend(backend_pod)
         

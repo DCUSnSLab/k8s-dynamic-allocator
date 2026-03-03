@@ -15,14 +15,10 @@ AGENT_TIMEOUT = 30.0
 
 class BackendAgent:
     """
-    Backend Agent HTTP 클라이언트
+    Backend Agent 통신용 HTTP 클라이언트
     
-    특정 Backend Pod의 Agent와 통신
-    - 마운트 요청
-    - 상태 조회
-    - 마운트 해제
-    
-    에러 시 httpx.HTTPError를 raise (로그는 상위 레이어에서 처리)
+    - 특정 Backend Pod IP 타겟 HTTP(/mount, /unmount) 통신
+    - 명령어 터미널 진입 전 SSHFS 환경 격리 세팅 및 자원 종료(Lifecycle) 제어
     """
     
     def __init__(self, pod_ip: str):
@@ -49,19 +45,7 @@ class BackendAgent:
         response = self.client.post(url, json=payload)
         response.raise_for_status()
         return response.json()
-    
-    def get_status(self) -> Dict:
-        """
-        Agent 상태 조회
-        
-        Raises:
-            httpx.HTTPError: HTTP 통신 에러
-        """
-        url = f"{self.base_url}/status"
-        
-        response = self.client.get(url)
-        response.raise_for_status()
-        return response.json()
+
     
     def unmount(self) -> Dict:
         """

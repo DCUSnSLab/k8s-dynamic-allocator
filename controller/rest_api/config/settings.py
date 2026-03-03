@@ -34,7 +34,6 @@ INSTALLED_APPS = [
 # ──────────────────────────────────────────────
 _local = threading.local()
 _counter = itertools.count()
-_conn_map = {}  # backend_pod → conn_id
 
 
 def get_request_id():
@@ -78,6 +77,13 @@ TEMPLATES = []
 WSGI_APPLICATION = 'config.wsgi.application'
 
 DATABASES = {}
+
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'controller-conn-cache',
+    }
+}
 
 LANGUAGE_CODE = 'ko-kr'
 TIME_ZONE = 'Asia/Seoul'

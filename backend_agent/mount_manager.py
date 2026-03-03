@@ -1,8 +1,8 @@
 """
 Mount Manager (Chroot Version)
 
-SSHFS 마운트 및 Chroot 환경 구성을 담당
-Mount Namespace를 사용하여 프로세스 격리 및 자동 Cleanup 지원
+- SSHFS 원격 마운트 및 Mount Namespace 프로세스 격리 모듈
+- Target Frontend Pod 파일시스템 바인딩 및 세션 종료 시의 자동 Cleanup 환경 제어
 """
 
 import asyncio
@@ -95,7 +95,10 @@ class MountManager:
     @staticmethod
     def setup_chroot_namespace(frontend_ip: str, cwd: str = "/home/dcuuser"):
         """
-        Mount Namespace를 생성하고 Chroot 환경을 구성 (subprocess의 preexec_fn에서 호출)
+        Mount Namespace 생성 기반 Frontend Pod 대상 SSHFS 격리 마운트 (Chroot)
+        
+        - 호출 시점: Subprocess 생성 시 preexec_fn
+        - 영향 범위: 호스트(부모)가 아닌 분기된 자식 세션 프로세스의 네임스페이스 한정
         """
         try:
             import ctypes

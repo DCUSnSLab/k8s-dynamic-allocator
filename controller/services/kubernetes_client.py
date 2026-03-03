@@ -1,7 +1,7 @@
 """
 Kubernetes Client Base
 
-Kubernetes API 연결 및 공통 Pod 조회 기능을 제공하는 기본 클래스
+- K8s API 연결 및 공통 Pod 단일 상태 조회 인터페이스 제공
 """
 
 import logging
@@ -20,10 +20,10 @@ _config_loaded = False
 
 class KubernetesClient(ABC):
     """
-    Kubernetes API 클라이언트 기본 클래스
-    
-    하위 레이어: 에러 시 exception raise (로그 없음)
-    config 로드는 프로세스당 1회만 실행 + 로그
+    Kubernetes API 클라이언트 공통 베이스 클래스
+
+    - InCluster/KubeConfig 인증 과정 통합 (프로세스 최초 1회 로드)
+    - Pod IP 및 구동 Status 획득 공통 로직 내장
     """
     
     def __init__(self, namespace: str = None):
@@ -61,7 +61,7 @@ class KubernetesClient(ABC):
     
     def get_pod_status(self, pod_name: str) -> Optional[str]:
         """
-        Pod 상태 조회 (Running, Pending 등)
+        Pod 현재 가동 상태 판별 (Running, Pending 등 명시)
         
         Returns:
             Optional[str]: Pod 상태 (존재하지 않으면 None)
@@ -73,13 +73,4 @@ class KubernetesClient(ABC):
             if e.status == 404:
                 return None
             raise
-    
-    def pod_exists(self, pod_name: str) -> bool:
-        """Pod 존재 여부 확인"""
-        try:
-            self.v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
-            return True
-        except ApiException as e:
-            if e.status == 404:
-                return False
-            raise
+

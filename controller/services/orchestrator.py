@@ -1,8 +1,9 @@
 """
 Orchestrator
 
-Backend Pool과 Agent를 조율하는 메인 Orchestrator 클래스
-모든 Backend 관련 요청의 진입점 + 유일한 로그 출력 지점
+- Backend Pool(K8s Deployment/Pods) 단위와 Backend Agent 연동 통제 최상위 클래스
+- Frontend 요청 수신, 가용 Backend 할당(Allocation) 연계
+- 선택된 Pod 내 Agent API 마운트 실행 및 Release(해제) 로직 오케스트레이션 전담
 """
 
 import logging
@@ -35,11 +36,12 @@ class Orchestrator:
     
     def execute_command(self, username: str, command: str, frontend_pod: str) -> Dict:
         """
-        Backend Pod에서 명령 실행
-
-        1. Frontend Pod IP 조회
-        2. Pool에서 Pod 선택 + 할당 (경쟁 시 재시도)
-        3. Agent에 마운트 및 실행 요청
+        Frontend 요청 기반 Backend Pod 할당 및 터미널 명령어(SSHFS) 마운트 트리거(Trigger)
+        
+        - 과정:
+          1. 요청 주체(Frontend Pod) IP 상태 점검
+          2. 가용(Available) Backend Pod 탐색 및 Label 점유 (충돌 발생 시 Retry)
+          3. 연결된 Backend Pod의 HTTP Agent API 연동 (Mount 비동기 요청 전송)
         """
         backend_pod = None
         
@@ -62,11 +64,6 @@ class Orchestrator:
                         "status": "error",
                         "message": "No available backend pods"
                     }
-
-                # 2-1. 할당 전 1초 대기 (경쟁 완화)
-                import time
-                time.sleep(1)
-
                 try:
                     self.pool.assign_pod(backend_pod, frontend_pod)
                     break
@@ -117,8 +114,8 @@ class Orchestrator:
             if backend_pod:
                 try:
                     self.pool.release_pod(backend_pod)
-                except Exception:
-                    pass
+                except Exception as ex:
+                    logger.warning(f"Failed to release pod {backend_pod} during fallback: {ex}")
             logger.error(f"[FAILED] Execute: Agent communication error ({e})")
             return {
                 "status": "error",
@@ -181,8 +178,10 @@ class Orchestrator:
 
     def check_stale_allocations(self) -> Dict:
         """
-        비정상 할당 감지 및 자동 해제
-        Frontend Pod가 존재하지 않거나 Running이 아닌 경우 해제
+        비정상 할당 감지 및 자동 해제 (가비지 컬렉터 역할)
+        
+        - 대상: K8s 내 할당 매칭된 Frontend Pod가 없거나 Running 상태가 아닌 경우
+        - 조치: 대상 Backend Pod 연결 강제 해제 및 Assigned(할당됨) Label 거두기
         """
         pool_list = self.pool.list_pool_status()
         assigned = [p for p in pool_list if p["pool_status"] == "assigned"]

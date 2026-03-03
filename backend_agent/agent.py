@@ -1,10 +1,9 @@
 """
-Backend Agent - FastAPI Server
+Backend Agent - HTTP API Server
 
 Backend Pool Pod 내에서 실행되는 경량 HTTP 서버
 - SSHFS 마운트 관리
-- 명령어 실행
-- 상태 조회
+- 백엔드 상태 단일 조회
 """
 
 import asyncio
@@ -48,7 +47,7 @@ class FormattedJSONResponse(JSONResponse):
         ) + "\n").encode("utf-8")
 
 
-# Request/Response 모델
+# Request 모델
 
 class MountRequest(BaseModel):
     """마운트 요청"""
@@ -56,29 +55,15 @@ class MountRequest(BaseModel):
     command: str
 
 
-class MountResponse(BaseModel):
-    """마운트 응답"""
-    status: str
-    message: Optional[str] = None
-
-
-class UnmountResponse(BaseModel):
-    """마운트 해제 응답"""
-    status: str
-    message: Optional[str] = None
-
-
 # 상태 관리
 
 class AgentState:
-    """Agent 상태 관리"""
+    """Agent 작동 상태 메모리 관리"""
     def __init__(self):
         self.status = "idle"
         self.frontend_ip: Optional[str] = None
         self.command: Optional[str] = None
-        self.result: Optional[str] = None
         self.started_at: Optional[datetime] = None
-        self.completed_at: Optional[datetime] = None
         self._lock = asyncio.Lock()
     
     async def set_mounting(self, frontend_ip: str, command: str):
@@ -87,42 +72,28 @@ class AgentState:
             self.frontend_ip = frontend_ip
             self.command = command
             self.started_at = datetime.now()
-            self.completed_at = None
-            self.result = None
     
     async def set_running(self):
         async with self._lock:
             self.status = "running"
     
-    async def set_completed(self, result: str):
-        async with self._lock:
-            self.status = "completed"
-            self.result = result
-            self.completed_at = datetime.now()
-    
     async def set_error(self, error: str):
         async with self._lock:
             self.status = "error"
-            self.result = error
-            self.completed_at = datetime.now()
     
     async def reset(self):
         async with self._lock:
             self.status = "idle"
             self.frontend_ip = None
             self.command = None
-            self.result = None
             self.started_at = None
-            self.completed_at = None
     
     def to_dict(self) -> dict:
         return {
             "status": self.status,
             "frontend_ip": self.frontend_ip,
             "command": self.command,
-            "result": self.result,
-            "started_at": self.started_at.isoformat() if self.started_at else None,
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None
+            "started_at": self.started_at.isoformat() if self.started_at else None
         }
 
 
@@ -152,33 +123,11 @@ async def get_status():
     return FormattedJSONResponse(data)
 
 
-@app.get("/result")
-async def get_result():
-    """
-    실행 결과만 plain text로 반환
-    
-    터미널에서 직접 실행한 것처럼 결과 확인 가능
-    """
-    from fastapi.responses import PlainTextResponse
-    
-    if state.result is None:
-        return PlainTextResponse(
-            content="(결과 없음)\n",
-            status_code=200
-        )
-    
-    # 결과 끝에 줄바꿈 추가
-    result_text = state.result
-    if not result_text.endswith("\n"):
-        result_text += "\n"
-    
-    return PlainTextResponse(content=result_text, status_code=200)
-
-
 @app.post("/mount")
 async def mount(request: MountRequest):
     """
-    Frontend에 SSHFS 마운트 (명령 실행은 TCP 서버에서 처리)
+    Frontend 대상 SSHFS 마운트 요청 처리
+    (실제 명령어 PTY 실행은 별도의 TCP 서버 포트에서 당담)
     """
     if state.status not in ["idle", "completed", "error"]:
         raise HTTPException(

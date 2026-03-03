@@ -1,7 +1,8 @@
 """
 TCP Terminal Server
 
-Frontend의 터미널과 직접 연결하여 PTY 입출력을 처리하는 TCP 서버
+- Controller 중계 없이 Frontend(WebTTY) 클라이언트 간 다이렉트 TCP 소켓 연결 서버
+- PTY 모듈을 이용한 양방향 Raw 바이너리 TTY/Shell 에뮬레이션 전담
 """
 
 import asyncio
@@ -74,13 +75,13 @@ class TCPTerminalServer:
 
     async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """
-        클라이언트 연결 처리
+        [신규 터미널 소켓 세션 수립 프로세스]
 
-        프로토콜:
-        1. 첫 줄: JSON Header ({command, cwd, rows, cols, term, settings})
-        2. 이후: 터미널 입출력
+        - 통신 프로토콜:
+          1. Connection 최초 수신: JSON 속성 메타데이터 Header ({command, cwd, rows, cols, term, settings})
+          2. 이후 스트림: 터미널 양방향 Raw 바이너리 입출력
 
-        모든 세션 상태는 로컬 변수로 관리
+        - 세션 독립성: Window Size 제어(io_ctl), 환경변수, pty fd 등 모든 상태는 독립 변수 격리로 처리
         """
         addr = writer.get_extra_info('peername')
         session_id = id(writer)

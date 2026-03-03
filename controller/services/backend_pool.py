@@ -1,8 +1,8 @@
 """
-Backend Pod Pool Manager
+Backend Pool Manager
 
-Deployment 기반 Backend Pool 관리 클래스
-manifests/ 디렉토리의 YAML 파일을 자동 스캔하여 Deployment 생성 및 관리
+- K8s Deployment 기반 Backend Pool Pod 상태 식별
+- K8s Label 변경을 통한 특정 Frontend 대상 가용(Available) Pod 점유 할당 및 해제 매니징
 """
 
 import glob
@@ -29,12 +29,11 @@ class PodConflictError(Exception):
 
 class BackendPool(KubernetesClient):
     """
-    Deployment 기반 Backend Pod Pool 관리 클래스
+    Backend Pod Pool 상태 및 할당 매니저
     
-    - manifests/*.yaml 자동 스캔하여 Deployment 생성
-    - 사용 가능한 Pod 조회 (Label 기반)
-    - Pod 할당/해제 (Label 업데이트)
-    - ReplicaSet이 Pod 자동 복구 담당
+    - manifests/ 디렉토리 템플릿 로드 (초기 구동 1회)
+    - Label Selector 기반 가동 가능 Pod 스케줄링 대행
+    - 동시성 Race Condition 제어 (JSON Patch Test 활용)
     """
     
     # Pool Pod Label 상수
