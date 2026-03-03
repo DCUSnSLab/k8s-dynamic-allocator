@@ -1,39 +1,42 @@
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 import json
 import logging
 from datetime import datetime
 
-from services import BackendOrchestrator
+from django.core.cache import cache
+
+from config.settings import get_request_id, set_request_id, next_conn_id
 
 logger = logging.getLogger(__name__)
+
+
+def _get_orchestrator():
+    from api.apps import orchestrator_instance
+    return orchestrator_instance
+
+
+def json_response(data, status=200):
+    """
+    들여쓰기된 JSON 응답 생성 (끝에 줄바꿈 포함)
+    """
+    json_str = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    return HttpResponse(
+        json_str,
+        content_type='application/json; charset=utf-8',
+        status=status
+    )
 
 
 @csrf_exempt
 def execute_command(request):
     """
-    Frontend Pod로부터 Backend Pod 실행 요청을 받는 API
-    
-    Request Body:
-        {
-            "username": "사용자명",
-            "command": "실행할 명령어",
-            "frontend_pod": "Frontend Pod 이름"
-        }
-    
-    Response:
-        {
-            "status": "success" | "error",
-            "message": "응답 메시지",
-            "pod_name": "생성된 Pod 이름",
-            "namespace": "네임스페이스",
-            "created_at": "2025-10-28T..."
-        }
+    Frontend Pod로부터 Backend 명령 실행 요청을 수신하여 할당을 Trigger 하는 API
     """
     if request.method != 'POST':
-        return JsonResponse({
+        return json_response({
             'status': 'error',
-            'message': 'POST 메서드만 지원합니다'
+            'message': 'Only POST method is allowed'
         }, status=405)
     
     try:
@@ -44,55 +47,47 @@ def execute_command(request):
         
         # 입력 검증
         if not username:
-            return JsonResponse({
+            return json_response({
                 'status': 'error',
-                'message': 'username은 필수입니다'
+                'message': 'username is required'
             }, status=400)
         
         if not command:
-            return JsonResponse({
+            return json_response({
                 'status': 'error',
-                'message': 'command는 필수입니다'
+                'message': 'command is required'
             }, status=400)
         
-        logger.info("=" * 60)
-        logger.info("[Controller] 새로운 Backend Pod 생성 요청 수신")
-        logger.info(f"  Username: {username}")
-        logger.info(f"  Command: {command}")
-        logger.info(f"  Frontend Pod: {frontend_pod}")
-        logger.info(f"  Timestamp: {datetime.now().isoformat()}")
-        logger.info("=" * 60)
-        
-        # Backend Pod 생성
-        orchestrator = BackendOrchestrator()
-        result = orchestrator.create_backend_pod(username, command, frontend_pod)
-        
-        # 로그 출력
+        set_request_id(next_conn_id())
+        logger.info(f"Execute request: frontend={frontend_pod}, user={username}, command={command}")
+
+        # Backend Pod 할당 및 실행 요청
+        result = _get_orchestrator().execute_command(username, command, frontend_pod)
+
+        # conn mapping
         if result['status'] == 'success':
-            logger.info(f"[Controller] Pod 생성 성공: {result.get('pod_name')}")
-        else:
-            logger.error(f"[Controller] Pod 생성 실패: {result.get('message')}")
-        
-        logger.info("=" * 60)
+            backend_pod = result.get('backend_pod')
+            if backend_pod:
+                cache.set(f"conn_map_{backend_pod}", get_request_id(), timeout=86400)
         
         # HTTP 상태 코드 결정
-        status_code = 200 if result['status'] == 'success' else 500
+        status_code = 200 if result['status'] == 'success' else 503
         
-        return JsonResponse(result, status=status_code)
+        return json_response(result, status=status_code)
         
     except json.JSONDecodeError as e:
-        logger.error(f"[Controller] JSON 파싱 에러: {str(e)}")
-        return JsonResponse({
+        logger.error(f"JSON parse error: {str(e)}")
+        return json_response({
             'status': 'error',
-            'message': '잘못된 JSON 형식입니다',
+            'message': 'Invalid JSON format',
             'detail': str(e)
         }, status=400)
         
     except Exception as e:
-        logger.error(f"[Controller] 예상치 못한 에러: {str(e)}", exc_info=True)
-        return JsonResponse({
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        return json_response({
             'status': 'error',
-            'message': '서버 내부 에러가 발생했습니다',
+            'message': 'Internal server error',
             'detail': str(e)
         }, status=500)
 
@@ -100,18 +95,142 @@ def execute_command(request):
 @csrf_exempt
 def health_check(request):
     """
-    컨트롤러 Pod 헬스 체크 엔드포인트
+    컨트롤러 생존 상태 검사용 헬스 체크 API
     """
     try:
-        orchestrator = BackendOrchestrator()
-        result = orchestrator.health_check()
-
+        result = _get_orchestrator().health_check()
     except Exception as e:
         result = "[error] " + str(e)
 
-    return JsonResponse({
+    return json_response({
         'status': 'healthy',
         'service': 'Controller Pod REST API',
         'timestamp': datetime.now().isoformat(),
         'result': result
     })
+
+
+@csrf_exempt
+def pool_status(request):
+    """
+    Backend Pool 상태 조회 엔드포인트
+    """
+    if request.method != 'GET':
+        return json_response({
+            'status': 'error',
+            'message': 'Only GET method is allowed'
+        }, status=405)
+    
+    try:
+        result = _get_orchestrator().get_pool_status()
+        return json_response(result)
+    except Exception as e:
+        logger.error(f"Pool status error: {str(e)}", exc_info=True)
+        return json_response({
+            'status': 'error',
+            'message': str(e)
+        }, status=500)
+
+
+@csrf_exempt
+def initialize_pool(request):
+    """
+    Backend Pool 수동 초기화 엔드포인트
+    """
+    if request.method != 'POST':
+        return json_response({
+            'status': 'error',
+            'message': 'Only POST method is allowed'
+        }, status=405)
+    
+    try:
+        result = _get_orchestrator().initialize_pool()
+        return json_response({
+            'status': 'success',
+            'message': 'Pool initialized',
+            'result': result
+        })
+    except Exception as e:
+        logger.error(f"Pool init error: {str(e)}", exc_info=True)
+        return json_response({
+            'status': 'error',
+            'message': str(e)
+        }, status=500)
+
+
+@csrf_exempt
+def release_backend(request):
+    """
+    Backend Pod 할당 해제 엔드포인트
+    """
+    if request.method != 'POST':
+        return json_response({
+            'status': 'error',
+            'message': 'Only POST method is allowed'
+        }, status=405)
+    
+    try:
+        data = json.loads(request.body)
+        backend_pod = data.get('backend_pod', '')
+        
+        if not backend_pod:
+            return json_response({
+                'status': 'error',
+                'message': 'backend_pod is required'
+            }, status=400)
+
+        # execute 때 저장한 conn 복원
+        conn_id = cache.get(f"conn_map_{backend_pod}")
+        if conn_id:
+            set_request_id(conn_id)
+            cache.delete(f"conn_map_{backend_pod}")
+
+        result = _get_orchestrator().release_backend(backend_pod)
+        
+        status_code = 200 if result['status'] == 'success' else 500
+        return json_response(result, status=status_code)
+        
+    except json.JSONDecodeError as e:
+        return json_response({
+            'status': 'error',
+            'message': 'Invalid JSON format'
+        }, status=400)
+    except Exception as e:
+        logger.error(f"Release error: {str(e)}", exc_info=True)
+        return json_response({
+            'status': 'error',
+            'message': str(e)
+        }, status=500)
+
+
+@csrf_exempt
+def check_stale(request):
+    """
+    비정상 할당 감지 및 자동 해제
+
+    K8s API로 할당된 Backend의 Frontend Pod 상태를 확인하여
+    존재하지 않거나 Running이 아닌 Frontend에 할당된 Backend를 해제
+    """
+    if request.method != 'POST':
+        return json_response({
+            'status': 'error',
+            'message': 'Only POST method is allowed'
+        }, status=405)
+
+    try:
+        result = _get_orchestrator().check_stale_allocations()
+        logger.info(
+            f"Stale check: {result['checked']} checked, "
+            f"{len(result['released'])} released"
+        )
+        return json_response({
+            'status': 'success',
+            **result
+        })
+    except Exception as e:
+        logger.error(f"Stale check error: {str(e)}", exc_info=True)
+        return json_response({
+            'status': 'error',
+            'message': str(e)
+        }, status=500)
+
