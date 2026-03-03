@@ -92,7 +92,7 @@ class Orchestrator:
             # 4. Agent mount
             agent = BackendAgent(backend_ip)
             try:
-                agent.mount(frontend_ip, command)
+                agent.mount(frontend_ip, command, frontend_pod)
             finally:
                 agent.close()
             

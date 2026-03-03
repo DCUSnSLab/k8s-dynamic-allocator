@@ -21,7 +21,8 @@ from tcp_terminal import tcp_terminal
 # 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ class MountRequest(BaseModel):
     """마운트 요청"""
     frontend_ip: str
     command: str
+    frontend_pod: Optional[str] = None
 
 
 # 상태 관리
@@ -62,14 +64,16 @@ class AgentState:
     def __init__(self):
         self.status = "idle"
         self.frontend_ip: Optional[str] = None
+        self.frontend_pod: Optional[str] = None
         self.command: Optional[str] = None
         self.started_at: Optional[datetime] = None
         self._lock = asyncio.Lock()
     
-    async def set_mounting(self, frontend_ip: str, command: str):
+    async def set_mounting(self, frontend_ip: str, frontend_pod: Optional[str], command: str):
         async with self._lock:
             self.status = "mounting"
             self.frontend_ip = frontend_ip
+            self.frontend_pod = frontend_pod
             self.command = command
             self.started_at = datetime.now()
     
@@ -92,6 +96,7 @@ class AgentState:
         return {
             "status": self.status,
             "frontend_ip": self.frontend_ip,
+            "frontend_pod": self.frontend_pod,
             "command": self.command,
             "started_at": self.started_at.isoformat() if self.started_at else None
         }
@@ -135,28 +140,24 @@ async def mount(request: MountRequest):
             detail=f"Agent is busy (status: {state.status})"
         )
     
-    logger.info("=" * 50)
-    logger.info("[Agent] 마운트 요청 수신")
-    logger.info(f"  Frontend IP: {request.frontend_ip}")
-    logger.info(f"  Command: {request.command}")
-    logger.info("=" * 50)
-    
     # 상태 업데이트
-    await state.set_mounting(request.frontend_ip, request.command)
-    logger.info("[Agent] Step 1: 마운트 시작...")
+    await state.set_mounting(request.frontend_ip, request.frontend_pod, request.command)
+    
+    pod_str = f"{request.frontend_pod} ({request.frontend_ip})" if request.frontend_pod else f"{request.frontend_ip}"
+    logger.info(f"Mount requested: Frontend={pod_str}, Command={request.command}")
     
     # SSHFS 마운트 (동기 실행)
     mount_success = await mount_manager.mount(request.frontend_ip)
     
     if not mount_success:
-        logger.error("[Agent] 마운트 실패!")
+        logger.error("SSHFS mount failed!")
         await state.set_error("SSHFS mount failed")
         return FormattedJSONResponse({
             "status": "error",
             "message": "SSHFS mount failed"
         }, status_code=500)
     
-    logger.info("[Agent] Step 2: 마운트 성공")
+    logger.info("Mount successful")
     await state.set_running()
     
     return FormattedJSONResponse({
@@ -172,7 +173,7 @@ async def unmount():
     """
     SSHFS 마운트 해제 및 상태 초기화
     """
-    logger.info("[Agent] 마운트 해제 요청 수신")
+    logger.info("Unmount requested")
     
     try:
         success = await mount_manager.unmount()
@@ -201,23 +202,21 @@ async def unmount():
 @app.on_event("startup")
 async def startup():
     """앱 시작 시 초기화"""
-    logger.info("=" * 50)
-    logger.info("[Agent] Backend Agent 시작")
+    logger.info("Backend Agent starting...")
     
     mount_manager.setup_ssh_key()
     
     # TCP 터미널 서버 시작
     await tcp_terminal.start()
     
-    logger.info("[Agent] 준비 완료")
-    logger.info("=" * 50)
+    logger.info("Backend Agent ready")
 
 
 @app.on_event("shutdown")
 async def shutdown():
     """앱 종료 시 정리"""
     await tcp_terminal.stop()
-    logger.info("[Agent] Backend Agent 종료")
+    logger.info("Backend Agent stopped")
 
 
 if __name__ == "__main__":

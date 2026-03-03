@@ -25,19 +25,21 @@ class MountManager:
     def __init__(self):
         self.frontend_ip = None
     
-    async def mount(self, frontend_ip: str) -> bool:
+    async def mount(self, frontend_ip: str, frontend_pod: str = None) -> bool:
         """
         Frontend 마운트 준비 (실제 마운트는 각 세션 프로세스 내에서 수행)
-        여기서는 Frontend IP만 기록하고 연결 테스트만 수행
+        여기서는 Frontend IP와 Pod명 기록
         
         Args:
             frontend_ip: Frontend Pod IP
+            frontend_pod: Frontend Pod 이름 (옵션)
             
         Returns:
             bool: 성공 여부
         """
         self.frontend_ip = frontend_ip
-        logger.info(f"Mount prepared for {frontend_ip}")
+        
+        pod_info = f"{frontend_pod} ({frontend_ip})" if frontend_pod else f"{frontend_ip}"
         return True
 
     def setup_ssh_key(self):
@@ -88,7 +90,6 @@ class MountManager:
         Namespace를 사용하므로 별도의 언마운트 작업이 필요 없음.
         프로세스가 종료되면 마운트도 자동으로 정리됨.
         """
-        logger.info("Unmount requested (No-op due to Namespace)")
         self.frontend_ip = None
         return True
 

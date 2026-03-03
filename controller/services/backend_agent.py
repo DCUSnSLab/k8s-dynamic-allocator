@@ -29,7 +29,7 @@ class BackendAgent:
     def close(self):
         self.client.close()
     
-    def mount(self, frontend_ip: str, command: str) -> Dict:
+    def mount(self, frontend_ip: str, command: str, frontend_pod: str = None) -> Dict:
         """
         Agent에 마운트 및 명령 실행 요청
         
@@ -41,7 +41,9 @@ class BackendAgent:
             "frontend_ip": frontend_ip,
             "command": command
         }
-        
+        if frontend_pod:
+            payload["frontend_pod"] = frontend_pod
+            
         response = self.client.post(url, json=payload)
         response.raise_for_status()
         return response.json()

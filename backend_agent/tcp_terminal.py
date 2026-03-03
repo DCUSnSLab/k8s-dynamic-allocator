@@ -85,7 +85,8 @@ class TCPTerminalServer:
         """
         addr = writer.get_extra_info('peername')
         session_id = id(writer)
-        logger.info(f"TCP connection from {addr} (session {session_id})")
+        client_ip = addr[0]
+        client_port = addr[1]
 
         # 세션별 로컬 변수
         process = None
@@ -117,8 +118,6 @@ class TCPTerminalServer:
                 settings = {}
                 logger.warning("Received legacy command format")
 
-            logger.info(f"Executing command: {command} (Size: {rows}x{cols}, Term: {term_env})")
-
             # 2. PTY 생성 및 프로세스 시작
             master_fd, slave_fd = pty.openpty()
 
@@ -149,17 +148,14 @@ class TCPTerminalServer:
                 if verase is not None:
                     cc[termios.VERASE] = bytes([verase])
                     verase_byte = bytes([verase])
-                    logger.info(f"Applied client VERASE: {verase} (0x{verase:02x})")
                 else:
                     cc[termios.VERASE] = b'\x7f'
                     verase_byte = b'\x7f'
-                    logger.info("Applied default VERASE: DEL (0x7f)")
 
                 cc[termios.VINTR] = b'\x03'
                 cc[termios.VEOF] = b'\x04'
 
                 termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
-                logger.info(f"PTY configured: ICANON|ECHO|ECHOE|ISIG, VERASE=0x{ord(verase_byte):02x}")
             except Exception as e:
                 logger.warning(f"Failed to configure PTY: {e}")
 
@@ -230,7 +226,7 @@ class TCPTerminalServer:
 
             writer.close()
             await writer.wait_closed()
-            logger.info(f"Connection closed: {addr} (session {session_id})")
+            logger.info(f"TCP connection closed: {client_ip}:{client_port}")
 
     async def _handle_io(
         self,
