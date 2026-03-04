@@ -143,8 +143,7 @@ async def mount(request: MountRequest):
     # 상태 업데이트
     await state.set_mounting(request.frontend_ip, request.frontend_pod, request.command)
     
-    pod_str = f"{request.frontend_pod} ({request.frontend_ip})" if request.frontend_pod else f"{request.frontend_ip}"
-    logger.info(f"Mount requested: Frontend={pod_str}, Command={request.command}")
+    logger.info(f"Mount requested: frontend={request.frontend_pod}({request.frontend_ip}), command={request.command}")
     
     # SSHFS 마운트 (동기 실행)
     mount_success = await mount_manager.mount(request.frontend_ip)
@@ -210,6 +209,14 @@ async def startup():
     await tcp_terminal.start()
     
     logger.info("Backend Agent ready")
+    
+    # Uvicorn 시작 프롬프트 출력 후 줄넘김
+    async def print_newline():
+        import sys
+        await asyncio.sleep(0.5)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    asyncio.create_task(print_newline())
 
 
 @app.on_event("shutdown")
@@ -221,4 +228,4 @@ async def shutdown():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8080, access_log=False)
