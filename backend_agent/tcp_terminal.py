@@ -260,6 +260,38 @@ class TCPTerminalServer:
             await writer.wait_closed()
             logger.info(f"TCP connection closed: {client_ip}:{client_port}")
 
+            # 활성 세션이 없으면 Controller에 자원 해제 요청
+            if not self._active_sessions:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._notify_release())
+
+    async def _notify_release(self):
+        """Controller에 Backend 해제 요청 (TCP 끊김 시 안전망)"""
+        import urllib.request
+        import urllib.error
+
+        hostname = os.environ.get("HOSTNAME", "")
+        if not hostname:
+            return
+
+        def make_request():
+            try:
+                url = "http://controller-service:9001/api/pool/release/"
+                data = json.dumps({"backend_pod": hostname}).encode("utf-8")
+                req = urllib.request.Request(
+                    url, data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                # 타임아웃을 10초로 늘림 (Controller 응답 지연 대비)
+                resp = urllib.request.urlopen(req, timeout=10)
+                logger.info(f"Release notified to Controller ({resp.status})")
+            except Exception as e:
+                logger.warning(f"Release notification failed: {e}")
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, make_request)
+
     async def _handle_io(
         self,
         reader: asyncio.StreamReader,
