@@ -1,5 +1,5 @@
 # path : /k8s-dynamic-allocator
-# docker build --no-cache -f deploy/docker/backend/Dockerfile -t harbor.cu.ac.kr/k8s_dynamic_allocator/backend:{tag} .
+# docker build -f deploy/docker/backend/Dockerfile -t harbor.cu.ac.kr/k8s_dynamic_allocator/backend:{tag} .
 # docker push harbor.cu.ac.kr/k8s_dynamic_allocator/backend:{tag}
 
 FROM ubuntu:20.04
