@@ -38,6 +38,7 @@ class TCPTerminalServer:
         self.port = port
         self.server: Optional[asyncio.Server] = None
         self._active_sessions = {}  # {session_id: {process, addr, started_at, command}}
+        self._skip_release_notify = False
 
     async def start(self):
         """TCP 서버 시작"""
@@ -67,6 +68,7 @@ class TCPTerminalServer:
 
     async def terminate_all_sessions(self):
         """외부 요청에 의한 모든 활성 세션/프로세스 강제 종료"""
+        self._skip_release_notify = True
         count = 0
         for sid, info in list(self._active_sessions.items()):
             process = info.get("process")
@@ -110,6 +112,7 @@ class TCPTerminalServer:
 
         - 세션 독립성: Window Size 제어(io_ctl), 환경변수, pty fd 등 모든 상태는 독립 변수 격리로 처리
         """
+        self._skip_release_notify = False
         addr = writer.get_extra_info('peername')
         session_id = id(writer)
         client_ip = addr[0]
@@ -261,7 +264,7 @@ class TCPTerminalServer:
             logger.info(f"TCP connection closed: {client_ip}:{client_port}")
 
             # 활성 세션이 없으면 Controller에 자원 해제 요청
-            if not self._active_sessions:
+            if not self._active_sessions and not self._skip_release_notify:
                 loop = asyncio.get_running_loop()
                 loop.create_task(self._notify_release())
 
