@@ -1,3 +1,7 @@
+# path : /k8s-dynamic-allocator
+# docker build -f deploy/docker/controller/Dockerfile -t harbor.cu.ac.kr/k8s_dynamic_allocator/controller:{tag} .
+# docker push harbor.cu.ac.kr/k8s_dynamic_allocator/controller:{tag}
+
 FROM python:3.11-slim
 
 WORKDIR /app

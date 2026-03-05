@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import pty
+import socket
 import subprocess
 import select
 import termios
@@ -37,6 +38,7 @@ class TCPTerminalServer:
         self.port = port
         self.server: Optional[asyncio.Server] = None
         self._active_sessions = {}  # {session_id: {process, addr, started_at, command}}
+        self._skip_release_notify = False
 
     async def start(self):
         """TCP 서버 시작"""
@@ -45,6 +47,9 @@ class TCPTerminalServer:
             host='0.0.0.0',
             port=self.port
         )
+        # 서버 소켓에 TCP Keepalive 적용
+        for sock in self.server.sockets:
+            self._configure_keepalive(sock)
         logger.info(f"TCP Terminal Server started on port {self.port}")
 
     async def stop(self):
@@ -60,6 +65,30 @@ class TCPTerminalServer:
             self.server.close()
             await self.server.wait_closed()
             logger.info("TCP Terminal Server stopped")
+
+    async def terminate_all_sessions(self):
+        """외부 요청에 의한 모든 활성 세션/프로세스 강제 종료"""
+        self._skip_release_notify = True
+        count = 0
+        for sid, info in list(self._active_sessions.items()):
+            process = info.get("process")
+            if process and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                count += 1
+        if count:
+            logger.info(f"Terminated {count} active session(s) by external request")
+
+    @staticmethod
+    def _configure_keepalive(sock):
+        """TCP Keepalive 설정 — 비정상 연결 끊김 감지용"""
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
 
     def get_sessions(self):
         """활성 세션 목록 반환 (모니터링용)"""
@@ -83,10 +112,16 @@ class TCPTerminalServer:
 
         - 세션 독립성: Window Size 제어(io_ctl), 환경변수, pty fd 등 모든 상태는 독립 변수 격리로 처리
         """
+        self._skip_release_notify = False
         addr = writer.get_extra_info('peername')
         session_id = id(writer)
         client_ip = addr[0]
         client_port = addr[1]
+
+        # 클라이언트 소켓에 TCP Keepalive 적용
+        client_sock = writer.get_extra_info('socket')
+        if client_sock:
+            self._configure_keepalive(client_sock)
 
         # 세션별 로컬 변수
         process = None
@@ -228,6 +263,38 @@ class TCPTerminalServer:
             await writer.wait_closed()
             logger.info(f"TCP connection closed: {client_ip}:{client_port}")
 
+            # 활성 세션이 없으면 Controller에 자원 해제 요청
+            if not self._active_sessions and not self._skip_release_notify:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._notify_release())
+
+    async def _notify_release(self):
+        """Controller에 Backend 해제 요청 (TCP 끊김 시 안전망)"""
+        import urllib.request
+        import urllib.error
+
+        hostname = os.environ.get("HOSTNAME", "")
+        if not hostname:
+            return
+
+        def make_request():
+            try:
+                url = "http://controller-service:9001/api/pool/release/"
+                data = json.dumps({"backend_pod": hostname}).encode("utf-8")
+                req = urllib.request.Request(
+                    url, data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                # 타임아웃을 10초로 늘림 (Controller 응답 지연 대비)
+                resp = urllib.request.urlopen(req, timeout=10)
+                logger.info(f"Release notified to Controller ({resp.status})")
+            except Exception as e:
+                logger.warning(f"Release notification failed: {e}")
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, make_request)
+
     async def _handle_io(
         self,
         reader: asyncio.StreamReader,
@@ -254,6 +321,8 @@ class TCPTerminalServer:
                         if data:
                             writer.write(data)
                             await writer.drain()
+                except (ConnectionResetError, BrokenPipeError):
+                    break
                 except (OSError, BlockingIOError):
                     pass
                 await asyncio.sleep(0.01)
@@ -289,10 +358,16 @@ class TCPTerminalServer:
                             data = data.replace(b'\x7f', verase_byte)
                         os.write(master_fd, data)
                     elif reader.at_eof():
+                        if process and process.poll() is None:
+                            process.terminate()
+                        process_done.set()
                         break
                 except asyncio.TimeoutError:
                     pass
                 except (OSError, BrokenPipeError):
+                    if process and process.poll() is None:
+                        process.terminate()
+                    process_done.set()
                     break
 
         # 두 태스크 동시 실행

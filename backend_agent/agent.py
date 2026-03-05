@@ -173,7 +173,17 @@ async def unmount():
     SSHFS 마운트 해제 및 상태 초기화
     """
     logger.info("Unmount requested")
-    
+
+    # 이미 unmount 된 상태면 중복 작업 스킵
+    if mount_manager.frontend_ip is None:
+        return FormattedJSONResponse({
+            "status": "success",
+            "message": "Already unmounted"
+        })
+
+    # TCP 세션 먼저 종료 (활성 프로세스 정리)
+    await tcp_terminal.terminate_all_sessions()
+
     try:
         success = await mount_manager.unmount()
         

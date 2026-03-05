@@ -8,13 +8,13 @@ import sys
 import threading
 from pathlib import Path
 
-# BASE_DIR: rest_api/ 경로
+# BASE_DIR: rest_api/
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# CONTROLLER_DIR: controller/ 경로 (services가 있는 곳)
+# CONTROLLER_DIR: controller/
 CONTROLLER_DIR = BASE_DIR.parent
 
-# Python 경로에 controller/ 추가 (services import를 위해)
+# Python 경로에 controller/ 추가
 if str(CONTROLLER_DIR) not in sys.path:
     sys.path.insert(0, str(CONTROLLER_DIR))
 
@@ -29,9 +29,6 @@ INSTALLED_APPS = [
     'api',
 ]
 
-# ──────────────────────────────────────────────
-# Request ID (요청별 로그 추적용)
-# ──────────────────────────────────────────────
 _local = threading.local()
 _counter = itertools.count()
 
