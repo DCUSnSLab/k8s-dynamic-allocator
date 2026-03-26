@@ -98,10 +98,20 @@ class Orchestrator:
             
             logger.info(f"[SUCCESS] Execute: {frontend_pod} <-> {backend_pod} ({backend_ip})")
             
+            backend_type_value = "unknown"
+            try:
+                backend_obj = self.pool.v1.read_namespaced_pod(backend_pod, self.pool.namespace)
+                backend_type_value = (
+                    (backend_obj.metadata.labels or {}).get(self.pool.LABEL_BACKEND_TYPE, "unknown")
+                )
+            except Exception:
+                pass
+            
             return {
                 "status": "success",
                 "message": "Command submitted to backend",
                 "backend_pod": backend_pod,
+                "backend_type": backend_type_value,
                 "backend_ip": backend_ip,
                 "tcp_port": 8081,
                 "frontend_pod": frontend_pod,

@@ -8,6 +8,7 @@ spec:
     matchLabels:
       app: backend-pool
       backend-type: general
+      pool-status: available
   template:
     metadata:
       labels:

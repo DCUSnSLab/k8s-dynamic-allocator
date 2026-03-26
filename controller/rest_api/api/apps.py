@@ -82,4 +82,5 @@ class ApiConfig(AppConfig):
             logger.info("Leader election initialized")
 
         except Exception as e:
-            logger.error(f"Pool init failed: {e}")
+            logger.exception("Controller startup failed")
+            raise
