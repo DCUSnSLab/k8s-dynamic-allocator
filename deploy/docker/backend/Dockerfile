@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     sshfs \
     fuse \
+    tini \
     curl \
     vim \
     iputils-ping \
@@ -38,6 +39,9 @@ RUN mkdir -p /mnt/chroot /root/.ssh
 # Agent 포트 노출
 EXPOSE 8080
 EXPOSE 8081
+
+# tini runs as PID 1 so orphaned sshfs/ssh children are reaped.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # Agent 서버 실행
 CMD ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "8080"]

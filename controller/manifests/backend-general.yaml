@@ -19,9 +19,9 @@ spec:
     spec:
       containers:
       - name: backend-agent
-        image: harbor.cu.ac.kr/k8s_dynamic_allocator/backend:latest
+        image: harbor.cu.ac.kr/k8s_dynamic_allocator/backend:dynamic-pool
         imagePullPolicy: Always
-        command: ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
+        args: ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
         ports:
         - containerPort: 8080
           name: agent
