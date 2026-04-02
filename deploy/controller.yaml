@@ -23,6 +23,32 @@ spec:
         env:
         - name: DJANGO_SETTINGS_MODULE
           value: "config.settings"
+        - name: REDIS_URL
+          value: "redis://controller-queue-redis:6379/0"
+        - name: WAIT_QUEUE_PREFIX
+          value: "kda:waitq"
+        - name: DEFAULT_BACKEND_TYPE
+          value: "general"
+        - name: WAIT_QUEUE_TIMEOUT_SECONDS
+          value: "1800"
+        - name: WAIT_QUEUE_TICKET_TTL_SECONDS
+          value: "7200"
+        - name: WAIT_QUEUE_LOCK_TTL_SECONDS
+          value: "60"
+        - name: WAIT_QUEUE_ALLOCATING_TTL_SECONDS
+          value: "60"
+        - name: WAIT_QUEUE_MAX_RETRIES
+          value: "3"
+        - name: WAIT_QUEUE_WORKER_INTERVAL_SECONDS
+          value: "1.0"
+        - name: WAIT_QUEUE_BACKEND_REFRESH_SECONDS
+          value: "15"
+        - name: BACKEND_AGENT_TIMEOUT_SECONDS
+          value: "30"
+        - name: BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS
+          value: "30"
+        - name: BACKEND_AGENT_UNMOUNT_TIMEOUT_SECONDS
+          value: "30"
 
 ---
 

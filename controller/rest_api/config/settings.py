@@ -4,6 +4,7 @@ Django settings for Controller Pod REST API
 
 import itertools
 import logging
+import os
 import sys
 import threading
 from pathlib import Path
@@ -52,6 +53,42 @@ def next_conn_id():
     return f"conn={next(_counter)}"
 
 
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _env_first(names, default):
+    for name in names:
+        value = os.getenv(name)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def _env_int_any(names, default):
+    try:
+        return int(_env_first(names, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _env_float_any(names, default):
+    try:
+        return float(_env_first(names, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
 class RequestIdMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
@@ -81,6 +118,41 @@ CACHES = {
         'LOCATION': 'controller-conn-cache',
     }
 }
+
+REDIS_URL = _env_first(('REDIS_URL',), 'redis://localhost:6379/0')
+WAIT_QUEUE_PREFIX = _env_first(('WAIT_QUEUE_PREFIX',), 'kda:waitq')
+DEFAULT_BACKEND_TYPE = _env_first(('DEFAULT_BACKEND_TYPE',), 'general')
+WAIT_QUEUE_TIMEOUT_SECONDS = _env_int_any(('WAIT_QUEUE_TIMEOUT_SECONDS',), 1800)
+WAIT_QUEUE_LOCK_TTL_SECONDS = _env_int_any(
+    ('WAIT_QUEUE_LOCK_TTL_SECONDS', 'ALLOCATOR_LOCK_TIMEOUT_SECONDS'),
+    60,
+)
+WAIT_QUEUE_TICKET_TTL_SECONDS = _env_int_any(
+    ('WAIT_QUEUE_TICKET_TTL_SECONDS', 'WAIT_TICKET_TTL_SECONDS', 'TICKET_TTL_SECONDS'),
+    7200,
+)
+WAIT_QUEUE_ALLOCATING_TTL_SECONDS = _env_int_any(
+    ('WAIT_QUEUE_ALLOCATING_TTL_SECONDS', 'ALLOCATING_STALE_TIMEOUT_SECONDS'),
+    60,
+)
+WAIT_QUEUE_MAX_RETRIES = _env_int_any(('WAIT_QUEUE_MAX_RETRIES',), 3)
+WAIT_QUEUE_WORKER_INTERVAL_SECONDS = _env_float_any(
+    ('WAIT_QUEUE_WORKER_INTERVAL_SECONDS', 'QUEUE_WORKER_INTERVAL_SECONDS'),
+    1.0,
+)
+WAIT_QUEUE_BACKEND_REFRESH_SECONDS = _env_float_any(
+    ('WAIT_QUEUE_BACKEND_REFRESH_SECONDS', 'BACKEND_REGISTRY_REFRESH_SECONDS'),
+    15.0,
+)
+BACKEND_AGENT_TIMEOUT_SECONDS = _env_float_any(('BACKEND_AGENT_TIMEOUT_SECONDS',), 30.0)
+BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS = _env_float_any(
+    ('BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS',),
+    BACKEND_AGENT_TIMEOUT_SECONDS,
+)
+BACKEND_AGENT_UNMOUNT_TIMEOUT_SECONDS = _env_float_any(
+    ('BACKEND_AGENT_UNMOUNT_TIMEOUT_SECONDS',),
+    BACKEND_AGENT_TIMEOUT_SECONDS,
+)
 
 LANGUAGE_CODE = 'ko-kr'
 TIME_ZONE = 'Asia/Seoul'

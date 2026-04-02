@@ -42,7 +42,7 @@ class MountManager:
         pod_info = f"{frontend_pod} ({frontend_ip})" if frontend_pod else f"{frontend_ip}"
         return True
 
-    def setup_ssh_key(self):
+    def setup_ssh_key(self) -> bool:
         """
         SSH 키 설정 (Pod 시작 시 호출)
         Secret으로 마운트된 키를 ~/.ssh/id_rsa로 복사하고 권한 설정
@@ -75,13 +75,16 @@ class MountManager:
                 
                 # Known hosts 파일 생성 (빈 파일)
                 (ssh_dir / "known_hosts").touch(mode=0o644)
+                return True
             else:
                 logger.warning(f"SSH key source not found in {key_mount_dir}")
                 # 디버깅을 위해 디렉토리 목록 출력
                 if key_mount_dir.exists():
                     logger.warning(f"Contents: {[f.name for f in key_mount_dir.iterdir()]}")
+                return False
         except Exception as e:
             logger.error(f"Failed to setup SSH key: {e}")
+            return False
 
     async def unmount(self) -> bool:
         """

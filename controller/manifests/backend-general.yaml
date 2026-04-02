@@ -25,6 +25,14 @@ spec:
         ports:
         - containerPort: 8080
           name: agent
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: agent
+          initialDelaySeconds: 1
+          periodSeconds: 2
+          timeoutSeconds: 1
+          failureThreshold: 3
         resources:
           requests:
             cpu: "100m"

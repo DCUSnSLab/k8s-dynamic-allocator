@@ -3,13 +3,16 @@ import logging
 import os
 import threading
 
+from config.settings import WAIT_QUEUE_WORKER_INTERVAL_SECONDS
+
 logger = logging.getLogger(__name__)
 
-# apps.py에서 생성한 인스턴스를 views.py에서 import
 orchestrator_instance = None
 leader_elector_instance = None
 leader_task_thread = None
 leader_task_stop_event = threading.Event()
+queue_worker_thread = None
+queue_worker_stop_event = threading.Event()
 startup_completed = False
 
 
@@ -40,19 +43,41 @@ def _stop_leader_task():
     logger.info("Leader-only heartbeat task stopped")
 
 
+def _queue_worker_loop():
+    while not queue_worker_stop_event.wait(WAIT_QUEUE_WORKER_INTERVAL_SECONDS):
+        instance = orchestrator_instance
+        if instance is None:
+            continue
+        try:
+            instance.process_wait_queues()
+        except Exception:
+            logger.exception("Queue worker iteration failed")
+
+
+def _start_queue_worker():
+    global queue_worker_thread
+
+    if queue_worker_thread and queue_worker_thread.is_alive():
+        return
+
+    queue_worker_stop_event.clear()
+    queue_worker_thread = threading.Thread(
+        target=_queue_worker_loop,
+        name="queue-worker",
+        daemon=True,
+    )
+    queue_worker_thread.start()
+    logger.info("Queue worker started")
+
+
 class ApiConfig(AppConfig):
-    default_auto_field = 'django.db.models.BigAutoField'
-    name = 'api'
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "api"
 
     def ready(self):
-        """
-        Called on app startup.
-        Auto-initializes Backend Pool and starts leader election.
-        """
         global orchestrator_instance, leader_elector_instance, startup_completed
 
-        # Django 개발 서버 reloader 중복 실행 방지
-        if os.environ.get('RUN_MAIN', None) != 'true':
+        if os.environ.get("RUN_MAIN", None) != "true":
             return
 
         if startup_completed:
@@ -66,12 +91,17 @@ class ApiConfig(AppConfig):
             orchestrator_instance = Orchestrator()
             result = orchestrator_instance.initialize_pool()
 
-            created = len(result.get('created', []))
-            existing = len(result.get('existing', []))
-            failed = len(result.get('failed', []))
+            created = len(result.get("created", []))
+            existing = len(result.get("existing", []))
+            failed = len(result.get("failed", []))
             logger.info(
-                f"Pool init complete: {created} created, {existing} existing, {failed} failed"
+                "Pool init complete: %s created, %s existing, %s failed",
+                created,
+                existing,
+                failed,
             )
+
+            _start_queue_worker()
 
             leader_elector_instance = LeaseLeaderElector(
                 on_started_leading=_start_leader_task,
@@ -81,6 +111,6 @@ class ApiConfig(AppConfig):
             startup_completed = True
             logger.info("Leader election initialized")
 
-        except Exception as e:
+        except Exception:
             logger.exception("Controller startup failed")
             raise
