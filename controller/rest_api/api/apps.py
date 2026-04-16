@@ -19,7 +19,9 @@ startup_completed = False
 def _leader_heartbeat_loop():
     identity = os.getenv("HOSTNAME", "controller-unknown")
     while not leader_task_stop_event.wait(5):
-        logger.info("[LEADER] Heartbeat from %s", identity)
+        pass
+        # logger.info("[LEADER] Heartbeat from %s", identity)
+        # 리더 선출 시 scale-up/down 로직 추가
 
 
 def _start_leader_task():
