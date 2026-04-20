@@ -1,12 +1,12 @@
 import json
 import logging
+import time
 from datetime import datetime
 
-from django.core.cache import cache
 from django.http import HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from config.settings import DEFAULT_BACKEND_TYPE, get_request_id, next_conn_id, set_request_id
+from config.settings import DEFAULT_BACKEND_TYPE, set_request_label
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,12 @@ def _extract_frontend_ip(request, data):
     return (request.META.get("REMOTE_ADDR") or "").strip()
 
 
+def _clean_optional_string(value):
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
 @csrf_exempt
 def execute_command(request):
     if request.method != "POST":
@@ -60,13 +66,15 @@ def execute_command(request):
         if not frontend_ip:
             return json_response({"status": "error", "message": "frontend_ip is required"}, status=400)
 
-        set_request_id(next_conn_id())
+        ingress_ts_ms = int(time.time() * 1000)
+        set_request_label(username)
         logger.info(
-            "Execute request: frontend=%s, frontend_ip=%s, backend_type=%s, user=%s, command=%s",
+            "Execute request: frontend=%s, frontend_ip=%s, backend_type=%s, user=%s, ingress_ts_ms=%s, command=%s",
             frontend_pod or frontend_ip,
             frontend_ip,
             backend_type,
             username,
+            ingress_ts_ms,
             command,
         )
 
@@ -76,12 +84,13 @@ def execute_command(request):
             frontend_ip=frontend_ip,
             frontend_pod=frontend_pod,
             backend_type=backend_type,
+            ingress_ts_ms=ingress_ts_ms,
         )
 
-        if result["status"] == "assigned":
-            backend_pod = result.get("backend_pod")
-            if backend_pod:
-                cache.set(f"conn_map_{backend_pod}", get_request_id(), timeout=86400)
+        ticket = result.get("ticket") or {}
+        post_ticket_label = ticket.get("request_label") or ""
+        if post_ticket_label:
+            set_request_label(post_ticket_label)
 
         if result.get("error_type") == "invalid_backend_type":
             return json_response(result, status=400)
@@ -118,6 +127,29 @@ def health_check(request):
             "result": result,
         }
     )
+
+
+@csrf_exempt
+def queue_status(request):
+    if request.method != "GET":
+        return json_response({"status": "error", "message": "Only GET method is allowed"}, status=405)
+
+    try:
+        backend_type = (request.GET.get("backend_type") or "").strip()
+        if not backend_type:
+            return json_response(
+                {"status": "error", "message": "backend_type is required"},
+                status=400,
+            )
+        result = _get_orchestrator().get_queue_status(
+            backend_type=backend_type,
+        )
+        return json_response(result)
+    except ValueError as exc:
+        return json_response({"status": "error", "message": str(exc)}, status=400)
+    except Exception as exc:
+        logger.error("Queue status error: %s", str(exc), exc_info=True)
+        return json_response({"status": "error", "message": str(exc)}, status=500)
 
 
 @csrf_exempt
@@ -198,17 +230,45 @@ def release_backend(request):
 
     try:
         data = json.loads(request.body)
-        backend_pod = data.get("backend_pod", "")
+        backend_pod = _clean_optional_string(data.get("backend_pod"))
+        orchestrator = _get_orchestrator()
 
         if not backend_pod:
             return json_response({"status": "error", "message": "backend_pod is required"}, status=400)
 
-        conn_id = cache.get(f"conn_map_{backend_pod}")
-        if conn_id:
-            set_request_id(conn_id)
-            cache.delete(f"conn_map_{backend_pod}")
+        try:
+            request_context = orchestrator.get_assigned_request_context(backend_pod)
+        except Exception as exc:
+            logger.warning("Release request context unavailable for %s: %s", backend_pod, exc)
+            request_context = None
 
-        result = _get_orchestrator().release_backend(backend_pod)
+        caller_hints = {}
+        for hint_key in ("ticket_id", "backend_type", "frontend_pod", "request_label", "reason", "source"):
+            hint_value = _clean_optional_string(data.get(hint_key))
+            if hint_value:
+                caller_hints[hint_key] = hint_value
+        if caller_hints:
+            if request_context is None:
+                request_context = caller_hints
+            else:
+                for key, value in caller_hints.items():
+                    if not request_context.get(key):
+                        request_context[key] = value
+
+        if request_context is not None and not request_context.get("request_label"):
+            synthesized_label = (
+                _clean_optional_string(request_context.get("frontend_pod"))
+                or _clean_optional_string(request_context.get("ticket_id"))
+                or backend_pod
+            )
+            if synthesized_label:
+                request_context["request_label"] = synthesized_label
+
+        request_label = _clean_optional_string((request_context or {}).get("request_label"))
+        if request_label:
+            set_request_label(request_label)
+
+        result = orchestrator.release_backend(backend_pod, request_context=request_context)
         status_code = 200 if result["status"] == "success" else 500
         return json_response(result, status=status_code)
 
@@ -226,11 +286,19 @@ def check_stale(request):
 
     try:
         result = _get_orchestrator().check_stale_allocations()
-        logger.info(
-            "Stale check: %s checked, %s released",
-            result.get("checked", 0),
-            len(result.get("released", [])),
-        )
+        released_count = len(result.get("released", []))
+        if released_count > 0:
+            logger.info(
+                "Stale check: %s checked, %s released",
+                result.get("checked", 0),
+                released_count,
+            )
+        else:
+            logger.debug(
+                "Stale check: %s checked, %s released",
+                result.get("checked", 0),
+                released_count,
+            )
         return json_response({"status": "success", **result})
     except Exception as exc:
         logger.error("Stale check error: %s", str(exc), exc_info=True)

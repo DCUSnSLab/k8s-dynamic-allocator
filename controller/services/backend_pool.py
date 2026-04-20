@@ -175,7 +175,7 @@ class BackendPool(KubernetesClient):
                 backend_type = self._validate_backend_manifest(spec)
 
                 if name in existing_deployments:
-                    logger.info("Deployment exists: %s", name)
+                    logger.debug("Deployment exists: %s", name)
                     results["existing"].append(name)
                     continue
 
@@ -192,7 +192,7 @@ class BackendPool(KubernetesClient):
 
             except ApiException as e:
                 if e.status == 409:
-                    logger.info("Deployment exists: %s", name)
+                    logger.debug("Deployment exists: %s", name)
                     results["existing"].append(name)
                 else:
                     logger.error(
@@ -317,7 +317,7 @@ class BackendPool(KubernetesClient):
                 raise PodConflictError(f"{pod_name} already taken")
             raise
 
-    def release_pod(self, pod_name: str) -> None:
+    def release_pod(self, pod_name: str) -> bool:
         """
         Delete an assigned backend pod so the Deployment can backfill a new
         warm pod. This path is idempotent so duplicate release notifications
@@ -329,11 +329,12 @@ class BackendPool(KubernetesClient):
                 namespace=self.namespace,
                 grace_period_seconds=0,
             )
-            logger.info("Deleted assigned backend pod: %s", pod_name)
+            logger.debug("Deleted assigned backend pod: %s", pod_name)
+            return True
         except ApiException as e:
             if e.status in (404, 409):
-                logger.info("Backend pod already deleted or terminating: %s", pod_name)
-                return
+                logger.debug("Backend pod already deleted or terminating: %s", pod_name)
+                return False
             raise
 
     def list_pool_status(self, backend_type: Optional[str] = None) -> List[Dict]:

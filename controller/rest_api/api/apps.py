@@ -1,6 +1,7 @@
+import os
+
 from django.apps import AppConfig
 import logging
-import os
 import threading
 
 from config.settings import WAIT_QUEUE_WORKER_INTERVAL_SECONDS
@@ -9,40 +10,9 @@ logger = logging.getLogger(__name__)
 
 orchestrator_instance = None
 leader_elector_instance = None
-leader_task_thread = None
-leader_task_stop_event = threading.Event()
 queue_worker_thread = None
 queue_worker_stop_event = threading.Event()
 startup_completed = False
-
-
-def _leader_heartbeat_loop():
-    identity = os.getenv("HOSTNAME", "controller-unknown")
-    while not leader_task_stop_event.wait(5):
-        pass
-        # logger.info("[LEADER] Heartbeat from %s", identity)
-        # 리더 선출 시 scale-up/down 로직 추가
-
-
-def _start_leader_task():
-    global leader_task_thread
-
-    if leader_task_thread and leader_task_thread.is_alive():
-        return
-
-    leader_task_stop_event.clear()
-    leader_task_thread = threading.Thread(
-        target=_leader_heartbeat_loop,
-        name="leader-heartbeat",
-        daemon=True,
-    )
-    leader_task_thread.start()
-    logger.info("Leader-only heartbeat task started")
-
-
-def _stop_leader_task():
-    leader_task_stop_event.set()
-    logger.info("Leader-only heartbeat task stopped")
 
 
 def _queue_worker_loop():
@@ -105,10 +75,7 @@ class ApiConfig(AppConfig):
 
             _start_queue_worker()
 
-            leader_elector_instance = LeaseLeaderElector(
-                on_started_leading=_start_leader_task,
-                on_stopped_leading=_stop_leader_task,
-            )
+            leader_elector_instance = LeaseLeaderElector()
             leader_elector_instance.start()
             startup_completed = True
             logger.info("Leader election initialized")

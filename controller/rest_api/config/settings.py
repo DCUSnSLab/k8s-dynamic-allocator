@@ -2,7 +2,6 @@
 Django settings for Controller Pod REST API
 """
 
-import itertools
 import logging
 import os
 import sys
@@ -31,26 +30,42 @@ INSTALLED_APPS = [
 ]
 
 _local = threading.local()
-_counter = itertools.count()
+
+
+def get_request_label():
+    return getattr(_local, 'request_label', '-')
+
+
+def set_request_label(request_label):
+    _local.request_label = request_label
+    _local.request_id = request_label
 
 
 def get_request_id():
-    return getattr(_local, 'request_id', '-')
+    return get_request_label()
 
 
-def set_request_id(conn_id):
-    _local.request_id = conn_id
+def set_request_id(request_label):
+    set_request_label(request_label)
 
 
-class RequestIdFilter(logging.Filter):
+def build_request_label(username, ticket_short=None):
+    user = (username or "-").strip() or "-"
+    ticket_short_value = (ticket_short or "").strip()
+    if ticket_short_value:
+        return f"{user}-{ticket_short_value[:10]}"
+    return user
+
+
+class RequestLabelFilter(logging.Filter):
     def filter(self, record):
-        record.request_id = get_request_id()
+        request_label = get_request_label()
+        record.request_label = request_label
+        record.request_id = request_label
         return True
 
 
-def next_conn_id():
-    """Generate next conn=N id (called only from execute view)"""
-    return f"conn={next(_counter)}"
+RequestIdFilter = RequestLabelFilter
 
 
 def _env_int(name, default):
@@ -89,19 +104,23 @@ def _env_float_any(names, default):
         return float(default)
 
 
-class RequestIdMiddleware:
+class RequestLabelMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
 
     def __call__(self, request):
+        _local.request_label = '-'
         _local.request_id = '-'
         return self.get_response(request)
+
+
+RequestIdMiddleware = RequestLabelMiddleware
 
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.middleware.common.CommonMiddleware',
-    'config.settings.RequestIdMiddleware',
+    'config.settings.RequestLabelMiddleware',
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -115,7 +134,7 @@ DATABASES = {}
 CACHES = {
     'default': {
         'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': 'controller-conn-cache',
+        'LOCATION': 'controller-request-cache',
     }
 }
 
@@ -134,6 +153,10 @@ WAIT_QUEUE_TICKET_TTL_SECONDS = _env_int_any(
 WAIT_QUEUE_ALLOCATING_TTL_SECONDS = _env_int_any(
     ('WAIT_QUEUE_ALLOCATING_TTL_SECONDS', 'ALLOCATING_STALE_TIMEOUT_SECONDS'),
     60,
+)
+ASSIGNED_CONTEXT_TTL_SECONDS = _env_int_any(
+    ('ASSIGNED_CONTEXT_TTL_SECONDS',),
+    2592000,
 )
 WAIT_QUEUE_MAX_RETRIES = _env_int_any(('WAIT_QUEUE_MAX_RETRIES',), 3)
 WAIT_QUEUE_WORKER_INTERVAL_SECONDS = _env_float_any(
@@ -175,21 +198,21 @@ LOGGING = {
     'disable_existing_loggers': False,
     'formatters': {
         'detailed': {
-            'format': '[{asctime}] [{levelname}] [{request_id}] {message}',
+            'format': '[{asctime}] [{levelname}] [{request_label}] {message}',
             'style': '{',
             'datefmt': '%Y-%m-%d %H:%M:%S',
         },
     },
     'filters': {
-        'request_id': {
-            '()': 'config.settings.RequestIdFilter',
+        'request_label': {
+            '()': 'config.settings.RequestLabelFilter',
         },
     },
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
             'formatter': 'detailed',
-            'filters': ['request_id'],
+            'filters': ['request_label'],
         },
     },
     'root': {

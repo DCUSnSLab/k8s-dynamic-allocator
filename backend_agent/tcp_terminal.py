@@ -16,6 +16,7 @@ import termios
 import struct
 import fcntl
 import json
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -39,6 +40,17 @@ class TCPTerminalServer:
         self.server: Optional[asyncio.Server] = None
         self._active_sessions = {}  # {session_id: {process, addr, started_at, command}}
         self._skip_release_notify = False
+        self._release_notify_debounce_seconds = float(
+            os.getenv("BACKEND_AGENT_RELEASE_NOTIFY_DEBOUNCE_SECONDS", "10")
+        )
+        self._release_notify_lock = asyncio.Lock()
+        self._release_notify_pending = False
+        self._release_notify_sent = False
+        self._release_notify_task: Optional[asyncio.Task] = None
+        self._release_notify_generation = 0
+        self._release_notify_cancelled = threading.Event()
+        self._release_notify_http_connection_lock = threading.Lock()
+        self._release_notify_http_connection = None
 
     async def start(self):
         """TCP 서버 시작"""
@@ -67,8 +79,7 @@ class TCPTerminalServer:
             logger.info("TCP Terminal Server stopped")
 
     async def terminate_all_sessions(self):
-        """외부 요청에 의한 모든 활성 세션/프로세스 강제 종료"""
-        self._skip_release_notify = True
+        """외부 요청에 의한 모든 활성 세션/프로세스 강제 종료 (fallback 상태는 변경하지 않음)"""
         count = 0
         for sid, info in list(self._active_sessions.items()):
             process = info.get("process")
@@ -81,6 +92,42 @@ class TCPTerminalServer:
                 count += 1
         if count:
             logger.info(f"Terminated {count} active session(s) by external request")
+
+    async def suppress_fallback_release(self):
+        """primary cleanup 성공 후 호출 — fallback release를 확정적으로 억제한다."""
+        self._skip_release_notify = True
+        self._release_notify_cancelled.set()
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._close_release_notify_http_connection_sync)
+
+        async with self._release_notify_lock:
+            self._release_notify_generation += 1
+            self._release_notify_pending = False
+            self._release_notify_sent = True
+            if self._release_notify_task and not self._release_notify_task.done():
+                self._release_notify_task.cancel()
+
+    def _close_release_notify_http_connection_sync(self):
+        with self._release_notify_http_connection_lock:
+            release_notify_http_connection = self._release_notify_http_connection
+            self._release_notify_http_connection = None
+        if release_notify_http_connection:
+            try:
+                release_notify_http_connection.close()
+            except Exception:
+                pass
+
+    async def begin_session_lifecycle(self):
+        self._release_notify_cancelled.clear()
+        async with self._release_notify_lock:
+            self._skip_release_notify = False
+            self._release_notify_generation += 1
+            self._release_notify_pending = False
+            self._release_notify_sent = False
+            if self._release_notify_task and not self._release_notify_task.done():
+                self._release_notify_task.cancel()
+            self._release_notify_task = None
 
     @staticmethod
     def _configure_keepalive(sock):
@@ -112,7 +159,6 @@ class TCPTerminalServer:
 
         - 세션 독립성: Window Size 제어(io_ctl), 환경변수, pty fd 등 모든 상태는 독립 변수 격리로 처리
         """
-        self._skip_release_notify = False
         addr = writer.get_extra_info('peername')
         session_id = id(writer)
         client_ip = addr[0]
@@ -264,36 +310,102 @@ class TCPTerminalServer:
             logger.info(f"TCP connection closed: {client_ip}:{client_port}")
 
             # 활성 세션이 없으면 Controller에 자원 해제 요청
-            if not self._active_sessions and not self._skip_release_notify:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._notify_release())
+            await self._maybe_notify_release()
 
-    async def _notify_release(self):
-        """Controller에 Backend 해제 요청 (TCP 끊김 시 안전망)"""
-        import urllib.request
-        import urllib.error
+    async def _maybe_notify_release(self):
+        """Schedule one fallback release notify per backend lifecycle."""
+        # Fast path: avoid lock if obviously not needed (optimization)
+        if self._skip_release_notify or self._active_sessions:
+            return
 
+        # Double-check with lock to prevent race conditions
+        async with self._release_notify_lock:
+            if self._skip_release_notify or self._active_sessions:
+                return
+            # Ensure we only schedule one notification per lifecycle
+            if self._release_notify_pending or self._release_notify_sent:
+                return
+            self._release_notify_pending = True
+            loop = asyncio.get_running_loop()
+            generation = self._release_notify_generation
+            self._release_notify_task = loop.create_task(self._notify_release(generation))
+
+    async def _notify_release(self, generation: int):
+        """
+        Controller에 Backend 해제 요청 (TCP 끊김 시 안전망).
+
+        debounce → generation 검증 → cancelled_event 검사 → HTTP 전송 순서로 진행.
+        primary cleanup이 먼저 끝나면 cancelled_event.set()와 HTTP 연결 종료로
+        fallback 요청을 best-effort로 중단하며, 중복 전송 가능성은 크게 줄이되
+        blocking HTTP 자체의 마지막 미세 race window까지 완전히 없애지는 않는다.
+        """
         hostname = os.environ.get("HOSTNAME", "")
         if not hostname:
             return
 
+        notified = False
+        cancelled_event = self._release_notify_cancelled
+
+        http_connection_lock = self._release_notify_http_connection_lock
+
         def make_request():
+            if cancelled_event.is_set():
+                return False
+            import http.client
+            body = json.dumps({
+                "backend_pod": hostname,
+                "source": "backend_fallback",
+            }).encode("utf-8")
+            release_notify_http_connection = None
             try:
-                url = "http://controller-service:9001/api/pool/release/"
-                data = json.dumps({"backend_pod": hostname}).encode("utf-8")
-                req = urllib.request.Request(
-                    url, data=data,
-                    headers={"Content-Type": "application/json"},
-                    method="POST"
-                )
-                # 타임아웃을 10초로 늘림 (Controller 응답 지연 대비)
-                resp = urllib.request.urlopen(req, timeout=10)
-                logger.info(f"Release notified to Controller ({resp.status})")
+                release_notify_http_connection = http.client.HTTPConnection("controller-service", 9001, timeout=10)
+                with http_connection_lock:
+                    if cancelled_event.is_set():
+                        return False
+                    self._release_notify_http_connection = release_notify_http_connection
+                release_notify_http_connection.connect()
+                if cancelled_event.is_set():
+                    return False
+                release_notify_http_connection.request("POST", "/api/pool/release/", body=body, headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body)),
+                })
+                if cancelled_event.is_set():
+                    return False
+                response = release_notify_http_connection.getresponse()
+                response.read()
+                logger.debug("Fallback release notified to Controller (%s)", response.status)
+                return True
             except Exception as e:
-                logger.warning(f"Release notification failed: {e}")
+                if not cancelled_event.is_set():
+                    logger.warning("Fallback release notification failed: %s", e)
+                return False
+            finally:
+                with http_connection_lock:
+                    if self._release_notify_http_connection is release_notify_http_connection:
+                        self._release_notify_http_connection = None
+                if release_notify_http_connection:
+                    release_notify_http_connection.close()
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, make_request)
+        try:
+            await asyncio.sleep(self._release_notify_debounce_seconds)
+            async with self._release_notify_lock:
+                if generation != self._release_notify_generation:
+                    return
+                if self._skip_release_notify or self._active_sessions:
+                    return
+            notified = bool(await loop.run_in_executor(None, make_request))
+        except asyncio.CancelledError:
+            raise
+        finally:
+            async with self._release_notify_lock:
+                if generation == self._release_notify_generation:
+                    self._release_notify_pending = False
+                    if notified:
+                        self._release_notify_sent = True
+                    if self._release_notify_task is asyncio.current_task():
+                        self._release_notify_task = None
 
     async def _handle_io(
         self,

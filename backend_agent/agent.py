@@ -167,6 +167,7 @@ async def mount(request: MountRequest):
 
     logger.info("Mount successful")
     await state.set_running()
+    await tcp_terminal.begin_session_lifecycle()
 
     return FormattedJSONResponse({
         "status": "success",
@@ -190,9 +191,9 @@ async def unmount():
 
     try:
         success = await mount_manager.unmount()
-
         if success:
             await state.reset()
+            await tcp_terminal.suppress_fallback_release()
             return FormattedJSONResponse({
                 "status": "success",
                 "message": "Unmounted and reset"
