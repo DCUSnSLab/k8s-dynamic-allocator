@@ -23,8 +23,6 @@ from .tickets import (
     QueueUnavailableError,
     Tickets,
     _iso_now,
-    _parse_datetime,
-    _safe_int,
     _utc_now,
     parse_datetime,
     safe_int,
@@ -113,13 +111,6 @@ class BackendQueues:
                     socket_timeout=3,
                 )
             return self._client
-
-    def _ping(self) -> None:
-        client = self._redis_client()
-        try:
-            client.ping()
-        except RedisError as exc:
-            raise QueueUnavailableError(f"Redis unavailable: {exc}") from exc
 
     def _queue_key(self, backend_type: str) -> str:
         return f"{self.prefix}:queue:{backend_type}"
@@ -235,10 +226,6 @@ class BackendQueues:
                     f"Failed to inspect queue {backend_type} for ticket {ticket_id}: {exc}"
                 ) from exc
 
-    def _ensure_ticket_in_queue(self, client, backend_type: str, ticket_id: str) -> None:
-        if not self._queue_contains(client, backend_type, ticket_id):
-            client.rpush(self._queue_key(backend_type), ticket_id)
-
     def _repair_queue_membership(self, backend_type: str) -> None:
         client = self._redis_client()
         queue_key = self._queue_key(backend_type)
@@ -301,10 +288,10 @@ class BackendQueues:
                 continue
 
             queue_position += 1
-            ingress_ts_ms = _safe_int(raw.get("ingress_ts_ms"), 0)
+            ingress_ts_ms = safe_int(raw.get("ingress_ts_ms"), 0)
             created_ms = ingress_ts_ms
             if not created_ms:
-                created_at = _parse_datetime(raw.get("created_at"))
+                created_at = parse_datetime(raw.get("created_at"))
                 if created_at:
                     created_ms = int(created_at.timestamp() * 1000)
 
@@ -383,7 +370,7 @@ class BackendQueues:
         stale: List[Dict[str, object]] = []
         for type_name in types:
             for ticket_id in self._active_ticket_ids(type_name):
-                ticket = self.get_ticket(ticket_id)
+                ticket = self.tickets.get_ticket(ticket_id)
                 if not ticket:
                     continue
                 if ticket.get("status") == "allocating" and self.is_allocation_stale(ticket):
@@ -398,7 +385,7 @@ class BackendQueues:
         self._repair_queue_membership(backend_type_value)
 
         for ticket_id in self._queue_ids(backend_type_value):
-            ticket = self.get_ticket(ticket_id)
+            ticket = self.tickets.get_ticket(ticket_id)
             if not ticket:
                 self._remove_ticket_from_queue(backend_type_value, ticket_id)
                 client.srem(self._active_key(backend_type_value), ticket_id)
@@ -412,13 +399,13 @@ class BackendQueues:
             if status != "queued":
                 continue
             if self.is_wait_timeout_expired(ticket):
-                self.mark_failed(ticket_id, "Queue wait timeout exceeded")
+                self.tickets.mark_failed(ticket_id, "Queue wait timeout exceeded")
                 continue
 
             claim_token = uuid.uuid4().hex
             claimed_at = _iso_now()
             allocation_deadline = (_utc_now() + timedelta(seconds=self.allocating_ttl_seconds)).isoformat()
-            ticket = self._ticket_transition(
+            ticket = self.tickets._ticket_transition(
                 ticket_id,
                 backend_type=backend_type_value,
                 expected_statuses={"queued"},
@@ -445,86 +432,3 @@ class BackendQueues:
             client.lrem(self._queue_key(backend_type), 0, ticket_id)
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to remove ticket {ticket_id} from queue {backend_type}: {exc}") from exc
-
-    def _raw_to_ticket_dict(self, *args, **kwargs):
-        return self.tickets._raw_to_ticket_dict(*args, **kwargs)
-
-    def _ticket_to_dict(self, *args, **kwargs):
-        return self.tickets._ticket_to_dict(*args, **kwargs)
-
-    def _ticket_fields(self, *args, **kwargs):
-        return self.tickets._ticket_fields(*args, **kwargs)
-
-    def create_ticket(self, *args, **kwargs):
-        return self.tickets.create_ticket(*args, **kwargs)
-
-    def set_assigned_request_context(self, *args, **kwargs):
-        return self.tickets.set_assigned_request_context(*args, **kwargs)
-
-    def get_assigned_request_context(self, *args, **kwargs):
-        return self.tickets.get_assigned_request_context(*args, **kwargs)
-
-    def clear_assigned_request_context(self, *args, **kwargs):
-        return self.tickets.clear_assigned_request_context(*args, **kwargs)
-
-    def set_backend_ticket_index(self, *args, **kwargs):
-        return self.tickets.set_backend_ticket_index(*args, **kwargs)
-
-    def get_ticket_id_for_backend_pod(self, *args, **kwargs):
-        return self.tickets.get_ticket_id_for_backend_pod(*args, **kwargs)
-
-    def get_ticket(self, *args, **kwargs):
-        return self.tickets.get_ticket(*args, **kwargs)
-
-    def get_ticket_snapshot(self, *args, **kwargs):
-        return self.tickets.get_ticket_snapshot(*args, **kwargs)
-
-    def get_ticket_raw(self, *args, **kwargs):
-        return self.tickets.get_ticket_raw(*args, **kwargs)
-
-    def find_ticket_by_backend_pod(self, *args, **kwargs):
-        return self.tickets.find_ticket_by_backend_pod(*args, **kwargs)
-
-    def _ticket_transition(self, *args, **kwargs):
-        return self.tickets._ticket_transition(*args, **kwargs)
-
-    def _refresh_ticket_ttl(self, *args, **kwargs):
-        return self.tickets._refresh_ticket_ttl(*args, **kwargs)
-
-    def list_tickets(self, *args, **kwargs):
-        return self.tickets.list_tickets(*args, **kwargs)
-
-    def list_tickets_snapshot(self, *args, **kwargs):
-        return self.tickets.list_tickets_snapshot(*args, **kwargs)
-
-    def summarize_active_tickets(self, *args, **kwargs):
-        return self.tickets.summarize_active_tickets(*args, **kwargs)
-
-    def find_ticket_by_backend_pod_index_only(self, *args, **kwargs):
-        return self.tickets.find_ticket_by_backend_pod_index_only(*args, **kwargs)
-
-    def mark_allocating(self, *args, **kwargs):
-        return self.tickets.mark_allocating(*args, **kwargs)
-
-    def requeue_ticket(self, *args, **kwargs):
-        return self.tickets.requeue_ticket(*args, **kwargs)
-
-    def mark_assigned(self, *args, **kwargs):
-        return self.tickets.mark_assigned(*args, **kwargs)
-
-    def mark_failed(self, *args, **kwargs):
-        return self.tickets.mark_failed(*args, **kwargs)
-
-    def cancel_ticket(self, *args, **kwargs):
-        return self.tickets.cancel_ticket(*args, **kwargs)
-
-
-WaitQueue = BackendQueues
-
-__all__ = [
-    "BackendQueues",
-    "WaitQueue",
-    "QueueUnavailableError",
-    "parse_datetime",
-    "safe_int",
-]

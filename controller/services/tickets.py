@@ -39,17 +39,11 @@ def parse_datetime(value: Optional[str]) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
-_parse_datetime = parse_datetime
-
-
 def safe_int(value: object, default: int = 0) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
         return default
-
-
-_safe_int = safe_int
 
 
 class QueueUnavailableError(RuntimeError):
@@ -66,9 +60,6 @@ class Tickets:
     def __init__(self, queue):
         self.queue = queue
 
-    def __getattr__(self, name):
-        return getattr(self.queue, name)
-
     def _raw_to_ticket_dict(
         self,
         ticket_id: str,
@@ -78,9 +69,9 @@ class Tickets:
     ) -> Dict[str, object]:
         ticket = dict(raw)
         ticket["ticket_id"] = ticket_id
-        ticket["retry_count"] = _safe_int(ticket.get("retry_count"), 0)
-        ticket["max_retries"] = _safe_int(ticket.get("max_retries"), self.max_retries)
-        ticket["ingress_ts_ms"] = _safe_int(ticket.get("ingress_ts_ms"), 0)
+        ticket["retry_count"] = safe_int(ticket.get("retry_count"), 0)
+        ticket["max_retries"] = safe_int(ticket.get("max_retries"), self.queue.max_retries)
+        ticket["ingress_ts_ms"] = safe_int(ticket.get("ingress_ts_ms"), 0)
         for field in (
             "created_at",
             "updated_at",
@@ -91,7 +82,7 @@ class Tickets:
             "failed_at",
             "cancelled_at",
         ):
-            ticket[field] = _parse_datetime(ticket.get(field))
+            ticket[field] = parse_datetime(ticket.get(field))
         ticket["queue_position"] = queue_position
         return ticket
 
@@ -99,13 +90,13 @@ class Tickets:
         return self._raw_to_ticket_dict(
             ticket_id,
             raw,
-            queue_position=self.get_ticket_position(ticket_id),
+            queue_position=self.queue.get_ticket_position(ticket_id),
         )
 
     def _ticket_fields(self, **overrides) -> Dict[str, str]:
         ticket = {
             "status": "queued",
-            "backend_type": self.default_backend_type,
+            "backend_type": self.queue.default_backend_type,
             "username": "",
             "command": "",
             "frontend_pod": "",
@@ -122,7 +113,7 @@ class Tickets:
             "backend_pod": "",
             "backend_ip": "",
             "retry_count": "0",
-            "max_retries": str(self.max_retries),
+            "max_retries": str(self.queue.max_retries),
             "created_at": _iso_now(),
             "updated_at": _iso_now(),
             "assigned_at": "",
@@ -143,7 +134,7 @@ class Tickets:
         request_id: Optional[str] = None,
         ingress_ts_ms: Optional[int] = None,
     ) -> Dict[str, object]:
-        backend_type_value = self.normalize_backend_type(backend_type)
+        backend_type_value = self.queue.normalize_backend_type(backend_type)
         ticket_id = uuid.uuid4().hex
         ticket_short = ticket_id[:10]
         request_label = settings.build_request_label(username, ticket_short)
@@ -158,16 +149,16 @@ class Tickets:
             request_label=request_label,
             ticket_short=ticket_short,
             ingress_ts_ms=ingress_ts_ms or 0,
-            wait_deadline=(_utc_now() + timedelta(seconds=self.wait_timeout_seconds)).isoformat(),
+            wait_deadline=(_utc_now() + timedelta(seconds=self.queue.wait_timeout_seconds)).isoformat(),
         )
-        client = self._redis_client()
+        client = self.queue._redis_client()
         try:
             pipe = client.pipeline(transaction=True)
-            pipe.hset(self._ticket_key(ticket_id), mapping=ticket)
-            pipe.expire(self._ticket_key(ticket_id), self.ticket_ttl_seconds)
-            pipe.rpush(self._queue_key(backend_type_value), ticket_id)
-            pipe.sadd(self._active_key(backend_type_value), ticket_id)
-            pipe.sadd(self._types_key(), backend_type_value)
+            pipe.hset(self.queue._ticket_key(ticket_id), mapping=ticket)
+            pipe.expire(self.queue._ticket_key(ticket_id), self.queue.ticket_ttl_seconds)
+            pipe.rpush(self.queue._queue_key(backend_type_value), ticket_id)
+            pipe.sadd(self.queue._active_key(backend_type_value), ticket_id)
+            pipe.sadd(self.queue._types_key(), backend_type_value)
             pipe.execute()
             return self.get_ticket(ticket_id) or {"ticket_id": ticket_id, **ticket}
         except RedisError as exc:
@@ -179,14 +170,18 @@ class Tickets:
             return
 
         payload = {key: "" if value is None else str(value) for key, value in context.items()}
-        client = self._redis_client()
+        client = self.queue._redis_client()
         try:
             pipe = client.pipeline(transaction=True)
-            pipe.hset(self._assigned_request_key(backend_pod_value), mapping=payload)
-            pipe.expire(self._assigned_request_key(backend_pod_value), self.assigned_context_ttl_seconds)
+            pipe.hset(self.queue._assigned_request_key(backend_pod_value), mapping=payload)
+            pipe.expire(self.queue._assigned_request_key(backend_pod_value), self.queue.assigned_context_ttl_seconds)
             ticket_id = (payload.get("ticket_id") or "").strip()
             if ticket_id:
-                pipe.set(self._backend_ticket_key(backend_pod_value), ticket_id, ex=self.assigned_context_ttl_seconds)
+                pipe.set(
+                    self.queue._backend_ticket_key(backend_pod_value),
+                    ticket_id,
+                    ex=self.queue.assigned_context_ttl_seconds,
+                )
             pipe.execute()
         except RedisError as exc:
             raise QueueUnavailableError(
@@ -198,12 +193,12 @@ class Tickets:
         if not backend_pod_value:
             return None
 
-        client = self._redis_client()
+        client = self.queue._redis_client()
         try:
-            raw = client.hgetall(self._assigned_request_key(backend_pod_value))
+            raw = client.hgetall(self.queue._assigned_request_key(backend_pod_value))
             if not raw:
                 return None
-            raw["assigned_at_ms"] = _safe_int(raw.get("assigned_at_ms"), 0)
+            raw["assigned_at_ms"] = safe_int(raw.get("assigned_at_ms"), 0)
             return raw
         except RedisError as exc:
             raise QueueUnavailableError(
@@ -215,29 +210,15 @@ class Tickets:
         if not backend_pod_value:
             return
 
-        client = self._redis_client()
+        client = self.queue._redis_client()
         try:
             client.delete(
-                self._assigned_request_key(backend_pod_value),
-                self._backend_ticket_key(backend_pod_value),
+                self.queue._assigned_request_key(backend_pod_value),
+                self.queue._backend_ticket_key(backend_pod_value),
             )
         except RedisError as exc:
             raise QueueUnavailableError(
                 f"Failed to clear assigned request context for {backend_pod_value}: {exc}"
-            ) from exc
-
-    def set_backend_ticket_index(self, backend_pod: str, ticket_id: str) -> None:
-        backend_pod_value = (backend_pod or "").strip()
-        ticket_id_value = (ticket_id or "").strip()
-        if not backend_pod_value or not ticket_id_value:
-            return
-
-        client = self._redis_client()
-        try:
-            client.set(self._backend_ticket_key(backend_pod_value), ticket_id_value, ex=self.assigned_context_ttl_seconds)
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to store backend ticket index for {backend_pod_value}: {exc}"
             ) from exc
 
     def get_ticket_id_for_backend_pod(self, backend_pod: str) -> Optional[str]:
@@ -245,9 +226,9 @@ class Tickets:
         if not backend_pod_value:
             return None
 
-        client = self._redis_client()
+        client = self.queue._redis_client()
         try:
-            ticket_id = client.get(self._backend_ticket_key(backend_pod_value))
+            ticket_id = client.get(self.queue._backend_ticket_key(backend_pod_value))
             return (ticket_id or "").strip() or None
         except RedisError as exc:
             raise QueueUnavailableError(
@@ -255,9 +236,9 @@ class Tickets:
             ) from exc
 
     def get_ticket(self, ticket_id: str) -> Optional[Dict[str, object]]:
-        client = self._redis_client()
+        client = self.queue._redis_client()
         try:
-            raw = client.hgetall(self._ticket_key(ticket_id))
+            raw = client.hgetall(self.queue._ticket_key(ticket_id))
             if not raw:
                 return None
             return self._ticket_to_dict(ticket_id, raw)
@@ -268,7 +249,7 @@ class Tickets:
         raw = self.get_ticket_raw(ticket_id)
         if not raw:
             return None
-        backend_type = self.normalize_backend_type(raw.get("backend_type"))
+        backend_type = self.queue.normalize_backend_type(raw.get("backend_type"))
         status = str(raw.get("status") or "").lower()
         queue_position = None
         if status == "queued":
@@ -280,22 +261,12 @@ class Tickets:
         )
 
     def get_ticket_raw(self, ticket_id: str) -> Optional[Dict[str, str]]:
-        client = self._redis_client()
+        client = self.queue._redis_client()
         try:
-            raw = client.hgetall(self._ticket_key(ticket_id))
+            raw = client.hgetall(self.queue._ticket_key(ticket_id))
             return raw or None
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to read ticket {ticket_id}: {exc}") from exc
-
-    def find_ticket_by_backend_pod(
-        self,
-        backend_pod: str,
-        backend_type: Optional[str] = None,
-    ) -> Optional[Dict[str, object]]:
-        return self.find_ticket_by_backend_pod_index_only(
-            backend_pod,
-            backend_type=backend_type,
-        )
 
     def _ticket_transition(
         self,
@@ -309,11 +280,11 @@ class Tickets:
         remove_from_active: bool = False,
         ensure_in_queue: bool = False,
     ) -> Optional[Dict[str, object]]:
-        client = self._redis_client()
-        ticket_key = self._ticket_key(ticket_id)
-        queue_backend_type = self.normalize_backend_type(backend_type) if backend_type else None
-        queue_key = self._queue_key(queue_backend_type) if queue_backend_type else None
-        active_key = self._active_key(queue_backend_type) if queue_backend_type else None
+        client = self.queue._redis_client()
+        ticket_key = self.queue._ticket_key(ticket_id)
+        queue_backend_type = self.queue.normalize_backend_type(backend_type) if backend_type else None
+        queue_key = self.queue._queue_key(queue_backend_type) if queue_backend_type else None
+        active_key = self.queue._active_key(queue_backend_type) if queue_backend_type else None
         expected = {status.lower() for status in expected_statuses}
 
         for _ in range(3):
@@ -339,10 +310,10 @@ class Tickets:
                         pipe.reset()
                         return None
 
-                    backend_type_value = queue_backend_type or self.normalize_backend_type(raw.get("backend_type"))
-                    queue_key = self._queue_key(backend_type_value)
-                    active_key = self._active_key(backend_type_value)
-                    if ensure_in_queue and not self._queue_contains(client, backend_type_value, ticket_id):
+                    backend_type_value = queue_backend_type or self.queue.normalize_backend_type(raw.get("backend_type"))
+                    queue_key = self.queue._queue_key(backend_type_value)
+                    active_key = self.queue._active_key(backend_type_value)
+                    if ensure_in_queue and not self.queue._queue_contains(client, backend_type_value, ticket_id):
                         queue_should_add = True
                     else:
                         queue_should_add = False
@@ -361,23 +332,20 @@ class Tickets:
                         pipe.srem(active_key, ticket_id)
                     if ensure_in_queue:
                         pipe.sadd(active_key, ticket_id)
-                    pipe.expire(ticket_key, self.ticket_ttl_seconds)
+                    pipe.expire(ticket_key, self.queue.ticket_ttl_seconds)
                     pipe.execute()
                     return self.get_ticket(ticket_id)
             except WatchError:
                 continue
         raise QueueUnavailableError(f"Failed to update ticket {ticket_id}: concurrent modification detected")
 
-    def _refresh_ticket_ttl(self, client, ticket_id: str) -> None:
-        client.expire(self._ticket_key(ticket_id), self.ticket_ttl_seconds)
-
     def list_tickets(self, backend_type: Optional[str] = None) -> List[Dict[str, object]]:
-        types = [self.normalize_backend_type(backend_type)] if backend_type else self.known_backend_types()
+        types = [self.queue.normalize_backend_type(backend_type)] if backend_type else self.queue.known_backend_types()
         tickets: List[Dict[str, object]] = []
         seen = set()
         for type_name in types:
-            self._repair_queue_membership(type_name)
-            for ticket_id in self._queue_ids(type_name):
+            self.queue._repair_queue_membership(type_name)
+            for ticket_id in self.queue._queue_ids(type_name):
                 if ticket_id in seen:
                     continue
                 seen.add(ticket_id)
@@ -387,13 +355,13 @@ class Tickets:
         return tickets
 
     def list_tickets_snapshot(self, backend_type: Optional[str] = None) -> List[Dict[str, object]]:
-        types = [self.normalize_backend_type(backend_type)] if backend_type else self.known_backend_types()
+        types = [self.queue.normalize_backend_type(backend_type)] if backend_type else self.queue.known_backend_types()
         tickets: List[Dict[str, object]] = []
         seen = set()
         for type_name in types:
             queue_positions: Dict[str, int] = {}
             current_position = 0
-            for ticket_id in self._queue_ids(type_name):
+            for ticket_id in self.queue._queue_ids(type_name):
                 raw = self.get_ticket_raw(ticket_id)
                 if not raw:
                     continue
@@ -401,7 +369,7 @@ class Tickets:
                     current_position += 1
                     queue_positions[ticket_id] = current_position
 
-            for ticket_id in self._snapshot_ticket_ids(type_name):
+            for ticket_id in self.queue._snapshot_ticket_ids(type_name):
                 if ticket_id in seen:
                     continue
                 seen.add(ticket_id)
@@ -426,13 +394,13 @@ class Tickets:
         *,
         now_ms: Optional[int] = None,
     ) -> Dict[str, int]:
-        backend_type_value = self.normalize_backend_type(backend_type)
+        backend_type_value = self.queue.normalize_backend_type(backend_type)
         now_ms_value = now_ms if now_ms is not None else int(_utc_now().timestamp() * 1000)
         queued_count = 0
         allocating_count = 0
         oldest_wait_ms = 0
 
-        for ticket_id in self._snapshot_ticket_ids(backend_type_value):
+        for ticket_id in self.queue._snapshot_ticket_ids(backend_type_value):
             raw = self.get_ticket_raw(ticket_id)
             if not raw:
                 continue
@@ -446,10 +414,10 @@ class Tickets:
             elif status == "allocating":
                 allocating_count += 1
 
-            ingress_ts_ms = _safe_int(raw.get("ingress_ts_ms"), 0)
+            ingress_ts_ms = safe_int(raw.get("ingress_ts_ms"), 0)
             created_ms = ingress_ts_ms
             if not created_ms:
-                created_at = _parse_datetime(raw.get("created_at"))
+                created_at = parse_datetime(raw.get("created_at"))
                 if created_at:
                     created_ms = int(created_at.timestamp() * 1000)
             if created_ms:
@@ -471,7 +439,7 @@ class Tickets:
         if not backend_pod_value:
             return None
 
-        backend_type_value = self.normalize_backend_type(backend_type) if backend_type else None
+        backend_type_value = self.queue.normalize_backend_type(backend_type) if backend_type else None
         try:
             ticket_id = self.get_ticket_id_for_backend_pod(backend_pod_value)
         except QueueUnavailableError:
@@ -482,7 +450,7 @@ class Tickets:
             if ticket:
                 assigned_backend = (ticket.get("backend_pod") or "").strip()
                 assigned_status = str(ticket.get("status") or "").lower()
-                assigned_type = self.normalize_backend_type(ticket.get("backend_type"))
+                assigned_type = self.queue.normalize_backend_type(ticket.get("backend_type"))
                 if (
                     assigned_backend == backend_pod_value
                     and assigned_status == "assigned"
@@ -508,7 +476,7 @@ class Tickets:
         if not ticket:
             return None
 
-        ticket_backend_type = self.normalize_backend_type(ticket.get("backend_type"))
+        ticket_backend_type = self.queue.normalize_backend_type(ticket.get("backend_type"))
         return self._ticket_transition(
             ticket_id,
             backend_type=ticket_backend_type,
@@ -518,10 +486,10 @@ class Tickets:
                 "status": "allocating",
                 "backend_pod": backend_pod,
                 "backend_ip": backend_ip,
-                "claimed_by": claimed_by or ticket.get("claimed_by") or self.worker_identity,
+                "claimed_by": claimed_by or ticket.get("claimed_by") or self.queue.worker_identity,
                 "claim_token": claim_token or ticket.get("claim_token") or uuid.uuid4().hex,
                 "claimed_at": ticket.get("claimed_at") or _iso_now(),
-                "allocation_deadline": (_utc_now() + timedelta(seconds=self.allocating_ttl_seconds)).isoformat(),
+                "allocation_deadline": (_utc_now() + timedelta(seconds=self.queue.allocating_ttl_seconds)).isoformat(),
                 "error": "",
             },
         )
@@ -544,10 +512,10 @@ class Tickets:
         if self.is_wait_timeout_expired(ticket):
             return self.mark_failed(ticket_id, reason or "Queue wait timeout exceeded")
 
-        backend_type = self.normalize_backend_type(ticket.get("backend_type"))
-        retry_count = _safe_int(ticket.get("retry_count"), 0)
+        backend_type = self.queue.normalize_backend_type(ticket.get("backend_type"))
+        retry_count = safe_int(ticket.get("retry_count"), 0)
         if increment_retry:
-            retry_count = min(retry_count + 1, self.max_retries)
+            retry_count = min(retry_count + 1, self.queue.max_retries)
         return self._ticket_transition(
             ticket_id,
             backend_type=backend_type,
@@ -580,7 +548,7 @@ class Tickets:
         ticket = self.get_ticket(ticket_id)
         if not ticket:
             return None
-        backend_type = self.normalize_backend_type(ticket.get("backend_type"))
+        backend_type = self.queue.normalize_backend_type(ticket.get("backend_type"))
         ticket = self._ticket_transition(
             ticket_id,
             backend_type=backend_type,
@@ -591,21 +559,21 @@ class Tickets:
                 "backend_pod": backend_pod,
                 "backend_ip": backend_ip,
                 "assigned_at": _iso_now(),
-                "claimed_by": ticket.get("claimed_by") or self.worker_identity,
+                "claimed_by": ticket.get("claimed_by") or self.queue.worker_identity,
                 "error": "",
             },
             remove_from_queue=True,
             remove_from_active=True,
         )
         if ticket and str(ticket.get("status") or "").lower() == "assigned":
-            client = self._redis_client()
+            client = self.queue._redis_client()
             try:
                 pipe = client.pipeline(transaction=False)
-                pipe.expire(self._ticket_key(ticket_id), self.assigned_context_ttl_seconds)
+                pipe.expire(self.queue._ticket_key(ticket_id), self.queue.assigned_context_ttl_seconds)
                 pipe.set(
-                    self._backend_ticket_key(backend_pod),
+                    self.queue._backend_ticket_key(backend_pod),
                     ticket_id,
-                    ex=self.assigned_context_ttl_seconds,
+                    ex=self.queue.assigned_context_ttl_seconds,
                 )
                 pipe.execute()
             except (RedisError, QueueUnavailableError):
@@ -624,7 +592,7 @@ class Tickets:
         status = str(ticket.get("status") or "").lower()
         if status in self.FINAL_STATES:
             return ticket
-        backend_type = self.normalize_backend_type(ticket.get("backend_type"))
+        backend_type = self.queue.normalize_backend_type(ticket.get("backend_type"))
         return self._ticket_transition(
             ticket_id,
             backend_type=backend_type,
@@ -653,7 +621,7 @@ class Tickets:
         if status in self.FINAL_STATES:
             return ticket
 
-        backend_type = self.normalize_backend_type(ticket.get("backend_type"))
+        backend_type = self.queue.normalize_backend_type(ticket.get("backend_type"))
         return self._ticket_transition(
             ticket_id,
             backend_type=backend_type,

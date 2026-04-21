@@ -57,21 +57,6 @@ class RequestLabelFilter(logging.Filter):
         return True
 
 
-
-def _env_int(name, default):
-    try:
-        return int(os.getenv(name, default))
-    except (TypeError, ValueError):
-        return int(default)
-
-
-def _env_float(name, default):
-    try:
-        return float(os.getenv(name, default))
-    except (TypeError, ValueError):
-        return float(default)
-
-
 def _env_first(names, default):
     for name in names:
         value = os.getenv(name)
