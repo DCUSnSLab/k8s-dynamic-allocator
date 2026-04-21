@@ -18,11 +18,15 @@ import fcntl
 import json
 import threading
 from datetime import datetime
-from typing import Optional
+from typing import Dict, List, Optional
 
 from mount_manager import MountManager
 
 logger = logging.getLogger(__name__)
+
+TCP_KEEPIDLE = int(os.getenv("TCP_KEEPIDLE", "10"))
+TCP_KEEPINTVL = int(os.getenv("TCP_KEEPINTVL", "5"))
+TCP_KEEPCNT = int(os.getenv("TCP_KEEPCNT", "3"))
 
 
 class TCPTerminalServer:
@@ -35,10 +39,10 @@ class TCPTerminalServer:
     - 동시 접속 지원 (세션별 로컬 변수 관리)
     """
 
-    def __init__(self, port: int = 8081):
-        self.port = port
+    def __init__(self, port: Optional[int] = None) -> None:
+        self.port = port or int(os.getenv("BACKEND_AGENT_TCP_PORT", "8081"))
         self.server: Optional[asyncio.Server] = None
-        self._active_sessions = {}  # {session_id: {process, addr, started_at, command}}
+        self._active_sessions: Dict[int, Dict] = {}
         self._skip_release_notify = False
         self._release_notify_debounce_seconds = float(
             os.getenv("BACKEND_AGENT_RELEASE_NOTIFY_DEBOUNCE_SECONDS", "10")
@@ -52,7 +56,7 @@ class TCPTerminalServer:
         self._release_notify_http_connection_lock = threading.Lock()
         self._release_notify_http_connection = None
 
-    async def start(self):
+    async def start(self) -> None:
         """TCP 서버 시작"""
         self.server = await asyncio.start_server(
             self.handle_connection,
@@ -62,15 +66,15 @@ class TCPTerminalServer:
         # 서버 소켓에 TCP Keepalive 적용
         for sock in self.server.sockets:
             self._configure_keepalive(sock)
-        logger.info(f"TCP Terminal Server started on port {self.port}")
+        logger.info("TCP Terminal Server started on port %s", self.port)
 
-    async def stop(self):
+    async def stop(self) -> None:
         """TCP 서버 중지 — 모든 활성 세션 정리"""
         for sid, info in list(self._active_sessions.items()):
             process = info.get("process")
             if process and process.poll() is None:
                 process.terminate()
-                logger.info(f"Terminated process for session {sid}")
+                logger.info("Terminated process for session %s", sid)
         self._active_sessions.clear()
 
         if self.server:
@@ -78,7 +82,7 @@ class TCPTerminalServer:
             await self.server.wait_closed()
             logger.info("TCP Terminal Server stopped")
 
-    async def terminate_all_sessions(self):
+    async def terminate_all_sessions(self) -> None:
         """외부 요청에 의한 모든 활성 세션/프로세스 강제 종료 (fallback 상태는 변경하지 않음)"""
         count = 0
         for sid, info in list(self._active_sessions.items()):
@@ -91,9 +95,9 @@ class TCPTerminalServer:
                     process.kill()
                 count += 1
         if count:
-            logger.info(f"Terminated {count} active session(s) by external request")
+            logger.info("Terminated %d active session(s) by external request", count)
 
-    async def suppress_fallback_release(self):
+    async def suppress_fallback_release(self) -> None:
         """primary cleanup 성공 후 호출 — fallback release를 확정적으로 억제한다."""
         self._skip_release_notify = True
         self._release_notify_cancelled.set()
@@ -108,7 +112,7 @@ class TCPTerminalServer:
             if self._release_notify_task and not self._release_notify_task.done():
                 self._release_notify_task.cancel()
 
-    def _close_release_notify_http_connection_sync(self):
+    def _close_release_notify_http_connection_sync(self) -> None:
         with self._release_notify_http_connection_lock:
             release_notify_http_connection = self._release_notify_http_connection
             self._release_notify_http_connection = None
@@ -118,7 +122,7 @@ class TCPTerminalServer:
             except Exception:
                 pass
 
-    async def begin_session_lifecycle(self):
+    async def begin_session_lifecycle(self) -> None:
         self._release_notify_cancelled.clear()
         async with self._release_notify_lock:
             self._skip_release_notify = False
@@ -130,15 +134,14 @@ class TCPTerminalServer:
             self._release_notify_task = None
 
     @staticmethod
-    def _configure_keepalive(sock):
+    def _configure_keepalive(sock: socket.socket) -> None:
         """TCP Keepalive 설정 — 비정상 연결 끊김 감지용"""
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPIDLE)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPINTVL)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPCNT)
 
-    def get_sessions(self):
-        """활성 세션 목록 반환 (모니터링용)"""
+    def get_sessions(self) -> List[Dict]:
         return [
             {
                 "id": sid,
@@ -206,7 +209,7 @@ class TCPTerminalServer:
             try:
                 fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
             except Exception as e:
-                logger.warning(f"Failed to set window size: {e}")
+                logger.warning("Failed to set window size: %s", e)
 
             # PTY 설정
             try:
@@ -238,7 +241,7 @@ class TCPTerminalServer:
 
                 termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
             except Exception as e:
-                logger.warning(f"Failed to configure PTY: {e}")
+                logger.warning("Failed to configure PTY: %s", e)
 
             if command.endswith("bash") or command.endswith("sh"):
                 final_command = [command, "-l"]
@@ -284,7 +287,7 @@ class TCPTerminalServer:
             await self._handle_io(reader, writer, master_fd, process, verase_byte)
 
         except Exception as e:
-            logger.error(f"Connection error: {e}")
+            logger.error("Connection error: %s", e)
         finally:
             # 정리: master_fd 닫기
             if master_fd is not None:
@@ -300,14 +303,14 @@ class TCPTerminalServer:
                     process.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    logger.warning(f"Force killed process for session {session_id}")
+                    logger.warning("Force killed process for session %s", session_id)
 
             # 세션 추적 제거
             self._active_sessions.pop(session_id, None)
 
             writer.close()
             await writer.wait_closed()
-            logger.info(f"TCP connection closed: {client_ip}:{client_port}")
+            logger.info("TCP connection closed: %s:%s", client_ip, client_port)
 
             # 활성 세션이 없으면 Controller에 자원 해제 요청
             await self._maybe_notify_release()

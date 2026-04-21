@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 import threading
 import time
 from datetime import datetime
@@ -11,8 +11,8 @@ from config import settings
 from config.settings import build_request_label, get_request_label, set_request_label
 
 from .backend_agent import BackendAgent
-from .backend_pool import BackendPool, PodConflictError
-from .wait_queue import QueueUnavailableError, WaitQueue, parse_datetime, safe_int
+from .pool import BackendPool, PodConflictError
+from .queue import BackendQueues, QueueUnavailableError, parse_datetime, safe_int
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ class Orchestrator:
 
     def __init__(self):
         self.pool = BackendPool()
-        self.wait_queue = WaitQueue()
+        self.queues = BackendQueues()
         self._backend_refresh_lock = threading.Lock()
         self._backend_refresh_interval = max(settings.WAIT_QUEUE_BACKEND_REFRESH_SECONDS, 1.0)
         self._last_backend_refresh = 0.0
@@ -125,7 +125,7 @@ class Orchestrator:
         getattr(logger, level, logger.info)(message)
 
     def _ready_backend_names(self, backend_type: str) -> List[str]:
-        backend_type_value = self.wait_queue.normalize_backend_type(backend_type)
+        backend_type_value = self.queues.normalize_backend_type(backend_type)
         ready = []
         for item in self.pool.list_pool_status(backend_type_value):
             if item.get("pool_status") == self.pool.STATUS_AVAILABLE and item.get("ready"):
@@ -136,7 +136,7 @@ class Orchestrator:
 
     def _ticket_for_backend_pod(self, backend_pod: str, backend_type: Optional[str] = None) -> Optional[Dict]:
         try:
-            ticket = self.wait_queue.find_ticket_by_backend_pod_index_only(
+            ticket = self.queues.find_ticket_by_backend_pod_index_only(
                 backend_pod,
                 backend_type=backend_type,
             )
@@ -157,7 +157,7 @@ class Orchestrator:
 
         if ticket_id:
             try:
-                ticket = self.wait_queue.get_ticket_snapshot(ticket_id)
+                ticket = self.queues.get_ticket_snapshot(ticket_id)
             except QueueUnavailableError as exc:
                 logger.debug("Ticket lookup by id failed for %s: %s", ticket_id, exc)
             else:
@@ -324,20 +324,20 @@ class Orchestrator:
                 self.pool.initialize_pool()
             except Exception as exc:
                 logger.debug("Backend manifest refresh skipped: %s", exc)
-            backend_types.update(self.wait_queue.known_backend_types())
+            backend_types.update(self.queues.known_backend_types())
             for item in self.pool.list_pool_status():
                 if item.get("backend_type"):
-                    backend_types.add(self.wait_queue.normalize_backend_type(item.get("backend_type")))
+                    backend_types.add(self.queues.normalize_backend_type(item.get("backend_type")))
 
             if backend_types:
-                self.wait_queue.register_backend_types(sorted(backend_types))
+                self.queues.register_backend_types(sorted(backend_types))
 
     def _discover_backend_types(self) -> List[str]:
         self._refresh_backend_types()
-        return sorted(self.wait_queue.known_backend_types())
+        return sorted(self.queues.known_backend_types())
 
     def _select_backend_pod(self, backend_type: str) -> Dict:
-        backend_type_value = self.wait_queue.normalize_backend_type(backend_type)
+        backend_type_value = self.queues.normalize_backend_type(backend_type)
         backend_pod = self.pool.get_available_pod(backend_type_value)
         if not backend_pod:
             return {}
@@ -346,86 +346,58 @@ class Orchestrator:
             "ip": self.pool.get_pod_ip(backend_pod) or "",
         }
 
+    def _release_pod_best_effort(self, backend_pod: str, ticket_id: str) -> None:
+        if not backend_pod:
+            return
+        try:
+            self.pool.release_pod(backend_pod)
+        except Exception as exc:
+            logger.warning(
+                "Failed to release stale backend %s for ticket %s: %s",
+                backend_pod,
+                ticket_id,
+                exc,
+            )
+
     def _recover_stale_ticket(self, ticket: Dict) -> Dict:
         ticket_id = ticket.get("ticket_id", "")
-        backend_type = self.wait_queue.normalize_backend_type(ticket.get("backend_type"))
+        backend_type = self.queues.normalize_backend_type(ticket.get("backend_type"))
         backend_pod = ticket.get("backend_pod", "")
         claim_token = ticket.get("claim_token") or None
         retry_count = int(ticket.get("retry_count") or 0)
-        max_retries = int(ticket.get("max_retries") or self.wait_queue.max_retries)
+        max_retries = int(ticket.get("max_retries") or self.queues.max_retries)
+        skipped = {"ticket_id": ticket_id, "backend_type": backend_type, "status": "skipped"}
 
         try:
-            current = self.wait_queue.get_ticket(ticket_id)
+            current = self.queues.get_ticket(ticket_id)
             if not current or str(current.get("status") or "").lower() != "allocating":
-                return {
-                    "ticket_id": ticket_id,
-                    "backend_type": backend_type,
-                    "status": "skipped",
-                }
+                return skipped
             if claim_token and (current.get("claim_token") or "") != claim_token:
-                return {
-                    "ticket_id": ticket_id,
-                    "backend_type": backend_type,
-                    "status": "skipped",
-                }
+                return skipped
 
             if retry_count < max_retries:
-                recovered = self.wait_queue.requeue_ticket(
+                recovered = self.queues.requeue_ticket(
                     ticket_id,
                     reason="stale allocation recovered",
                     increment_retry=True,
                     claim_token=claim_token,
                 )
-                if backend_pod and recovered and recovered.get("status") == "queued":
-                    try:
-                        self.pool.release_pod(backend_pod)
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to release stale backend %s for ticket %s: %s",
-                            backend_pod,
-                            ticket_id,
-                            exc,
-                        )
-                if recovered:
+                if recovered and recovered.get("status") == "queued":
+                    self._release_pod_best_effort(backend_pod, ticket_id)
                     self._log_queue_event("debug", "stale_recovered", recovered, reason="stale allocation recovered")
-                    return {
-                        "ticket_id": ticket_id,
-                        "backend_type": backend_type,
-                        "status": "requeued",
-                    }
-                return {
-                    "ticket_id": ticket_id,
-                    "backend_type": backend_type,
-                    "status": "skipped",
-                }
+                    return {"ticket_id": ticket_id, "backend_type": backend_type, "status": "requeued"}
+                return skipped
 
-            failed = self.wait_queue.mark_failed(
+            failed = self.queues.mark_failed(
                 ticket_id,
                 "stale allocation exceeded retry budget",
                 claim_token=claim_token,
             )
-            if backend_pod and failed and failed.get("status") == "failed":
-                try:
-                    self.pool.release_pod(backend_pod)
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to release stale backend %s for ticket %s: %s",
-                        backend_pod,
-                        ticket_id,
-                        exc,
-                    )
-            if failed:
+            if failed and failed.get("status") == "failed":
+                self._release_pod_best_effort(backend_pod, ticket_id)
                 self._log_queue_event("debug", "ticket_failed", failed, reason="stale allocation exceeded retry budget")
-                return {
-                    "ticket_id": ticket_id,
-                    "backend_type": backend_type,
-                    "status": "failed",
-                }
-            return {
-                "ticket_id": ticket_id,
-                "backend_type": backend_type,
-                "status": "skipped",
-            }
+                return {"ticket_id": ticket_id, "backend_type": backend_type, "status": "failed"}
+            return skipped
         except QueueUnavailableError as exc:
             return {
                 "ticket_id": ticket_id,
@@ -455,7 +427,7 @@ class Orchestrator:
 
     def _execute_allocated_ticket(self, ticket: Dict) -> Dict:
         ticket_id = ticket.get("ticket_id", "")
-        backend_type = self.wait_queue.normalize_backend_type(ticket.get("backend_type"))
+        backend_type = self.queues.normalize_backend_type(ticket.get("backend_type"))
         backend_pod = ticket.get("backend_pod", "")
         backend_ip = ticket.get("backend_ip", "")
         frontend_pod = ticket.get("frontend_pod") or ""
@@ -464,7 +436,7 @@ class Orchestrator:
         claim_token = ticket.get("claim_token") or ""
 
         if not backend_pod or not frontend_ip:
-            self.wait_queue.mark_failed(ticket_id, "Missing backend or frontend context", claim_token=claim_token)
+            self.queues.mark_failed(ticket_id, "Missing backend or frontend context", claim_token=claim_token)
             return {
                 "ticket_id": ticket_id,
                 "backend_type": backend_type,
@@ -472,7 +444,7 @@ class Orchestrator:
                 "message": "Missing backend or frontend context",
             }
 
-        current = self.wait_queue.get_ticket(ticket_id)
+        current = self.queues.get_ticket(ticket_id)
         if not current or current.get("status") != "allocating" or current.get("claim_token") != claim_token:
             try:
                 self.pool.release_pod(backend_pod)
@@ -487,71 +459,23 @@ class Orchestrator:
             }
 
         try:
-            agent = BackendAgent(backend_ip)
-            try:
+            with BackendAgent(backend_ip) as agent:
                 agent.mount(frontend_ip, command, frontend_pod)
-            finally:
-                agent.close()
-        except httpx.HTTPError as exc:
-            logger.warning("Mount failed for ticket %s on %s: %s", ticket_id, backend_pod, exc)
-            try:
-                self.pool.release_pod(backend_pod)
-            except Exception as release_exc:
-                logger.warning(
-                    "Failed to release backend pod %s after mount error: %s",
-                    backend_pod,
-                    release_exc,
-                )
-
-            current = self.wait_queue.get_ticket(ticket_id)
-            if current and int(current.get("retry_count") or 0) < int(current.get("max_retries") or self.wait_queue.max_retries):
-                requeued = self.wait_queue.requeue_ticket(
-                    ticket_id,
-                    reason=f"Mount failed: {exc}",
-                    increment_retry=True,
-                    claim_token=claim_token,
-                )
-                requeued_ticket = requeued if requeued and requeued.get("status") == "queued" else self.wait_queue.get_ticket(ticket_id)
-                if requeued_ticket:
-                    self._log_queue_event("debug", "ticket_requeued", requeued_ticket, reason=f"Mount failed: {exc}")
-                return self._ticket_response(requeued_ticket, str(exc))
-
-            failed = self.wait_queue.mark_failed(ticket_id, f"Mount failed: {exc}", claim_token=claim_token)
-            failed_ticket = failed if failed and failed.get("status") == "failed" else self.wait_queue.get_ticket(ticket_id)
-            if failed_ticket:
-                self._log_queue_event("info", "Failed", failed_ticket, reason=f"Mount failed: {exc}")
-            return self._ticket_response(failed_ticket, str(exc))
         except Exception as exc:
-            logger.exception("Unexpected mount failure for ticket %s on %s", ticket_id, backend_pod)
-            try:
-                self.pool.release_pod(backend_pod)
-            except Exception as release_exc:
-                logger.warning(
-                    "Failed to release backend pod %s after unexpected mount error: %s",
-                    backend_pod,
-                    release_exc,
-                )
+            is_http_error = isinstance(exc, httpx.HTTPError)
+            if is_http_error:
+                logger.warning("Mount failed for ticket %s on %s: %s", ticket_id, backend_pod, exc)
+            else:
+                logger.exception("Unexpected mount failure for ticket %s on %s", ticket_id, backend_pod)
 
-            current = self.wait_queue.get_ticket(ticket_id)
-            if current and int(current.get("retry_count") or 0) < int(current.get("max_retries") or self.wait_queue.max_retries):
-                requeued = self.wait_queue.requeue_ticket(
-                    ticket_id,
-                    reason=f"Unexpected mount failure: {exc}",
-                    increment_retry=True,
-                    claim_token=claim_token,
-                )
-                requeued_ticket = requeued if requeued and requeued.get("status") == "queued" else self.wait_queue.get_ticket(ticket_id)
-                if requeued_ticket:
-                    self._log_queue_event("debug", "ticket_requeued", requeued_ticket, reason=f"Unexpected mount failure: {exc}")
-                return self._ticket_response(requeued_ticket, str(exc))
+            return self._handle_mount_failure(
+                ticket_id=ticket_id,
+                backend_pod=backend_pod,
+                claim_token=claim_token,
+                exc=exc,
+            )
 
-            failed = self.wait_queue.mark_failed(ticket_id, f"Unexpected mount failure: {exc}", claim_token=claim_token)
-            failed_ticket = failed if failed and failed.get("status") == "failed" else self.wait_queue.get_ticket(ticket_id)
-            if failed_ticket:
-                self._log_queue_event("info", "Failed", failed_ticket, reason=f"Unexpected mount failure: {exc}")
-            return self._ticket_response(failed_ticket, str(exc))
-
-        current = self.wait_queue.get_ticket(ticket_id)
+        current = self.queues.get_ticket(ticket_id)
         if not current or current.get("status") != "allocating" or current.get("claim_token") != claim_token:
             try:
                 self.pool.release_pod(backend_pod)
@@ -564,10 +488,10 @@ class Orchestrator:
                 "message": "Ticket was cancelled before commit",
             }
 
-        committed = self.wait_queue.mark_assigned(ticket_id, backend_pod, backend_ip, claim_token=claim_token)
+        committed = self.queues.mark_assigned(ticket_id, backend_pod, backend_ip, claim_token=claim_token)
         if committed and committed.get("status") == "assigned":
             assigned_context = self._assigned_request_context(committed)
-            self.wait_queue.set_assigned_request_context(backend_pod, assigned_context)
+            self.queues.set_assigned_request_context(backend_pod, assigned_context)
             self._log_queue_event(
                 "info",
                 "Assigned",
@@ -591,13 +515,49 @@ class Orchestrator:
             self.pool.release_pod(backend_pod)
         except Exception:
             pass
-        current = self.wait_queue.get_ticket(ticket_id)
+        current = self.queues.get_ticket(ticket_id)
         if current:
             self._log_queue_event("debug", "ticket_requeued", current, reason="Ticket no longer owns the allocation")
         return self._ticket_response(current or ticket, "Ticket no longer owns the allocation")
 
+    def _handle_mount_failure(
+        self,
+        ticket_id: str,
+        backend_pod: str,
+        claim_token: str,
+        exc: Exception,
+    ) -> Dict:
+        reason = f"Mount failed: {exc}"
+        try:
+            self.pool.release_pod(backend_pod)
+        except Exception as release_exc:
+            logger.warning(
+                "Failed to release backend pod %s after mount error: %s",
+                backend_pod,
+                release_exc,
+            )
+
+        current = self.queues.get_ticket(ticket_id)
+        if current and int(current.get("retry_count") or 0) < int(current.get("max_retries") or self.queues.max_retries):
+            requeued = self.queues.requeue_ticket(
+                ticket_id,
+                reason=reason,
+                increment_retry=True,
+                claim_token=claim_token,
+            )
+            requeued_ticket = requeued if requeued and requeued.get("status") == "queued" else self.queues.get_ticket(ticket_id)
+            if requeued_ticket:
+                self._log_queue_event("debug", "ticket_requeued", requeued_ticket, reason=reason)
+            return self._ticket_response(requeued_ticket, str(exc))
+
+        failed = self.queues.mark_failed(ticket_id, reason, claim_token=claim_token)
+        failed_ticket = failed if failed and failed.get("status") == "failed" else self.queues.get_ticket(ticket_id)
+        if failed_ticket:
+            self._log_queue_event("info", "Failed", failed_ticket, reason=reason)
+        return self._ticket_response(failed_ticket, str(exc))
+
     def _drain_wait_queue_for_type(self, backend_type: str) -> Dict:
-        backend_type_value = self.wait_queue.normalize_backend_type(backend_type)
+        backend_type_value = self.queues.normalize_backend_type(backend_type)
         result = {
             "backend_type": backend_type_value,
             "stale_recovered": 0,
@@ -611,12 +571,12 @@ class Orchestrator:
         lock_token = None
         ticket = None
         try:
-            lock_token = self.wait_queue.acquire_allocator_lock(backend_type_value)
+            lock_token = self.queues.acquire_allocator_lock(backend_type_value)
             if not lock_token:
                 result["queued"] += 1
                 return result
 
-            for stale_ticket in self.wait_queue.find_stale_allocating_tickets(backend_type_value):
+            for stale_ticket in self.queues.find_stale_allocating_tickets(backend_type_value):
                 recovered = self._recover_stale_ticket(stale_ticket)
                 if recovered["status"] == "requeued":
                     result["stale_recovered"] += 1
@@ -625,9 +585,9 @@ class Orchestrator:
                 elif recovered["status"] == "error":
                     result["errors"].append(recovered)
 
-            ticket = self.wait_queue.claim_next_ticket(
+            ticket = self.queues.claim_next_ticket(
                 backend_type_value,
-                worker_id=self.wait_queue.worker_identity,
+                worker_id=self.queues.worker_identity,
             )
             if not ticket:
                 return result
@@ -641,7 +601,7 @@ class Orchestrator:
 
             backend = self._select_backend_pod(backend_type_value)
             if not backend:
-                self.wait_queue.requeue_ticket(
+                self.queues.requeue_ticket(
                     ticket_id,
                     reason="No available backend pods",
                     increment_retry=False,
@@ -670,7 +630,7 @@ class Orchestrator:
             try:
                 self.pool.assign_pod(backend_pod, frontend_identity)
             except PodConflictError as exc:
-                self.wait_queue.requeue_ticket(
+                self.queues.requeue_ticket(
                     ticket_id,
                     reason=f"Backend contention: {exc}",
                     increment_retry=False,
@@ -698,7 +658,7 @@ class Orchestrator:
                     self.pool.release_pod(backend_pod)
                 except Exception:
                     pass
-                self.wait_queue.requeue_ticket(
+                self.queues.requeue_ticket(
                     ticket_id,
                     reason="Backend IP unavailable",
                     increment_retry=False,
@@ -714,7 +674,7 @@ class Orchestrator:
                 result["queued"] += 1
                 return result
 
-            ticket = self.wait_queue.mark_allocating(
+            ticket = self.queues.mark_allocating(
                 ticket_id,
                 backend_pod=backend_pod,
                 backend_ip=backend_ip,
@@ -744,7 +704,7 @@ class Orchestrator:
             result["claimed"] += 1
         finally:
             if lock_token:
-                self.wait_queue.release_allocator_lock(backend_type_value, lock_token)
+                self.queues.release_allocator_lock(backend_type_value, lock_token)
 
         if not ticket:
             return result
@@ -777,12 +737,12 @@ class Orchestrator:
                 }
 
             self._refresh_backend_types()
-            backend_type_value = self.wait_queue.validate_backend_type(
+            backend_type_value = self.queues.validate_backend_type(
                 backend_type,
                 self._discover_backend_types(),
             )
             frontend_pod_value = frontend_pod or ""
-            ticket = self.wait_queue.create_ticket(
+            ticket = self.queues.create_ticket(
                 username=username,
                 command=command,
                 frontend_pod=frontend_pod_value,
@@ -802,7 +762,7 @@ class Orchestrator:
             )
 
             self._kick_wait_queue_worker()
-            current_ticket = self.wait_queue.get_ticket(ticket["ticket_id"])
+            current_ticket = self.queues.get_ticket(ticket["ticket_id"])
             response = self._ticket_response(current_ticket or ticket)
             if response["status"] == "assigned":
                 response["message"] = "Command assigned to backend"
@@ -856,12 +816,12 @@ class Orchestrator:
     def get_queue_status(self, backend_type: Optional[str] = None) -> Dict:
         if not backend_type:
             raise ValueError("backend_type is required")
-        backend_type_value = self.wait_queue.validate_backend_type(
+        backend_type_value = self.queues.validate_backend_type(
             backend_type,
-            self.wait_queue.known_backend_types(),
+            self.queues.known_backend_types(),
         )
         now_ms = int(time.time() * 1000)
-        snapshot = self.wait_queue.list_waiting_frontends(
+        snapshot = self.queues.list_waiting_frontends(
             backend_type_value,
             now_ms=now_ms,
         )
@@ -871,7 +831,7 @@ class Orchestrator:
         }
 
     def get_ticket(self, ticket_id: str) -> Dict:
-        ticket = self.wait_queue.get_ticket_snapshot(ticket_id)
+        ticket = self.queues.get_ticket_snapshot(ticket_id)
         if not ticket:
             return {
                 "status": "error",
@@ -889,7 +849,7 @@ class Orchestrator:
 
     def cancel_ticket(self, ticket_id: str, reason: str = "") -> Dict:
         try:
-            current = self.wait_queue.get_ticket(ticket_id)
+            current = self.queues.get_ticket(ticket_id)
             if not current:
                 return {
                     "status": "error",
@@ -902,8 +862,8 @@ class Orchestrator:
                     "ticket": current,
                 }
 
-            cancelled = self.wait_queue.cancel_ticket(ticket_id, reason=reason)
-            final_ticket = cancelled or self.wait_queue.get_ticket(ticket_id) or current
+            cancelled = self.queues.cancel_ticket(ticket_id, reason=reason)
+            final_ticket = cancelled or self.queues.get_ticket(ticket_id) or current
             if final_ticket and str(final_ticket.get("status") or "").lower() == "cancelled":
                 queue_wait_ms = self._elapsed_since_ingress_ms(final_ticket, "cancelled_at")
                 self._log_queue_event(
@@ -942,11 +902,11 @@ class Orchestrator:
             }
 
     def get_assigned_request_context(self, backend_pod: str) -> Optional[Dict[str, object]]:
-        return self.wait_queue.get_assigned_request_context(backend_pod)
+        return self.queues.get_assigned_request_context(backend_pod)
 
     def _clear_assigned_request_context_best_effort(self, backend_pod: str) -> None:
         try:
-            self.wait_queue.clear_assigned_request_context(backend_pod)
+            self.queues.clear_assigned_request_context(backend_pod)
         except QueueUnavailableError as exc:
             logger.warning("Assigned request context cleanup skipped for %s: %s", backend_pod, exc)
         except Exception as exc:
@@ -964,12 +924,12 @@ class Orchestrator:
             nonlocal cleanup_context, backend_unmounted
             release_started = time.perf_counter()
             frontend = "unknown"
-            backend_type = self.wait_queue.default_backend_type
+            backend_type = self.queues.default_backend_type
             try:
                 pod = self.pool.v1.read_namespaced_pod(backend_pod, self.pool.namespace)
                 labels = pod.metadata.labels or {}
                 frontend = labels.get(self.pool.LABEL_FRONTEND, "unknown")
-                backend_type = self.wait_queue.normalize_backend_type(labels.get(self.pool.LABEL_BACKEND_TYPE))
+                backend_type = self.queues.normalize_backend_type(labels.get(self.pool.LABEL_BACKEND_TYPE))
             except ApiException as exc:
                 if exc.status != 404:
                     raise
@@ -983,7 +943,7 @@ class Orchestrator:
             assigned_context = dict(request_context_value)
             if not assigned_context:
                 try:
-                    assigned_context = self.wait_queue.get_assigned_request_context(backend_pod) or {}
+                    assigned_context = self.queues.get_assigned_request_context(backend_pod) or {}
                 except QueueUnavailableError as exc:
                     logger.debug("Assigned request context unavailable for %s: %s", backend_pod, exc)
 
@@ -994,24 +954,18 @@ class Orchestrator:
             if ticket:
                 self._set_ticket_context(ticket)
                 frontend = ticket.get("frontend_pod") or frontend
-                backend_type = self.wait_queue.normalize_backend_type(ticket.get("backend_type"))
+                backend_type = self.queues.normalize_backend_type(ticket.get("backend_type"))
             elif assigned_context:
                 frontend = assigned_context.get("frontend_pod") or frontend
-                backend_type = self.wait_queue.normalize_backend_type(
+                backend_type = self.queues.normalize_backend_type(
                     assigned_context.get("backend_type") or backend_type
                 )
 
             backend_ip = self.pool.get_pod_ip(backend_pod)
             if backend_ip and not backend_unmounted:
-                agent = BackendAgent(backend_ip)
-                try:
+                with BackendAgent(backend_ip) as agent:
                     agent.unmount()
                     backend_unmounted = True
-                finally:
-                    try:
-                        agent.close()
-                    except Exception as exc:
-                        logger.debug("Backend agent close failed after unmount for %s: %s", backend_pod, exc)
 
             released_now = self.pool.release_pod(backend_pod)
             if not released_now:
@@ -1109,7 +1063,7 @@ class Orchestrator:
         queue_failed = []
 
         try:
-            for stale_ticket in self.wait_queue.find_stale_allocating_tickets():
+            for stale_ticket in self.queues.find_stale_allocating_tickets():
                 recovered = self._recover_stale_ticket(stale_ticket)
                 if recovered["status"] == "requeued":
                     queue_recovered.append(recovered["ticket_id"])

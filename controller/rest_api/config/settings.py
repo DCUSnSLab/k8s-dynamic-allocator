@@ -18,9 +18,9 @@ CONTROLLER_DIR = BASE_DIR.parent
 if str(CONTROLLER_DIR) not in sys.path:
     sys.path.insert(0, str(CONTROLLER_DIR))
 
-SECRET_KEY = 'django-insecure-controller-pod-secret-key-change-in-production'
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-controller-pod-secret-key-change-in-production')
 
-DEBUG = True
+DEBUG = os.getenv('DJANGO_DEBUG', 'true').lower() in ('true', '1', 'yes')
 
 ALLOWED_HOSTS = ['*']
 
@@ -41,14 +41,6 @@ def set_request_label(request_label):
     _local.request_id = request_label
 
 
-def get_request_id():
-    return get_request_label()
-
-
-def set_request_id(request_label):
-    set_request_label(request_label)
-
-
 def build_request_label(username, ticket_short=None):
     user = (username or "-").strip() or "-"
     ticket_short_value = (ticket_short or "").strip()
@@ -64,8 +56,6 @@ class RequestLabelFilter(logging.Filter):
         record.request_id = request_label
         return True
 
-
-RequestIdFilter = RequestLabelFilter
 
 
 def _env_int(name, default):
@@ -113,8 +103,6 @@ class RequestLabelMiddleware:
         _local.request_id = '-'
         return self.get_response(request)
 
-
-RequestIdMiddleware = RequestLabelMiddleware
 
 
 MIDDLEWARE = [

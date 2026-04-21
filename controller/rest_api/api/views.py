@@ -1,9 +1,11 @@
+import ipaddress
 import json
 import logging
 import time
 from datetime import datetime
+from typing import Any, Dict
 
-from django.http import HttpResponse
+from django.http import HttpRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from config.settings import DEFAULT_BACKEND_TYPE, set_request_label
@@ -17,7 +19,7 @@ def _get_orchestrator():
     return orchestrator_instance
 
 
-def json_response(data, status=200):
+def json_response(data: Dict[str, Any], status: int = 200) -> HttpResponse:
     json_str = json.dumps(data, indent=2, ensure_ascii=False, default=str) + "\n"
     return HttpResponse(
         json_str,
@@ -26,45 +28,65 @@ def json_response(data, status=200):
     )
 
 
-def _extract_frontend_ip(request, data):
-    frontend_ip = (data.get("frontend_ip") or "").strip()
-    if frontend_ip:
+def _error_response(message: str, status: int = 400) -> HttpResponse:
+    return json_response({"status": "error", "message": message}, status=status)
+
+
+def _method_not_allowed(expected: str) -> HttpResponse:
+    return _error_response(f"Only {expected} method is allowed", status=405)
+
+
+def _is_valid_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _extract_frontend_ip(request: HttpRequest, data: Dict[str, Any]) -> str:
+    frontend_ip = _clean_optional_string(data.get("frontend_ip"))
+    if frontend_ip and _is_valid_ip(frontend_ip):
         return frontend_ip
 
-    forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
+    forwarded = _clean_optional_string(request.META.get("HTTP_X_FORWARDED_FOR", ""))
     if forwarded:
         first_hop = forwarded.split(",")[0].strip()
-        if first_hop:
+        if first_hop and _is_valid_ip(first_hop):
             return first_hop
 
-    return (request.META.get("REMOTE_ADDR") or "").strip()
+    remote_addr = _clean_optional_string(request.META.get("REMOTE_ADDR"))
+    if remote_addr and _is_valid_ip(remote_addr):
+        return remote_addr
+
+    return ""
 
 
-def _clean_optional_string(value):
+def _clean_optional_string(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip()
 
 
 @csrf_exempt
-def execute_command(request):
+def execute_command(request: HttpRequest) -> HttpResponse:
     if request.method != "POST":
-        return json_response({"status": "error", "message": "Only POST method is allowed"}, status=405)
+        return _method_not_allowed("POST")
 
     try:
         data = json.loads(request.body)
-        username = data.get("username", "")
-        command = data.get("command", "")
-        frontend_pod = data.get("frontend_pod", "")
+        username = _clean_optional_string(data.get("username"))
+        command = _clean_optional_string(data.get("command"))
+        frontend_pod = _clean_optional_string(data.get("frontend_pod"))
         frontend_ip = _extract_frontend_ip(request, data)
-        backend_type = data.get("backend_type", DEFAULT_BACKEND_TYPE)
+        backend_type = _clean_optional_string(data.get("backend_type")) or DEFAULT_BACKEND_TYPE
 
         if not username:
-            return json_response({"status": "error", "message": "username is required"}, status=400)
+            return _error_response("username is required")
         if not command:
-            return json_response({"status": "error", "message": "command is required"}, status=400)
+            return _error_response("command is required")
         if not frontend_ip:
-            return json_response({"status": "error", "message": "frontend_ip is required"}, status=400)
+            return _error_response("frontend_ip is required")
 
         ingress_ts_ms = int(time.time() * 1000)
         set_request_label(username)
@@ -105,15 +127,15 @@ def execute_command(request):
         return json_response(result, status=status_code)
 
     except json.JSONDecodeError as exc:
-        logger.error("JSON parse error: %s", str(exc))
-        return json_response({"status": "error", "message": "Invalid JSON format", "detail": str(exc)}, status=400)
+        logger.error("JSON parse error: %s", exc)
+        return _error_response(f"Invalid JSON format: {exc}")
     except Exception as exc:
-        logger.error("Unexpected error: %s", str(exc), exc_info=True)
-        return json_response({"status": "error", "message": "Internal server error", "detail": str(exc)}, status=500)
+        logger.error("Unexpected error: %s", exc, exc_info=True)
+        return _error_response("Internal server error", status=500)
 
 
 @csrf_exempt
-def health_check(request):
+def health_check(request: HttpRequest) -> HttpResponse:
     try:
         result = _get_orchestrator().health_check()
     except Exception as exc:
@@ -130,45 +152,42 @@ def health_check(request):
 
 
 @csrf_exempt
-def queue_status(request):
+def queue_status(request: HttpRequest) -> HttpResponse:
     if request.method != "GET":
-        return json_response({"status": "error", "message": "Only GET method is allowed"}, status=405)
+        return _method_not_allowed("GET")
 
     try:
         backend_type = (request.GET.get("backend_type") or "").strip()
         if not backend_type:
-            return json_response(
-                {"status": "error", "message": "backend_type is required"},
-                status=400,
-            )
+            return _error_response("backend_type is required")
         result = _get_orchestrator().get_queue_status(
             backend_type=backend_type,
         )
         return json_response(result)
     except ValueError as exc:
-        return json_response({"status": "error", "message": str(exc)}, status=400)
+        return _error_response(str(exc))
     except Exception as exc:
-        logger.error("Queue status error: %s", str(exc), exc_info=True)
-        return json_response({"status": "error", "message": str(exc)}, status=500)
+        logger.error("Queue status error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)
 
 
 @csrf_exempt
-def pool_status(request):
+def pool_status(request: HttpRequest) -> HttpResponse:
     if request.method != "GET":
-        return json_response({"status": "error", "message": "Only GET method is allowed"}, status=405)
+        return _method_not_allowed("GET")
 
     try:
         result = _get_orchestrator().get_pool_status()
         return json_response(result)
     except Exception as exc:
-        logger.error("Pool status error: %s", str(exc), exc_info=True)
-        return json_response({"status": "error", "message": str(exc)}, status=500)
+        logger.error("Pool status error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)
 
 
 @csrf_exempt
-def ticket_detail(request, ticket_id):
+def ticket_detail(request: HttpRequest, ticket_id: str) -> HttpResponse:
     if request.method != "GET":
-        return json_response({"status": "error", "message": "Only GET method is allowed"}, status=405)
+        return _method_not_allowed("GET")
 
     try:
         result = _get_orchestrator().get_ticket(ticket_id)
@@ -176,21 +195,21 @@ def ticket_detail(request, ticket_id):
             return json_response(result, status=404)
         return json_response(result)
     except Exception as exc:
-        logger.error("Ticket detail error: %s", str(exc), exc_info=True)
-        return json_response({"status": "error", "message": str(exc)}, status=500)
+        logger.error("Ticket detail error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)
 
 
 @csrf_exempt
-def cancel_ticket(request, ticket_id):
+def cancel_ticket(request: HttpRequest, ticket_id: str) -> HttpResponse:
     if request.method != "POST":
-        return json_response({"status": "error", "message": "Only POST method is allowed"}, status=405)
+        return _method_not_allowed("POST")
 
     try:
         reason = ""
         if request.body:
             try:
                 data = json.loads(request.body)
-                reason = data.get("reason", "")
+                reason = _clean_optional_string(data.get("reason"))
             except json.JSONDecodeError:
                 reason = ""
 
@@ -206,27 +225,27 @@ def cancel_ticket(request, ticket_id):
             return json_response(result, status=500)
         return json_response(result)
     except Exception as exc:
-        logger.error("Ticket cancel error: %s", str(exc), exc_info=True)
-        return json_response({"status": "error", "message": str(exc)}, status=500)
+        logger.error("Ticket cancel error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)
 
 
 @csrf_exempt
-def initialize_pool(request):
+def initialize_pool(request: HttpRequest) -> HttpResponse:
     if request.method != "POST":
-        return json_response({"status": "error", "message": "Only POST method is allowed"}, status=405)
+        return _method_not_allowed("POST")
 
     try:
         result = _get_orchestrator().initialize_pool()
         return json_response({"status": "success", "message": "Pool initialized", "result": result})
     except Exception as exc:
-        logger.error("Pool init error: %s", str(exc), exc_info=True)
-        return json_response({"status": "error", "message": str(exc)}, status=500)
+        logger.error("Pool init error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)
 
 
 @csrf_exempt
-def release_backend(request):
+def release_backend(request: HttpRequest) -> HttpResponse:
     if request.method != "POST":
-        return json_response({"status": "error", "message": "Only POST method is allowed"}, status=405)
+        return _method_not_allowed("POST")
 
     try:
         data = json.loads(request.body)
@@ -234,7 +253,7 @@ def release_backend(request):
         orchestrator = _get_orchestrator()
 
         if not backend_pod:
-            return json_response({"status": "error", "message": "backend_pod is required"}, status=400)
+            return _error_response("backend_pod is required")
 
         try:
             request_context = orchestrator.get_assigned_request_context(backend_pod)
@@ -273,16 +292,16 @@ def release_backend(request):
         return json_response(result, status=status_code)
 
     except json.JSONDecodeError:
-        return json_response({"status": "error", "message": "Invalid JSON format"}, status=400)
+        return _error_response("Invalid JSON format")
     except Exception as exc:
-        logger.error("Release error: %s", str(exc), exc_info=True)
-        return json_response({"status": "error", "message": str(exc)}, status=500)
+        logger.error("Release error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)
 
 
 @csrf_exempt
-def check_stale(request):
+def check_stale(request: HttpRequest) -> HttpResponse:
     if request.method != "POST":
-        return json_response({"status": "error", "message": "Only POST method is allowed"}, status=405)
+        return _method_not_allowed("POST")
 
     try:
         result = _get_orchestrator().check_stale_allocations()
@@ -301,5 +320,5 @@ def check_stale(request):
             )
         return json_response({"status": "success", **result})
     except Exception as exc:
-        logger.error("Stale check error: %s", str(exc), exc_info=True)
-        return json_response({"status": "error", "message": str(exc)}, status=500)
+        logger.error("Stale check error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)
