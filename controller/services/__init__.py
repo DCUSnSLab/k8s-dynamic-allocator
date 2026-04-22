@@ -3,11 +3,9 @@ Services package for Kubernetes Backend Pod orchestration
 """
 
 from .orchestrator import Orchestrator
+from .backend import BackendAgent, BackendPool, PodConflictError
+from .infra import KubernetesClient, LeaseLeaderElector
 from .queue import BackendQueues, QueueUnavailableError
-from .pool import BackendPool, PodConflictError
-from .backend_agent import BackendAgent
-from .kubernetes_client import KubernetesClient
-from .leader import LeaseLeaderElector
 
 __all__ = [
     "Orchestrator",

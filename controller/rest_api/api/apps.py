@@ -1,7 +1,7 @@
+import logging
 import os
 
 from django.apps import AppConfig
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -10,8 +10,8 @@ startup_completed = False
 
 
 class ApiConfig(AppConfig):
-    default_auto_field = "django.db.models.BigAutoField"
-    name = "api"
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'api'
 
     def ready(self):
         global orchestrator_instance, startup_completed
@@ -23,11 +23,23 @@ class ApiConfig(AppConfig):
             return
 
         try:
-            from services.startup import start_runtime
+            from services.orchestrator import Orchestrator
 
-            runtime = start_runtime()
-            orchestrator_instance = runtime.orchestrator_instance
-            startup_completed = runtime.startup_completed
+            logger.info("Controller starting - initializing backend pool...")
+            orchestrator = Orchestrator()
+            result = orchestrator.start()
+            orchestrator_instance = orchestrator
+            startup_completed = orchestrator.startup_completed
+
+            created = len(result.get("created", []))
+            existing = len(result.get("existing", []))
+            failed = len(result.get("failed", []))
+            logger.info(
+                "Pool init complete: %s created, %s existing, %s failed",
+                created,
+                existing,
+                failed,
+            )
 
         except Exception:
             logger.exception("Controller startup failed")

@@ -15,12 +15,12 @@ from typing import Dict, List, Optional
 from kubernetes import client
 from kubernetes.client.rest import ApiException
 
-from .kubernetes_client import KubernetesClient
+from ..infra.kubernetes_client import KubernetesClient
 
 logger = logging.getLogger(__name__)
 
 
-MANIFESTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "manifests")
+MANIFESTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "manifests")
 
 
 class PodConflictError(Exception):
