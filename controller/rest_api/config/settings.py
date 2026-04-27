@@ -2,8 +2,8 @@
 Django settings for Controller Pod REST API
 """
 
-import itertools
 import logging
+import os
 import sys
 import threading
 from pathlib import Path
@@ -18,9 +18,9 @@ CONTROLLER_DIR = BASE_DIR.parent
 if str(CONTROLLER_DIR) not in sys.path:
     sys.path.insert(0, str(CONTROLLER_DIR))
 
-SECRET_KEY = 'django-insecure-controller-pod-secret-key-change-in-production'
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-controller-pod-secret-key-change-in-production')
 
-DEBUG = True
+DEBUG = os.getenv('DJANGO_DEBUG', 'true').lower() in ('true', '1', 'yes')
 
 ALLOWED_HOSTS = ['*']
 
@@ -30,41 +30,70 @@ INSTALLED_APPS = [
 ]
 
 _local = threading.local()
-_counter = itertools.count()
 
 
-def get_request_id():
-    return getattr(_local, 'request_id', '-')
+def get_request_label():
+    return getattr(_local, 'request_label', '-')
 
 
-def set_request_id(conn_id):
-    _local.request_id = conn_id
+def set_request_label(request_label):
+    _local.request_label = request_label
+    _local.request_id = request_label
 
 
-class RequestIdFilter(logging.Filter):
+def build_request_label(username, ticket_short=None):
+    user = (username or "-").strip() or "-"
+    ticket_short_value = (ticket_short or "").strip()
+    if ticket_short_value:
+        return f"{user}-{ticket_short_value[:10]}"
+    return user
+
+
+class RequestLabelFilter(logging.Filter):
     def filter(self, record):
-        record.request_id = get_request_id()
+        request_label = get_request_label()
+        record.request_label = request_label
+        record.request_id = request_label
         return True
 
 
-def next_conn_id():
-    """Generate next conn=N id (called only from execute view)"""
-    return f"conn={next(_counter)}"
+def _env_first(names, default):
+    for name in names:
+        value = os.getenv(name)
+        if value not in (None, ""):
+            return value
+    return default
 
 
-class RequestIdMiddleware:
+def _env_int_any(names, default):
+    try:
+        return int(_env_first(names, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _env_float_any(names, default):
+    try:
+        return float(_env_first(names, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+class RequestLabelMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
 
     def __call__(self, request):
+        _local.request_label = '-'
         _local.request_id = '-'
         return self.get_response(request)
+
 
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.middleware.common.CommonMiddleware',
-    'config.settings.RequestIdMiddleware',
+    'config.settings.RequestLabelMiddleware',
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -78,9 +107,53 @@ DATABASES = {}
 CACHES = {
     'default': {
         'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': 'controller-conn-cache',
+        'LOCATION': 'controller-request-cache',
     }
 }
+
+REDIS_URL = _env_first(('REDIS_URL',), 'redis://localhost:6379/0')
+WAIT_QUEUE_PREFIX = _env_first(('WAIT_QUEUE_PREFIX',), 'kda:waitq')
+DEFAULT_BACKEND_TYPE = _env_first(('DEFAULT_BACKEND_TYPE',), 'general')
+WAIT_QUEUE_TIMEOUT_SECONDS = _env_int_any(('WAIT_QUEUE_TIMEOUT_SECONDS',), 1800)
+WAIT_QUEUE_LOCK_TTL_SECONDS = _env_int_any(
+    ('WAIT_QUEUE_LOCK_TTL_SECONDS', 'ALLOCATOR_LOCK_TIMEOUT_SECONDS'),
+    60,
+)
+WAIT_QUEUE_TICKET_TTL_SECONDS = _env_int_any(
+    ('WAIT_QUEUE_TICKET_TTL_SECONDS', 'WAIT_TICKET_TTL_SECONDS', 'TICKET_TTL_SECONDS'),
+    7200,
+)
+WAIT_QUEUE_ALLOCATING_TTL_SECONDS = _env_int_any(
+    ('WAIT_QUEUE_ALLOCATING_TTL_SECONDS', 'ALLOCATING_STALE_TIMEOUT_SECONDS'),
+    60,
+)
+ASSIGNED_CONTEXT_TTL_SECONDS = _env_int_any(
+    ('ASSIGNED_CONTEXT_TTL_SECONDS',),
+    2592000,
+)
+WAIT_QUEUE_MAX_RETRIES = _env_int_any(('WAIT_QUEUE_MAX_RETRIES',), 3)
+WAIT_QUEUE_WORKER_INTERVAL_SECONDS = _env_float_any(
+    ('WAIT_QUEUE_WORKER_INTERVAL_SECONDS', 'QUEUE_WORKER_INTERVAL_SECONDS'),
+    1.0,
+)
+WAIT_QUEUE_BACKEND_REFRESH_SECONDS = _env_float_any(
+    ('WAIT_QUEUE_BACKEND_REFRESH_SECONDS', 'BACKEND_REGISTRY_REFRESH_SECONDS'),
+    15.0,
+)
+WAIT_QUEUE_BATCH_LIMIT = _env_int_any(('WAIT_QUEUE_BATCH_LIMIT',), 10)
+WAIT_QUEUE_MOUNT_CONCURRENCY = _env_int_any(
+    ('WAIT_QUEUE_MOUNT_CONCURRENCY',),
+    WAIT_QUEUE_BATCH_LIMIT,
+)
+BACKEND_AGENT_TIMEOUT_SECONDS = _env_float_any(('BACKEND_AGENT_TIMEOUT_SECONDS',), 30.0)
+BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS = _env_float_any(
+    ('BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS',),
+    BACKEND_AGENT_TIMEOUT_SECONDS,
+)
+BACKEND_AGENT_UNMOUNT_TIMEOUT_SECONDS = _env_float_any(
+    ('BACKEND_AGENT_UNMOUNT_TIMEOUT_SECONDS',),
+    BACKEND_AGENT_TIMEOUT_SECONDS,
+)
 
 LANGUAGE_CODE = 'ko-kr'
 TIME_ZONE = 'Asia/Seoul'
@@ -103,21 +176,21 @@ LOGGING = {
     'disable_existing_loggers': False,
     'formatters': {
         'detailed': {
-            'format': '[{asctime}] [{levelname}] [{request_id}] {message}',
+            'format': '[{asctime}] [{levelname}] [{request_label}] {message}',
             'style': '{',
             'datefmt': '%Y-%m-%d %H:%M:%S',
         },
     },
     'filters': {
-        'request_id': {
-            '()': 'config.settings.RequestIdFilter',
+        'request_label': {
+            '()': 'config.settings.RequestLabelFilter',
         },
     },
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
             'formatter': 'detailed',
-            'filters': ['request_id'],
+            'filters': ['request_label'],
         },
     },
     'root': {

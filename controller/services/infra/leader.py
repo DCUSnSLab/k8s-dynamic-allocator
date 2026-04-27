@@ -1,5 +1,5 @@
 """
-Lease-based leader election for controller replicas.
+Lease-based leader election for controller replicas
 
 - Uses coordination.k8s.io/v1 Lease objects
 - Elects a single leader among controller pods

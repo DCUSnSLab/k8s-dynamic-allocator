@@ -19,12 +19,20 @@ spec:
     spec:
       containers:
       - name: backend-agent
-        image: harbor.cu.ac.kr/k8s_dynamic_allocator/backend:dynamic-pool
+        image: harbor.cu.ac.kr/k8s_dynamic_allocator/backend:queue
         imagePullPolicy: Always
         args: ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
         ports:
         - containerPort: 8080
           name: agent
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: agent
+          initialDelaySeconds: 1
+          periodSeconds: 2
+          timeoutSeconds: 1
+          failureThreshold: 3
         resources:
           requests:
             cpu: "100m"

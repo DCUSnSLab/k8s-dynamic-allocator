@@ -1,236 +1,324 @@
-from django.http import JsonResponse, HttpResponse
-from django.views.decorators.csrf import csrf_exempt
+import ipaddress
 import json
 import logging
+import time
 from datetime import datetime
+from typing import Any, Dict
 
-from django.core.cache import cache
+from django.http import HttpRequest, HttpResponse
+from django.views.decorators.csrf import csrf_exempt
 
-from config.settings import get_request_id, set_request_id, next_conn_id
+from config.settings import DEFAULT_BACKEND_TYPE, set_request_label
 
 logger = logging.getLogger(__name__)
 
 
 def _get_orchestrator():
     from api.apps import orchestrator_instance
+
     return orchestrator_instance
 
 
-def json_response(data, status=200):
-    """
-    들여쓰기된 JSON 응답 생성 (끝에 줄바꿈 포함)
-    """
-    json_str = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+def json_response(data: Dict[str, Any], status: int = 200) -> HttpResponse:
+    json_str = json.dumps(data, indent=2, ensure_ascii=False, default=str) + "\n"
     return HttpResponse(
         json_str,
-        content_type='application/json; charset=utf-8',
-        status=status
+        content_type="application/json; charset=utf-8",
+        status=status,
+    )
+
+
+def _error_response(message: str, status: int = 400) -> HttpResponse:
+    return json_response({"status": "error", "message": message}, status=status)
+
+
+def _method_not_allowed(expected: str) -> HttpResponse:
+    return _error_response(f"Only {expected} method is allowed", status=405)
+
+
+def _is_valid_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _extract_frontend_ip(request: HttpRequest, data: Dict[str, Any]) -> str:
+    frontend_ip = _clean_optional_string(data.get("frontend_ip"))
+    if frontend_ip and _is_valid_ip(frontend_ip):
+        return frontend_ip
+
+    forwarded = _clean_optional_string(request.META.get("HTTP_X_FORWARDED_FOR", ""))
+    if forwarded:
+        first_hop = forwarded.split(",")[0].strip()
+        if first_hop and _is_valid_ip(first_hop):
+            return first_hop
+
+    remote_addr = _clean_optional_string(request.META.get("REMOTE_ADDR"))
+    if remote_addr and _is_valid_ip(remote_addr):
+        return remote_addr
+
+    return ""
+
+
+def _clean_optional_string(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+@csrf_exempt
+def execute_command(request: HttpRequest) -> HttpResponse:
+    if request.method != "POST":
+        return _method_not_allowed("POST")
+
+    try:
+        data = json.loads(request.body)
+        username = _clean_optional_string(data.get("username"))
+        command = _clean_optional_string(data.get("command"))
+        frontend_pod = _clean_optional_string(data.get("frontend_pod"))
+        frontend_ip = _extract_frontend_ip(request, data)
+        backend_type = _clean_optional_string(data.get("backend_type")) or DEFAULT_BACKEND_TYPE
+
+        if not username:
+            return _error_response("username is required")
+        if not command:
+            return _error_response("command is required")
+        if not frontend_ip:
+            return _error_response("frontend_ip is required")
+
+        ingress_ts_ms = int(time.time() * 1000)
+        set_request_label(username)
+        logger.info(
+            "Execute request: frontend=%s, frontend_ip=%s, backend_type=%s, user=%s, ingress_ts_ms=%s, command=%s",
+            frontend_pod or frontend_ip,
+            frontend_ip,
+            backend_type,
+            username,
+            ingress_ts_ms,
+            command,
+        )
+
+        result = _get_orchestrator().execute_command(
+            username=username,
+            command=command,
+            frontend_ip=frontend_ip,
+            frontend_pod=frontend_pod,
+            backend_type=backend_type,
+            ingress_ts_ms=ingress_ts_ms,
+        )
+
+        ticket = result.get("ticket") or {}
+        post_ticket_label = ticket.get("request_label") or ""
+        if post_ticket_label:
+            set_request_label(post_ticket_label)
+
+        if result.get("error_type") == "invalid_backend_type":
+            return json_response(result, status=400)
+
+        status_code = {
+            "assigned": 200,
+            "queued": 202,
+            "allocating": 202,
+            "cancelled": 409,
+            "failed": 500,
+        }.get(result["status"], 500)
+        return json_response(result, status=status_code)
+
+    except json.JSONDecodeError as exc:
+        logger.error("JSON parse error: %s", exc)
+        return _error_response(f"Invalid JSON format: {exc}")
+    except Exception as exc:
+        logger.error("Unexpected error: %s", exc, exc_info=True)
+        return _error_response("Internal server error", status=500)
+
+
+@csrf_exempt
+def health_check(request: HttpRequest) -> HttpResponse:
+    try:
+        result = _get_orchestrator().health_check()
+    except Exception as exc:
+        result = "[error] " + str(exc)
+
+    return json_response(
+        {
+            "status": "healthy",
+            "service": "Controller Pod REST API",
+            "timestamp": datetime.now().isoformat(),
+            "result": result,
+        }
     )
 
 
 @csrf_exempt
-def execute_command(request):
-    """
-    Frontend Pod로부터 Backend 명령 실행 요청을 수신하여 할당을 Trigger 하는 API
-    """
-    if request.method != 'POST':
-        return json_response({
-            'status': 'error',
-            'message': 'Only POST method is allowed'
-        }, status=405)
-    
+def queue_status(request: HttpRequest) -> HttpResponse:
+    if request.method != "GET":
+        return _method_not_allowed("GET")
+
     try:
-        data = json.loads(request.body)
-        username = data.get('username', '')
-        command = data.get('command', '')
-        frontend_pod = data.get('frontend_pod', '')
-        
-        # 입력 검증
-        if not username:
-            return json_response({
-                'status': 'error',
-                'message': 'username is required'
-            }, status=400)
-        
-        if not command:
-            return json_response({
-                'status': 'error',
-                'message': 'command is required'
-            }, status=400)
-        
-        set_request_id(next_conn_id())
-        logger.info(f"Execute request: frontend={frontend_pod}, user={username}, command={command}")
-
-        # Backend Pod 할당 및 실행 요청
-        result = _get_orchestrator().execute_command(username, command, frontend_pod)
-
-        # conn mapping
-        if result['status'] == 'success':
-            backend_pod = result.get('backend_pod')
-            if backend_pod:
-                cache.set(f"conn_map_{backend_pod}", get_request_id(), timeout=86400)
-        
-        # HTTP 상태 코드 결정
-        status_code = 200 if result['status'] == 'success' else 503
-        
-        return json_response(result, status=status_code)
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error: {str(e)}")
-        return json_response({
-            'status': 'error',
-            'message': 'Invalid JSON format',
-            'detail': str(e)
-        }, status=400)
-        
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-        return json_response({
-            'status': 'error',
-            'message': 'Internal server error',
-            'detail': str(e)
-        }, status=500)
+        backend_type = (request.GET.get("backend_type") or "").strip()
+        if not backend_type:
+            return _error_response("backend_type is required")
+        result = _get_orchestrator().get_queue_status(
+            backend_type=backend_type,
+        )
+        return json_response(result)
+    except ValueError as exc:
+        return _error_response(str(exc))
+    except Exception as exc:
+        logger.error("Queue status error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)
 
 
 @csrf_exempt
-def health_check(request):
-    """
-    컨트롤러 생존 상태 검사용 헬스 체크 API
-    """
-    try:
-        result = _get_orchestrator().health_check()
-    except Exception as e:
-        result = "[error] " + str(e)
+def pool_status(request: HttpRequest) -> HttpResponse:
+    if request.method != "GET":
+        return _method_not_allowed("GET")
 
-    return json_response({
-        'status': 'healthy',
-        'service': 'Controller Pod REST API',
-        'timestamp': datetime.now().isoformat(),
-        'result': result
-    })
-
-
-@csrf_exempt
-def pool_status(request):
-    """
-    Backend Pool 상태 조회 엔드포인트
-    """
-    if request.method != 'GET':
-        return json_response({
-            'status': 'error',
-            'message': 'Only GET method is allowed'
-        }, status=405)
-    
     try:
         result = _get_orchestrator().get_pool_status()
         return json_response(result)
-    except Exception as e:
-        logger.error(f"Pool status error: {str(e)}", exc_info=True)
-        return json_response({
-            'status': 'error',
-            'message': str(e)
-        }, status=500)
+    except Exception as exc:
+        logger.error("Pool status error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)
 
 
 @csrf_exempt
-def initialize_pool(request):
-    """
-    Backend Pool 수동 초기화 엔드포인트
-    """
-    if request.method != 'POST':
-        return json_response({
-            'status': 'error',
-            'message': 'Only POST method is allowed'
-        }, status=405)
-    
+def ticket_detail(request: HttpRequest, ticket_id: str) -> HttpResponse:
+    if request.method != "GET":
+        return _method_not_allowed("GET")
+
+    try:
+        result = _get_orchestrator().get_ticket(ticket_id)
+        if result.get("status") == "error":
+            return json_response(result, status=404)
+        return json_response(result)
+    except Exception as exc:
+        logger.error("Ticket detail error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)
+
+
+@csrf_exempt
+def cancel_ticket(request: HttpRequest, ticket_id: str) -> HttpResponse:
+    if request.method != "POST":
+        return _method_not_allowed("POST")
+
+    try:
+        reason = ""
+        if request.body:
+            try:
+                data = json.loads(request.body)
+                reason = _clean_optional_string(data.get("reason"))
+            except json.JSONDecodeError:
+                reason = ""
+
+        result = _get_orchestrator().cancel_ticket(ticket_id, reason=reason)
+        if result.get("status") == "error":
+            message = (result.get("message") or "").lower()
+            if "already assigned" in message:
+                return json_response(result, status=409)
+            if "not found" in message:
+                return json_response(result, status=404)
+            if "busy" in message:
+                return json_response(result, status=503)
+            return json_response(result, status=500)
+        return json_response(result)
+    except Exception as exc:
+        logger.error("Ticket cancel error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)
+
+
+@csrf_exempt
+def initialize_pool(request: HttpRequest) -> HttpResponse:
+    if request.method != "POST":
+        return _method_not_allowed("POST")
+
     try:
         result = _get_orchestrator().initialize_pool()
-        return json_response({
-            'status': 'success',
-            'message': 'Pool initialized',
-            'result': result
-        })
-    except Exception as e:
-        logger.error(f"Pool init error: {str(e)}", exc_info=True)
-        return json_response({
-            'status': 'error',
-            'message': str(e)
-        }, status=500)
+        return json_response({"status": "success", "message": "Pool initialized", "result": result})
+    except Exception as exc:
+        logger.error("Pool init error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)
 
 
 @csrf_exempt
-def release_backend(request):
-    """
-    Backend Pod 할당 해제 엔드포인트
-    """
-    if request.method != 'POST':
-        return json_response({
-            'status': 'error',
-            'message': 'Only POST method is allowed'
-        }, status=405)
-    
+def release_backend(request: HttpRequest) -> HttpResponse:
+    if request.method != "POST":
+        return _method_not_allowed("POST")
+
     try:
         data = json.loads(request.body)
-        backend_pod = data.get('backend_pod', '')
-        
+        backend_pod = _clean_optional_string(data.get("backend_pod"))
+        orchestrator = _get_orchestrator()
+
         if not backend_pod:
-            return json_response({
-                'status': 'error',
-                'message': 'backend_pod is required'
-            }, status=400)
+            return _error_response("backend_pod is required")
 
-        # execute 때 저장한 conn 복원
-        conn_id = cache.get(f"conn_map_{backend_pod}")
-        if conn_id:
-            set_request_id(conn_id)
-            cache.delete(f"conn_map_{backend_pod}")
+        try:
+            request_context = orchestrator.get_assigned_request_context(backend_pod)
+        except Exception as exc:
+            logger.warning("Release request context unavailable for %s: %s", backend_pod, exc)
+            request_context = None
 
-        result = _get_orchestrator().release_backend(backend_pod)
-        
-        status_code = 200 if result['status'] == 'success' else 500
+        caller_hints = {}
+        for hint_key in ("ticket_id", "backend_type", "frontend_pod", "request_label", "reason", "source"):
+            hint_value = _clean_optional_string(data.get(hint_key))
+            if hint_value:
+                caller_hints[hint_key] = hint_value
+        if caller_hints:
+            if request_context is None:
+                request_context = caller_hints
+            else:
+                for key, value in caller_hints.items():
+                    if not request_context.get(key):
+                        request_context[key] = value
+
+        if request_context is not None and not request_context.get("request_label"):
+            synthesized_label = (
+                _clean_optional_string(request_context.get("frontend_pod"))
+                or _clean_optional_string(request_context.get("ticket_id"))
+                or backend_pod
+            )
+            if synthesized_label:
+                request_context["request_label"] = synthesized_label
+
+        request_label = _clean_optional_string((request_context or {}).get("request_label"))
+        if request_label:
+            set_request_label(request_label)
+
+        result = orchestrator.release_backend(backend_pod, request_context=request_context)
+        status_code = 200 if result["status"] == "success" else 500
         return json_response(result, status=status_code)
-        
-    except json.JSONDecodeError as e:
-        return json_response({
-            'status': 'error',
-            'message': 'Invalid JSON format'
-        }, status=400)
-    except Exception as e:
-        logger.error(f"Release error: {str(e)}", exc_info=True)
-        return json_response({
-            'status': 'error',
-            'message': str(e)
-        }, status=500)
+
+    except json.JSONDecodeError:
+        return _error_response("Invalid JSON format")
+    except Exception as exc:
+        logger.error("Release error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)
 
 
 @csrf_exempt
-def check_stale(request):
-    """
-    비정상 할당 감지 및 자동 해제
-
-    K8s API로 할당된 Backend의 Frontend Pod 상태를 확인하여
-    존재하지 않거나 Running이 아닌 Frontend에 할당된 Backend를 해제
-    """
-    if request.method != 'POST':
-        return json_response({
-            'status': 'error',
-            'message': 'Only POST method is allowed'
-        }, status=405)
+def check_stale(request: HttpRequest) -> HttpResponse:
+    if request.method != "POST":
+        return _method_not_allowed("POST")
 
     try:
         result = _get_orchestrator().check_stale_allocations()
-        logger.info(
-            f"Stale check: {result['checked']} checked, "
-            f"{len(result['released'])} released"
-        )
-        return json_response({
-            'status': 'success',
-            **result
-        })
-    except Exception as e:
-        logger.error(f"Stale check error: {str(e)}", exc_info=True)
-        return json_response({
-            'status': 'error',
-            'message': str(e)
-        }, status=500)
-
+        released_count = len(result.get("released", []))
+        if released_count > 0:
+            logger.info(
+                "Stale check: %s checked, %s released",
+                result.get("checked", 0),
+                released_count,
+            )
+        else:
+            logger.debug(
+                "Stale check: %s checked, %s released",
+                result.get("checked", 0),
+                released_count,
+            )
+        return json_response({"status": "success", **result})
+    except Exception as exc:
+        logger.error("Stale check error: %s", exc, exc_info=True)
+        return _error_response(str(exc), status=500)

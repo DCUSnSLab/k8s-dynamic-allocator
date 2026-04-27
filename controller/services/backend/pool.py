@@ -1,5 +1,5 @@
 """
-Backend pool manager.
+Backend pool manager
 
 - Creates backend Deployments from manifests
 - Allocates warm backend pods to frontend pods
@@ -15,12 +15,12 @@ from typing import Dict, List, Optional
 from kubernetes import client
 from kubernetes.client.rest import ApiException
 
-from .kubernetes_client import KubernetesClient
+from ..infra.kubernetes_client import KubernetesClient
 
 logger = logging.getLogger(__name__)
 
 
-MANIFESTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "manifests")
+MANIFESTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "manifests")
 
 
 class PodConflictError(Exception):
@@ -34,7 +34,8 @@ class BackendPool(KubernetesClient):
     `app` identifies backend pods managed by this controller.
     `pool-status` is part of the Deployment selector, so changing it from
     available -> assigned removes a pod from warm-pool membership while keeping
-    the backend identity labels intact.
+    the backend identity labels intact. Released assigned pods are deleted so
+    the Deployment can backfill a new Ready warm pod.
     """
 
     LABEL_APP = "app"
@@ -55,22 +56,37 @@ class BackendPool(KubernetesClient):
         self.apps_v1 = client.AppsV1Api()
         self.owner_ref = self._get_owner_deployment()
 
-    def _warm_pool_selector(self, status: Optional[str] = None) -> str:
-        parts = [
-            f"{self.LABEL_APP}={self.APP_WARM_POOL}",
-            self.LABEL_BACKEND_TYPE,
-        ]
+    def _warm_pool_selector(
+        self,
+        status: Optional[str] = None,
+        backend_type: Optional[str] = None,
+    ) -> str:
+        parts = [f"{self.LABEL_APP}={self.APP_WARM_POOL}"]
+        if backend_type:
+            parts.append(f"{self.LABEL_BACKEND_TYPE}={backend_type}")
         if status:
             parts.append(f"{self.LABEL_STATUS}={status}")
         return ",".join(parts)
 
-    def _backend_selector(self) -> str:
-        return ",".join(
-            [
-                f"{self.LABEL_APP}={self.APP_WARM_POOL}",
-                self.LABEL_BACKEND_TYPE,
-            ]
-        )
+    def _backend_selector(self, backend_type: Optional[str] = None) -> str:
+        parts = [f"{self.LABEL_APP}={self.APP_WARM_POOL}"]
+        if backend_type:
+            parts.append(f"{self.LABEL_BACKEND_TYPE}={backend_type}")
+        return ",".join(parts)
+
+    @staticmethod
+    def _pod_is_ready(pod) -> bool:
+        if getattr(pod.metadata, "deletion_timestamp", None):
+            return False
+
+        if getattr(pod.status, "phase", None) != "Running":
+            return False
+
+        conditions = getattr(pod.status, "conditions", None) or []
+        for condition in conditions:
+            if condition.type == "Ready":
+                return condition.status == "True"
+        return False
 
     def _validate_backend_manifest(self, spec: Dict) -> str:
         selector_labels = (
@@ -129,25 +145,44 @@ class BackendPool(KubernetesClient):
 
         return template_backend_type
 
-    def initialize_pool(self) -> Dict:
+    def initialize_pool(self, *, log_existing: bool = True) -> Dict:
         """
         Create backend Deployments defined in the manifests directory.
         Safe to call multiple times because existing Deployments are skipped.
         """
         results = {"created": [], "existing": [], "failed": []}
+        existing_deployments = set()
 
         yaml_files = glob.glob(os.path.join(MANIFESTS_DIR, "*.yaml"))
         if not yaml_files:
             logger.warning("No manifest files found in %s", MANIFESTS_DIR)
             return results
 
+        try:
+            existing_deployments = {
+                deployment.metadata.name
+                for deployment in self.apps_v1.list_namespaced_deployment(namespace=self.namespace).items
+            }
+        except Exception as exc:
+            logger.debug("Failed to prefetch existing backend deployments: %s", exc)
+
         for yaml_file in yaml_files:
             try:
                 with open(yaml_file) as f:
                     spec = yaml.safe_load(f)
 
-                name = spec["metadata"]["name"]
+                if not isinstance(spec, dict) or "metadata" not in spec:
+                    raise ValueError("Invalid manifest: missing metadata")
+                name = spec["metadata"].get("name")
+                if not name:
+                    raise ValueError("Invalid manifest: missing metadata.name")
                 backend_type = self._validate_backend_manifest(spec)
+
+                if name in existing_deployments:
+                    if log_existing:
+                        logger.debug("Deployment exists: %s", name)
+                    results["existing"].append(name)
+                    continue
 
                 if self.owner_ref:
                     spec.setdefault("metadata", {})["ownerReferences"] = [self.owner_ref]
@@ -158,10 +193,12 @@ class BackendPool(KubernetesClient):
                 )
                 logger.info("Deployment created: %s (backend_type=%s)", name, backend_type)
                 results["created"].append(name)
+                existing_deployments.add(name)
 
             except ApiException as e:
                 if e.status == 409:
-                    logger.info("Deployment exists: %s", name)
+                    if log_existing:
+                        logger.debug("Deployment exists: %s", name)
                     results["existing"].append(name)
                 else:
                     logger.error(
@@ -227,18 +264,44 @@ class BackendPool(KubernetesClient):
             BackendPool._owner_ref_resolved = True
             return None
 
-    def get_available_pod(self) -> Optional[str]:
-        """Return one running warm backend pod that is currently available."""
+    def get_available_pod(self, backend_type: Optional[str] = None) -> Optional[str]:
+        """Return one Ready warm backend pod that is currently available."""
+        names = self.get_available_pods(backend_type=backend_type, limit=1)
+        return names[0] if names else None
+
+    def get_available_pods(
+        self,
+        backend_type: Optional[str] = None,
+        exclude: Optional[set] = None,
+        limit: Optional[int] = None,
+    ) -> List[str]:
+        """Return Ready warm backend pod names that are currently available.
+
+        `exclude` filters out pods already reserved in the current pass —
+        the apiserver watch cache can briefly report a freshly-patched pod
+        as still available, so callers tracking in-flight reservations pass
+        them here to avoid double-selection.
+        """
         pods = self.v1.list_namespaced_pod(
             namespace=self.namespace,
-            label_selector=self._warm_pool_selector(status=self.STATUS_AVAILABLE),
+            label_selector=self._warm_pool_selector(
+                status=self.STATUS_AVAILABLE,
+                backend_type=backend_type,
+            ),
         )
 
-        running_pods = [pod for pod in pods.items if pod.status.phase == "Running"]
-        if not running_pods:
-            return None
-
-        return running_pods[0].metadata.name
+        exclude_set = exclude or set()
+        names: List[str] = []
+        for pod in pods.items:
+            if not self._pod_is_ready(pod):
+                continue
+            name = pod.metadata.name
+            if name in exclude_set:
+                continue
+            names.append(name)
+            if limit is not None and len(names) >= limit:
+                break
+        return names
 
     def assign_pod(self, pod_name: str, frontend_pod: str) -> None:
         """
@@ -283,32 +346,33 @@ class BackendPool(KubernetesClient):
                 raise PodConflictError(f"{pod_name} already taken")
             raise
 
-    def release_pod(self, pod_name: str) -> None:
+    def release_pod(self, pod_name: str) -> bool:
         """
-        Return a backend pod to warm-pool membership by restoring
-        pool-status=available.
-
-        This keeps the current release semantics intact. Later, when scale
-        logic is added, this release path can be changed to delete completed
-        running pods instead of restoring them.
+        Delete an assigned backend pod so the Deployment can backfill a new
+        warm pod. This path is idempotent so duplicate release notifications
+        or concurrent cleanup attempts do not fail the controller.
         """
-        patch = {
-            "metadata": {
-                "labels": {
-                    self.LABEL_STATUS: self.STATUS_AVAILABLE,
-                    self.LABEL_FRONTEND: "",
-                }
-            }
-        }
-        self.v1.patch_namespaced_pod(pod_name, self.namespace, patch)
+        try:
+            self.v1.delete_namespaced_pod(
+                name=pod_name,
+                namespace=self.namespace,
+                grace_period_seconds=0,
+            )
+            logger.debug("Deleted assigned backend pod: %s", pod_name)
+            return True
+        except ApiException as e:
+            if e.status in (404, 409):
+                logger.debug("Backend pod already deleted or terminating: %s", pod_name)
+                return False
+            raise
 
-    def list_pool_status(self) -> List[Dict]:
+    def list_pool_status(self, backend_type: Optional[str] = None) -> List[Dict]:
         """
         List backend pods managed by this controller.
         """
         pods = self.v1.list_namespaced_pod(
             namespace=self.namespace,
-            label_selector=self._backend_selector(),
+            label_selector=self._backend_selector(backend_type=backend_type),
         )
 
         status_list = []
@@ -322,6 +386,7 @@ class BackendPool(KubernetesClient):
                     "backend_type": labels.get(self.LABEL_BACKEND_TYPE, "unknown"),
                     "pool_status": labels.get(self.LABEL_STATUS, "unknown"),
                     "assigned_frontend": labels.get(self.LABEL_FRONTEND, ""),
+                    "ready": self._pod_is_ready(pod),
                     "ip": pod.status.pod_ip,
                 }
             )

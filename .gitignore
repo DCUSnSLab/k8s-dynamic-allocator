@@ -7,6 +7,8 @@ __pycache__/
 *.egg
 .Python
 .claude
+.codex
+.agents
 
 venv/
 env/

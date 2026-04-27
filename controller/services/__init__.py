@@ -1,17 +1,11 @@
 """
 Services package for Kubernetes Backend Pod orchestration
+
+Public surface: only 'Orchestrator'
+All other components (pool, queues, sessions, cleanup, infra) are internal and should be accessed through 'Orchestrator'
+not imported directly from this package.
 """
 
 from .orchestrator import Orchestrator
-from .backend_pool import BackendPool
-from .backend_agent import BackendAgent
-from .kubernetes_client import KubernetesClient
-from .leader_election import LeaseLeaderElector
 
-__all__ = [
-    'Orchestrator',
-    'BackendPool',
-    'BackendAgent',
-    'KubernetesClient',
-    'LeaseLeaderElector',
-]
+__all__ = ["Orchestrator"]

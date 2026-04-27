@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-queue-redis
+  namespace: swlabpods
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: controller-queue-redis
+  template:
+    metadata:
+      labels:
+        app: controller-queue-redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-alpine
+        imagePullPolicy: IfNotPresent
+        args: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+        ports:
+        - containerPort: 6379
+          name: redis
+        readinessProbe:
+          tcpSocket:
+            port: redis
+          initialDelaySeconds: 1
+          periodSeconds: 2
+          timeoutSeconds: 1
+        livenessProbe:
+          tcpSocket:
+            port: redis
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 1
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "250m"
+            memory: "256Mi"
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+      volumes:
+      - name: redis-data
+        persistentVolumeClaim:
+          claimName: controller-queue-redis-data
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: controller-queue-redis-data
+  namespace: swlabpods
+spec:
+  accessModes:
+  - ReadWriteOnce
+  # storageClassName: "normal-r3"
+  storageClassName: "openebs-hostpath"
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: controller-queue-redis
+  namespace: swlabpods
+spec:
+  selector:
+    app: controller-queue-redis
+  ports:
+  - protocol: TCP
+    port: 6379
+    targetPort: redis
+  type: ClusterIP
