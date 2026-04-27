@@ -534,6 +534,7 @@ class BackendSessions:
                 limit=effective_batch,
             )
             if not available:
+                self._mark_backend_unavailable_started(backend_type_value)
                 result["queued"] += 1
                 return result
 
@@ -593,6 +594,12 @@ class BackendSessions:
             else:
                 result["errors"].append(execution)
         return result
+
+    def _mark_backend_unavailable_started(self, backend_type_value: str) -> None:
+        try:
+            self.queues.mark_backend_unavailable_started(backend_type_value)
+        except QueueUnavailableError as exc:
+            logger.debug("Failed to mark backend-unavailable start for %s: %s", backend_type_value, exc)
 
     def _safe_execute_allocated_ticket(self, ticket: Dict, backend_type_value: str) -> Dict:
         try:

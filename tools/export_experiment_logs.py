@@ -53,6 +53,7 @@ EVENT_COLUMNS = [
     "retry_count",
     "ingress_ts_ms",
     "queue_wait_ms",
+    "backend_unavailable_ms",
     "allocation_ms",
     "total_assignment_ms",
     "session_ms",

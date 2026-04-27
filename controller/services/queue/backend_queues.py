@@ -178,6 +178,36 @@ class BackendQueues:
                 queued_types.append(backend_type_value)
         return sorted(set(queued_types))
 
+    def mark_backend_unavailable_started(self, backend_type: str) -> int:
+        backend_type_value = self.normalize_backend_type(backend_type)
+        now = _iso_now()
+        client = self._redis_client()
+        marked = 0
+        try:
+            pipe = client.pipeline(transaction=False)
+            for ticket_id in self._queue_ids(backend_type_value):
+                raw = self.tickets.get_ticket_raw(ticket_id)
+                if not raw:
+                    continue
+                if str(raw.get("status") or "").lower() != "queued":
+                    continue
+                if raw.get("backend_unavailable_started_at"):
+                    continue
+                pipe.hsetnx(
+                    self._ticket_key(ticket_id),
+                    "backend_unavailable_started_at",
+                    now,
+                )
+                pipe.expire(self._ticket_key(ticket_id), self.ticket_ttl_seconds)
+                marked += 1
+            if marked:
+                pipe.execute()
+            return marked
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to mark backend unavailable start for {backend_type_value}: {exc}"
+            ) from exc
+
     def _queue_position_snapshot(self, ticket_id: str, backend_type: str) -> Optional[int]:
         backend_type_value = self.normalize_backend_type(backend_type)
         position = 0

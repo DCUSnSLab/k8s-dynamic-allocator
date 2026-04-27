@@ -79,6 +79,7 @@ class Tickets:
             "claimed_at",
             "allocation_deadline",
             "assigned_at",
+            "backend_unavailable_started_at",
             "failed_at",
             "cancelled_at",
         ):
@@ -117,6 +118,7 @@ class Tickets:
             "created_at": _iso_now(),
             "updated_at": _iso_now(),
             "assigned_at": "",
+            "backend_unavailable_started_at": "",
             "failed_at": "",
             "cancelled_at": "",
             "error": "",

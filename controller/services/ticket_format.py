@@ -90,6 +90,7 @@ def log_queue_event(
             "available_ready_backends",
             "leader",
             "queue_wait_ms",
+            "backend_unavailable_ms",
             "allocation_ms",
             "total_assignment_ms",
             "session_ms",
@@ -158,6 +159,14 @@ def assignment_timing_fields(ticket: Optional[Dict]) -> Dict[str, int]:
     # Only calculate metrics where all required timestamps are available
     if ingress_ts_ms and claimed_at_ms:
         fields["queue_wait_ms"] = max(0, claimed_at_ms - ingress_ts_ms)
+    backend_unavailable_started_ms = datetime_to_epoch_ms(
+        ticket.get("backend_unavailable_started_at")
+    )
+    if backend_unavailable_started_ms and claimed_at_ms:
+        fields["backend_unavailable_ms"] = max(
+            0,
+            claimed_at_ms - backend_unavailable_started_ms,
+        )
     if claimed_at_ms and assigned_at_ms:
         fields["allocation_ms"] = max(0, assigned_at_ms - claimed_at_ms)
     if ingress_ts_ms and assigned_at_ms:
