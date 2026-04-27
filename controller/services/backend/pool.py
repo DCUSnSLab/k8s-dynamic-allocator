@@ -1,5 +1,5 @@
 """
-Backend pool manager.
+Backend pool manager
 
 - Creates backend Deployments from manifests
 - Allocates warm backend pods to frontend pods

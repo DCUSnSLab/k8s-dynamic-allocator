@@ -1,4 +1,4 @@
-"""Backend pod and backend-agent services."""
+"""Backend pod and backend-agent services"""
 
 from .agent_client import BackendAgent, BackendAgentError
 from .cleanup import BackendCleanup

@@ -1,4 +1,4 @@
-"""Redis-backed queue and ticket services."""
+"""Redis-backed queue and ticket services"""
 
 from .backend_queues import BackendQueues
 from .tickets import QueueUnavailableError, parse_datetime, safe_int

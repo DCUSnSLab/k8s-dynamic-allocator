@@ -1,4 +1,4 @@
-"""Low-level infrastructure clients and primitives."""
+"""Low-level infrastructure clients and primitives"""
 
 from .kubernetes_client import KubernetesClient
 from .leader import LeaseLeaderElector

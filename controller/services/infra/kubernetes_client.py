@@ -1,7 +1,7 @@
 """
 Kubernetes Client Base
 
-- K8s API 연결 및 공통 Pod 단일 상태 조회 인터페이스 제공
+K8s API 연결 및 공통 Pod 단일 상태 조회 인터페이스 제공
 """
 
 import logging
