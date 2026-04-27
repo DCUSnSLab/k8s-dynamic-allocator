@@ -20,7 +20,7 @@ data:
     [INPUT]
         Name                 tail
         Tag                  kube.*
-        Path                 /var/log/containers/*.log
+        Path                 /var/log/containers/*_swlabpods_*.log
         Path_Key             filename
         Parser               cri
         DB                   /buffers/fluent-bit/tail.db
