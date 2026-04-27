@@ -26,6 +26,14 @@ MOUNT_TIMEOUT = _env_float("BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS", DEFAULT_AGENT_
 UNMOUNT_TIMEOUT = _env_float("BACKEND_AGENT_UNMOUNT_TIMEOUT_SECONDS", DEFAULT_AGENT_TIMEOUT)
 
 
+class BackendAgentError(Exception):
+    """
+    Backend agent HTTP 통신 실패를 나타내는 도메인 예외.
+    HTTP 구현 세부사항(httpx)은 이 모듈에 갇혀 있고,
+    상위 레이어에는 'BackendAgentError'라는 도메인 예외만 노출
+    """
+
+
 class BackendAgent:
     """Backend Pod Agent HTTP 클라이언트 (/mount, /unmount)"""
 
@@ -62,11 +70,17 @@ class BackendAgent:
         if frontend_pod:
             payload["frontend_pod"] = frontend_pod
 
-        response = self.client.post(f"{self.base_url}/mount", json=payload, timeout=timeout)
-        response.raise_for_status()
-        return response.json()
+        try:
+            response = self.client.post(f"{self.base_url}/mount", json=payload, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPError as exc:
+            raise BackendAgentError(f"mount failed: {exc}") from exc
 
     def unmount(self, timeout: float = UNMOUNT_TIMEOUT) -> Dict:
-        response = self.client.post(f"{self.base_url}/unmount", timeout=timeout)
-        response.raise_for_status()
-        return response.json()
+        try:
+            response = self.client.post(f"{self.base_url}/unmount", timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPError as exc:
+            raise BackendAgentError(f"unmount failed: {exc}") from exc

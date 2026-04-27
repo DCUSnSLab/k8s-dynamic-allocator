@@ -4,7 +4,6 @@ import logging
 import os
 import threading
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional
 
@@ -343,15 +342,6 @@ class BackendQueues:
             return bool(result)
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to release lock for {backend_type_value}: {exc}") from exc
-
-    @contextmanager
-    def allocator_lock(self, backend_type: str, owner: Optional[str] = None):
-        token = self.acquire_allocator_lock(backend_type, owner=owner)
-        try:
-            yield token
-        finally:
-            if token:
-                self.release_allocator_lock(backend_type, token)
 
     def is_allocation_stale(self, ticket: Dict[str, object]) -> bool:
         allocation_deadline = ticket.get("allocation_deadline")

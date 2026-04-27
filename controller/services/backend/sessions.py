@@ -4,7 +4,6 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
-import httpx
 from kubernetes.client.rest import ApiException
 
 from config import settings
@@ -12,7 +11,7 @@ from config.settings import get_request_label, set_request_label
 
 from .. import ticket_format
 from ..queue import QueueUnavailableError, safe_int
-from .agent_client import BackendAgent
+from .agent_client import BackendAgent, BackendAgentError
 from .pool import PodConflictError
 
 logger = logging.getLogger(__name__)
@@ -335,7 +334,7 @@ class BackendSessions:
                 self.queues.register_backend_types(sorted(backend_types))
 
     def recover_stale_ticket(self, ticket: Dict) -> Dict:
-        """Public — shared with BackendCleanup."""
+        """Public - shared with BackendCleanup."""
         ticket_id = ticket.get("ticket_id", "")
         backend_type = self.queues.normalize_backend_type(ticket.get("backend_type"))
         backend_pod = ticket.get("backend_pod", "")
@@ -601,13 +600,16 @@ class BackendSessions:
         try:
             with BackendAgent(backend_ip) as agent:
                 agent.mount(frontend_ip, command, frontend_pod)
+        except BackendAgentError as exc:
+            logger.warning("Mount failed for ticket %s on %s: %s", ticket_id, backend_pod, exc)
+            return self._handle_mount_failure(
+                ticket_id=ticket_id,
+                backend_pod=backend_pod,
+                claim_token=claim_token,
+                exc=exc,
+            )
         except Exception as exc:
-            is_http_error = isinstance(exc, httpx.HTTPError)
-            if is_http_error:
-                logger.warning("Mount failed for ticket %s on %s: %s", ticket_id, backend_pod, exc)
-            else:
-                logger.exception("Unexpected mount failure for ticket %s on %s", ticket_id, backend_pod)
-
+            logger.exception("Unexpected mount failure for ticket %s on %s", ticket_id, backend_pod)
             return self._handle_mount_failure(
                 ticket_id=ticket_id,
                 backend_pod=backend_pod,
