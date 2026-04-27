@@ -181,13 +181,13 @@ LOGGING = {
         'detailed': {
             'format': '[{asctime}] [{levelname}] [{request_label}] {message}',
             'style': '{',
-            'datefmt': '%Y-%m-%d %H:%M:%S',
+            'datefmt': '%Y-%m-%d %H:%M:%S %z',
         },
         'json': {
             '()': 'pythonjsonlogger.jsonlogger.JsonFormatter',
             'format': '%(asctime)s %(levelname)s %(name)s %(request_label)s %(message)s',
             'rename_fields': {'asctime': 'ts', 'levelname': 'level', 'name': 'logger'},
-            'datefmt': '%Y-%m-%dT%H:%M:%S',
+            'datefmt': '%Y-%m-%dT%H:%M:%S%z',
         },
     },
     'filters': {

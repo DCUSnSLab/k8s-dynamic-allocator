@@ -54,7 +54,9 @@ data:
     [FILTER]
         Name                 grep
         Match                kube.*
-        Regex                $kubernetes['labels']['app'] ^(controller|backend-pool|swlabssh)$
+        Logical_Op           or
+        Regex                $kubernetes['labels']['app'] ^(controller|backend-pool)$
+        Regex                $kubernetes['labels']['kubessh'] ^swlabssh$
 
     [OUTPUT]
         Name                 file
@@ -71,3 +73,4 @@ data:
         Regex        ^(?<time>[^ ]+) (?<stream>stdout|stderr) (?<logtag>[^ ]*) (?<log>.*)$
         Time_Key     time
         Time_Format  %Y-%m-%dT%H:%M:%S.%L%z
+        Time_Keep    On

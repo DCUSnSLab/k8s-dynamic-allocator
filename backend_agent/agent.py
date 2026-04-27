@@ -25,14 +25,14 @@ if _LOG_FORMAT == "json":
     _handler.setFormatter(jsonlogger.JsonFormatter(
         '%(asctime)s %(levelname)s %(name)s %(message)s',
         rename_fields={'asctime': 'ts', 'levelname': 'level', 'name': 'logger'},
-        datefmt='%Y-%m-%dT%H:%M:%S',
+        datefmt='%Y-%m-%dT%H:%M:%S%z',
     ))
     logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 else:
     logging.basicConfig(
         level=logging.INFO,
         format='[%(asctime)s] [%(levelname)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
+        datefmt='%Y-%m-%d %H:%M:%S %z',
     )
 logger = logging.getLogger(__name__)
 
