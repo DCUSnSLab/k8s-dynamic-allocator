@@ -159,6 +159,25 @@ class BackendQueues:
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to read backend types: {exc}") from exc
 
+    def has_queued_tickets(self, backend_type: str) -> bool:
+        backend_type_value = self.normalize_backend_type(backend_type)
+        self._repair_queue_membership(backend_type_value)
+        for ticket_id in self._queue_ids(backend_type_value):
+            ticket = self.tickets.get_ticket_raw(ticket_id)
+            if not ticket:
+                continue
+            if str(ticket.get("status") or "").lower() == "queued":
+                return True
+        return False
+
+    def backend_types_with_queued_tickets(self) -> List[str]:
+        queued_types = []
+        for backend_type in self.known_backend_types():
+            backend_type_value = self.normalize_backend_type(backend_type)
+            if self.has_queued_tickets(backend_type_value):
+                queued_types.append(backend_type_value)
+        return sorted(set(queued_types))
+
     def _queue_position_snapshot(self, ticket_id: str, backend_type: str) -> Optional[int]:
         backend_type_value = self.normalize_backend_type(backend_type)
         position = 0

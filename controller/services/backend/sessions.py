@@ -30,6 +30,8 @@ class BackendSessions:
         self._last_backend_refresh = 0.0
         self._queue_kick_lock = threading.Lock()
         self._queue_kick_in_flight = False
+        self._queue_kick_pending_backend_types = set()
+        self._queue_kick_full_scan_pending = False
 
     def execute_command(
         self,
@@ -47,10 +49,7 @@ class BackendSessions:
                     "message": "frontend_ip is required",
                 }
 
-            backend_type_value = self.queues.validate_backend_type(
-                backend_type,
-                self._discover_backend_types(),
-            )
+            backend_type_value = self._validate_backend_type_for_enqueue(backend_type)
             frontend_pod_value = frontend_pod or ""
             ticket = self.tickets.create_ticket(
                 username=username,
@@ -71,7 +70,7 @@ class BackendSessions:
                 ingress_ts_ms=ticket.get("ingress_ts_ms"),
             )
 
-            self._kick_wait_queue_worker()
+            self._kick_wait_queue_worker(backend_type_value)
             current_ticket = self.tickets.get_ticket(ticket["ticket_id"])
             response = ticket_format.ticket_response(current_ticket or ticket)
             if response["status"] == "assigned":
@@ -148,6 +147,9 @@ class BackendSessions:
                     logger.warning("Failed to release backend pod %s after cancel: %s", backend_pod, exc)
                 self._clear_assigned_request_context_best_effort(backend_pod)
 
+            if str(final_ticket.get("status") or "").lower() == "cancelled":
+                self._kick_wait_queue_worker(final_ticket.get("backend_type"))
+
             if final_ticket.get("status") == "assigned":
                 return {
                     "status": "error",
@@ -169,9 +171,10 @@ class BackendSessions:
         last_error: Optional[Exception] = None
         cleanup_context = False
         backend_unmounted = False
+        released_backend_type: Optional[str] = None
 
         def _release_once() -> Dict:
-            nonlocal cleanup_context, backend_unmounted
+            nonlocal cleanup_context, backend_unmounted, released_backend_type
             release_started = time.perf_counter()
             frontend = "unknown"
             backend_type = self.queues.default_backend_type
@@ -210,6 +213,7 @@ class BackendSessions:
                 backend_type = self.queues.normalize_backend_type(
                     assigned_context.get("backend_type") or backend_type
                 )
+            released_backend_type = backend_type
 
             backend_ip = self.pool.get_pod_ip(backend_pod)
             if backend_ip and not backend_unmounted:
@@ -256,7 +260,7 @@ class BackendSessions:
                 try:
                     response = _release_once()
                     if response.get("status") == "success":
-                        self._kick_wait_queue_worker()
+                        self._kick_wait_queue_worker(released_backend_type)
                     return response
                 except Exception as exc:
                     last_error = exc
@@ -283,9 +287,14 @@ class BackendSessions:
             "message": str(last_error) if last_error else "Unknown release failure",
         }
 
-    def process_wait_queues(self) -> Dict:
+    def process_wait_queues(self, backend_type: Optional[str] = None) -> Dict:
         try:
-            backend_types = set(self._discover_backend_types())
+            if backend_type:
+                backend_types = {self.queues.normalize_backend_type(backend_type)}
+            else:
+                backend_types = set(self.queues.backend_types_with_queued_tickets())
+                backend_types.update(self._backend_types_with_stale_allocations())
+
             processed = []
             for backend_type in sorted(backend_types):
                 try:
@@ -385,24 +394,68 @@ class BackendSessions:
                 "error": str(exc),
             }
 
-    def _kick_wait_queue_worker(self) -> None:
+    def _backend_types_with_stale_allocations(self) -> List[str]:
+        backend_types = []
+        for backend_type in self.queues.known_backend_types():
+            backend_type_value = self.queues.normalize_backend_type(backend_type)
+            if self.queues.find_stale_allocating_tickets(backend_type_value):
+                backend_types.append(backend_type_value)
+        return sorted(set(backend_types))
+
+    def _kick_wait_queue_worker(self, backend_type: Optional[str] = None) -> None:
+        backend_type_value = self.queues.normalize_backend_type(backend_type) if backend_type else None
         with self._queue_kick_lock:
             if self._queue_kick_in_flight:
+                if backend_type_value:
+                    self._queue_kick_pending_backend_types.add(backend_type_value)
+                else:
+                    self._queue_kick_full_scan_pending = True
                 return
             self._queue_kick_in_flight = True
 
         def _runner():
+            next_backend_type = backend_type_value
+            lock_retry_count = 0
             try:
-                self.process_wait_queues()
+                while True:
+                    result = self.process_wait_queues(backend_type=next_backend_type)
+                    if (
+                        next_backend_type
+                        and self._process_result_had_lock_miss(result)
+                        and self.queues.has_queued_tickets(next_backend_type)
+                        and lock_retry_count < 3
+                    ):
+                        lock_retry_count += 1
+                        time.sleep(0.1)
+                        continue
+                    lock_retry_count = 0
+                    with self._queue_kick_lock:
+                        if self._queue_kick_full_scan_pending:
+                            self._queue_kick_full_scan_pending = False
+                            self._queue_kick_pending_backend_types.clear()
+                            next_backend_type = None
+                            continue
+                        if self._queue_kick_pending_backend_types:
+                            next_backend_type = self._queue_kick_pending_backend_types.pop()
+                            continue
+                        self._queue_kick_in_flight = False
+                        return
             finally:
                 with self._queue_kick_lock:
-                    self._queue_kick_in_flight = False
+                    if self._queue_kick_in_flight:
+                        self._queue_kick_in_flight = False
 
         threading.Thread(
             target=_runner,
             name="queue-kick",
             daemon=True,
         ).start()
+
+    def _process_result_had_lock_miss(self, result: Dict) -> bool:
+        for item in result.get("processed") or []:
+            if item.get("lock_missed"):
+                return True
+        return False
 
     def _compute_wait_queue_batch_plan(self) -> Tuple[int, int]:
         """Return (effective_batch, mount_concurrency) clamped against TTL.
@@ -461,6 +514,7 @@ class BackendSessions:
             lock_token = self.queues.acquire_allocator_lock(backend_type_value)
             if not lock_token:
                 result["queued"] += 1
+                result["lock_missed"] = True
                 return result
 
             for stale_ticket in self.queues.find_stale_allocating_tickets(backend_type_value):
@@ -472,17 +526,20 @@ class BackendSessions:
                 elif recovered["status"] == "error":
                     result["errors"].append(recovered)
 
+            if not self.queues.has_queued_tickets(backend_type_value):
+                return result
+
+            available = self.pool.get_available_pods(
+                backend_type=backend_type_value,
+                limit=effective_batch,
+            )
+            if not available:
+                result["queued"] += 1
+                return result
+
             reserved_pods: set = set()
-
-            for _ in range(effective_batch):
-                available = self.pool.get_available_pods(
-                    backend_type=backend_type_value,
-                    exclude=reserved_pods,
-                    limit=1,
-                )
-                if not available:
-                    break
-
+            max_claims = min(effective_batch, len(available))
+            for _ in range(max_claims):
                 ticket = self.queues.claim_next_ticket(
                     backend_type_value,
                     worker_id=self.queues.worker_identity,
@@ -500,6 +557,8 @@ class BackendSessions:
                 if reservation:
                     reserved_tickets.append(reservation)
                     result["claimed"] += 1
+                    continue
+                break
         finally:
             if lock_token:
                 self.queues.release_allocator_lock(backend_type_value, lock_token)
@@ -792,6 +851,13 @@ class BackendSessions:
     def _discover_backend_types(self) -> List[str]:
         self.refresh_backend_types()
         return sorted(self.queues.known_backend_types())
+
+    def _validate_backend_type_for_enqueue(self, backend_type: Optional[str]) -> str:
+        try:
+            return self.queues.validate_backend_type(backend_type, self.queues.known_backend_types())
+        except ValueError:
+            self.refresh_backend_types(force=True)
+            return self.queues.validate_backend_type(backend_type, self.queues.known_backend_types())
 
     def _ticket_for_backend_pod(self, backend_pod: str, backend_type: Optional[str] = None) -> Optional[Dict]:
         try:
