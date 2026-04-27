@@ -50,7 +50,7 @@ spec:
         - name: config
           mountPath: /fluent-bit/etc/
         - name: flb-storage
-          mountPath: /var/log/flb-storage
+          mountPath: /buffers/fluent-bit
         - name: logs-pvc
           mountPath: /mnt/logs
       volumes:

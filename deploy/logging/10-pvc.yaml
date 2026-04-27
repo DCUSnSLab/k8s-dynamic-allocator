@@ -9,5 +9,5 @@ spec:
   resources:
     requests:
       storage: 100Gi
-  storageClassName: normal-r3        # main server
-  # storageClassName: openebs-rwx    # test server
+  # storageClassName: normal-r3        # main server
+  storageClassName: openebs-rwx    # test server
