@@ -163,7 +163,7 @@ class BackendQueues:
         backend_type_value = self.normalize_backend_type(backend_type)
         position = 0
         for current_ticket_id in self._queue_ids(backend_type_value):
-            current = self.get_ticket_raw(current_ticket_id)
+            current = self.tickets.get_ticket_raw(current_ticket_id)
             if not current:
                 continue
             if str(current.get("status") or "").lower() != "queued":
@@ -174,7 +174,7 @@ class BackendQueues:
         return None
 
     def get_ticket_position(self, ticket_id: str) -> Optional[int]:
-        ticket = self.get_ticket_raw(ticket_id)
+        ticket = self.tickets.get_ticket_raw(ticket_id)
         if not ticket:
             return None
         backend_type = self.normalize_backend_type(ticket.get("backend_type"))
@@ -183,7 +183,7 @@ class BackendQueues:
         queue_ids = self._queue_ids(backend_type)
         position = 0
         for current_ticket_id in queue_ids:
-            current = self.get_ticket_raw(current_ticket_id)
+            current = self.tickets.get_ticket_raw(current_ticket_id)
             if not current:
                 self._remove_ticket_from_queue(backend_type, current_ticket_id)
                 client.srem(self._active_key(backend_type), current_ticket_id)
@@ -280,7 +280,7 @@ class BackendQueues:
         queue_position = 0
 
         for ticket_id in self._queue_ids(backend_type_value):
-            raw = self.get_ticket_raw(ticket_id)
+            raw = self.tickets.get_ticket_raw(ticket_id)
             if not raw:
                 continue
             if str(raw.get("status") or "").lower() != "queued":

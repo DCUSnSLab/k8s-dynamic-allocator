@@ -253,7 +253,7 @@ class Tickets:
         status = str(raw.get("status") or "").lower()
         queue_position = None
         if status == "queued":
-            queue_position = self._queue_position_snapshot(ticket_id, backend_type)
+            queue_position = self.queue._queue_position_snapshot(ticket_id, backend_type)
         return self._raw_to_ticket_dict(
             ticket_id,
             raw,
@@ -418,7 +418,7 @@ class Tickets:
             return ticket
         if status in self.FINAL_STATES:
             return ticket
-        if self.is_wait_timeout_expired(ticket):
+        if self.queue.is_wait_timeout_expired(ticket):
             return self.mark_failed(ticket_id, reason or "Queue wait timeout exceeded")
 
         backend_type = self.queue.normalize_backend_type(ticket.get("backend_type"))
