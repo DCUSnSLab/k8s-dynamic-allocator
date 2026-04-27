@@ -266,6 +266,22 @@ class BackendPool(KubernetesClient):
 
     def get_available_pod(self, backend_type: Optional[str] = None) -> Optional[str]:
         """Return one Ready warm backend pod that is currently available."""
+        names = self.get_available_pods(backend_type=backend_type, limit=1)
+        return names[0] if names else None
+
+    def get_available_pods(
+        self,
+        backend_type: Optional[str] = None,
+        exclude: Optional[set] = None,
+        limit: Optional[int] = None,
+    ) -> List[str]:
+        """Return Ready warm backend pod names that are currently available.
+
+        `exclude` filters out pods already reserved in the current pass —
+        the apiserver watch cache can briefly report a freshly-patched pod
+        as still available, so callers tracking in-flight reservations pass
+        them here to avoid double-selection.
+        """
         pods = self.v1.list_namespaced_pod(
             namespace=self.namespace,
             label_selector=self._warm_pool_selector(
@@ -274,11 +290,18 @@ class BackendPool(KubernetesClient):
             ),
         )
 
-        ready_pods = [pod for pod in pods.items if self._pod_is_ready(pod)]
-        if not ready_pods:
-            return None
-
-        return ready_pods[0].metadata.name
+        exclude_set = exclude or set()
+        names: List[str] = []
+        for pod in pods.items:
+            if not self._pod_is_ready(pod):
+                continue
+            name = pod.metadata.name
+            if name in exclude_set:
+                continue
+            names.append(name)
+            if limit is not None and len(names) >= limit:
+                break
+        return names
 
     def assign_pod(self, pod_name: str, frontend_pod: str) -> None:
         """

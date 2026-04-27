@@ -1,8 +1,9 @@
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from kubernetes.client.rest import ApiException
 
@@ -253,7 +254,10 @@ class BackendSessions:
         try:
             for attempt in range(1, self._RELEASE_MAX_ATTEMPTS + 1):
                 try:
-                    return _release_once()
+                    response = _release_once()
+                    if response.get("status") == "success":
+                        self._kick_wait_queue_worker()
+                    return response
                 except Exception as exc:
                     last_error = exc
                     if attempt < self._RELEASE_MAX_ATTEMPTS:
@@ -400,6 +404,44 @@ class BackendSessions:
             daemon=True,
         ).start()
 
+    def _compute_wait_queue_batch_plan(self) -> Tuple[int, int]:
+        """Return (effective_batch, mount_concurrency) clamped against TTL.
+
+        Reservations are committed under the allocator lock with status
+        `allocating`, then mounted outside the lock. If the wall-clock for
+        a mount wave exceeds WAIT_QUEUE_ALLOCATING_TTL_SECONDS, late
+        reservations can be flagged stale before their mount even starts.
+
+        We bound the batch so worst-case wall-clock fits inside the TTL,
+        with a small margin for stale-scan jitter / scheduling.
+        """
+        configured_batch = max(1, int(getattr(settings, "WAIT_QUEUE_BATCH_LIMIT", 10)))
+        configured_concurrency = max(
+            1,
+            int(getattr(settings, "WAIT_QUEUE_MOUNT_CONCURRENCY", configured_batch)),
+        )
+
+        mount_timeout = max(1.0, float(settings.BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS))
+        ttl = max(1.0, float(settings.WAIT_QUEUE_ALLOCATING_TTL_SECONDS))
+        worker_interval = max(0.0, float(settings.WAIT_QUEUE_WORKER_INTERVAL_SECONDS))
+
+        if ttl <= mount_timeout:
+            logger.warning(
+                "WAIT_QUEUE_ALLOCATING_TTL_SECONDS (%s) <= "
+                "BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS (%s); "
+                "even a single mount can be flagged stale before completion",
+                ttl,
+                mount_timeout,
+            )
+
+        usable_ttl = max(1.0, ttl - max(2.0, worker_interval))
+        waves = max(1, int(usable_ttl // mount_timeout))
+
+        safe_ceiling = max(1, waves * configured_concurrency)
+        effective_batch = min(configured_batch, safe_ceiling)
+        effective_concurrency = min(configured_concurrency, effective_batch)
+        return effective_batch, effective_concurrency
+
     def _drain_wait_queue_for_type(self, backend_type: str) -> Dict:
         backend_type_value = self.queues.normalize_backend_type(backend_type)
         result = {
@@ -412,8 +454,9 @@ class BackendSessions:
             "errors": [],
         }
 
+        reserved_tickets: List[Dict] = []
+        effective_batch, mount_concurrency = self._compute_wait_queue_batch_plan()
         lock_token = None
-        ticket = None
         try:
             lock_token = self.queues.acquire_allocator_lock(backend_type_value)
             if not lock_token:
@@ -429,120 +472,178 @@ class BackendSessions:
                 elif recovered["status"] == "error":
                     result["errors"].append(recovered)
 
-            ticket = self.queues.claim_next_ticket(
-                backend_type_value,
-                worker_id=self.queues.worker_identity,
-            )
-            if not ticket:
-                return result
-            ticket_id = ticket["ticket_id"]
+            reserved_pods: set = set()
 
-            backend = self._select_backend_pod(backend_type_value)
-            if not backend:
-                self.tickets.requeue_ticket(
-                    ticket_id,
-                    reason="No available backend pods",
-                    increment_retry=False,
-                    claim_token=ticket.get("claim_token"),
+            for _ in range(effective_batch):
+                available = self.pool.get_available_pods(
+                    backend_type=backend_type_value,
+                    exclude=reserved_pods,
+                    limit=1,
                 )
-                result["queued"] += 1
-                return result
+                if not available:
+                    break
 
-            backend_pod = backend.get("name", "")
-            frontend_identity = ticket.get("frontend_pod") or "unknown"
+                ticket = self.queues.claim_next_ticket(
+                    backend_type_value,
+                    worker_id=self.queues.worker_identity,
+                )
+                if not ticket:
+                    break
 
-            try:
-                self.pool.assign_pod(backend_pod, frontend_identity)
-            except PodConflictError as exc:
-                self.tickets.requeue_ticket(
-                    ticket_id,
-                    reason=f"Backend contention: {exc}",
-                    increment_retry=False,
-                    claim_token=ticket.get("claim_token"),
+                reservation = self._reserve_backend_for_ticket(
+                    ticket=ticket,
+                    backend_type_value=backend_type_value,
+                    candidate_pods=available,
+                    reserved_pods=reserved_pods,
+                    result=result,
                 )
-                ticket_format.log_queue_event(
-                    "debug",
-                    "ticket_requeued",
-                    ticket,
-                    backend_pod=backend_pod,
-                    reason=f"Backend contention: {exc}",
-                )
-                result["errors"].append(
-                    {
-                        "ticket_id": ticket_id,
-                        "backend_type": backend_type_value,
-                        "error": str(exc),
-                    }
-                )
-                return result
-
-            backend_ip = self.pool.get_pod_ip(backend_pod) or ""
-            if not backend_ip:
-                try:
-                    self.pool.release_pod(backend_pod)
-                except Exception:
-                    pass
-                self.tickets.requeue_ticket(
-                    ticket_id,
-                    reason="Backend IP unavailable",
-                    increment_retry=False,
-                    claim_token=ticket.get("claim_token"),
-                )
-                ticket_format.log_queue_event(
-                    "debug",
-                    "ticket_requeued",
-                    ticket,
-                    backend_pod=backend_pod,
-                    reason="Backend IP unavailable",
-                )
-                result["queued"] += 1
-                return result
-
-            ticket = self.tickets.mark_allocating(
-                ticket_id,
-                backend_pod=backend_pod,
-                backend_ip=backend_ip,
-                claimed_by=ticket.get("claimed_by"),
-                claim_token=ticket.get("claim_token"),
-            )
-            if not ticket or ticket.get("status") != "allocating":
-                try:
-                    self.pool.release_pod(backend_pod)
-                except Exception:
-                    pass
-                ticket_format.log_queue_event(
-                    "debug",
-                    "ticket_requeued",
-                    ticket,
-                    backend_pod=backend_pod,
-                    reason="Ticket lost ownership before backend commit",
-                )
-                result["errors"].append(
-                    {
-                        "ticket_id": ticket_id,
-                        "backend_type": backend_type_value,
-                        "error": "Ticket lost ownership before backend commit",
-                    }
-                )
-                return result
-            result["claimed"] += 1
+                if reservation:
+                    reserved_tickets.append(reservation)
+                    result["claimed"] += 1
         finally:
             if lock_token:
                 self.queues.release_allocator_lock(backend_type_value, lock_token)
 
-        if not ticket:
+        if not reserved_tickets:
             return result
 
-        execution = self._execute_allocated_ticket(ticket)
-        if execution["status"] == "assigned":
-            result["assigned"] += 1
-        elif execution["status"] == "queued":
-            result["queued"] += 1
-        elif execution["status"] == "failed":
-            result["failed"] += 1
+        executions: List[Dict] = []
+        if mount_concurrency <= 1 or len(reserved_tickets) == 1:
+            for ticket in reserved_tickets:
+                executions.append(self._safe_execute_allocated_ticket(ticket, backend_type_value))
         else:
-            result["errors"].append(execution)
+            with ThreadPoolExecutor(
+                max_workers=mount_concurrency,
+                thread_name_prefix="waitq-mount",
+            ) as executor:
+                futures = [
+                    executor.submit(self._safe_execute_allocated_ticket, ticket, backend_type_value)
+                    for ticket in reserved_tickets
+                ]
+                for future in as_completed(futures):
+                    executions.append(future.result())
+
+        for execution in executions:
+            status = execution.get("status")
+            if status == "assigned":
+                result["assigned"] += 1
+            elif status == "queued":
+                result["queued"] += 1
+            elif status == "failed":
+                result["failed"] += 1
+            else:
+                result["errors"].append(execution)
         return result
+
+    def _safe_execute_allocated_ticket(self, ticket: Dict, backend_type_value: str) -> Dict:
+        try:
+            return self._execute_allocated_ticket(ticket)
+        except Exception as exc:
+            logger.exception(
+                "Unexpected execution failure for ticket %s",
+                ticket.get("ticket_id"),
+            )
+            return {
+                "ticket_id": ticket.get("ticket_id", ""),
+                "backend_type": backend_type_value,
+                "status": "error",
+                "message": str(exc),
+            }
+
+    def _reserve_backend_for_ticket(
+        self,
+        ticket: Dict,
+        backend_type_value: str,
+        candidate_pods: List[str],
+        reserved_pods: set,
+        result: Dict,
+    ) -> Optional[Dict]:
+        ticket_id = ticket["ticket_id"]
+        claim_token = ticket.get("claim_token")
+        frontend_identity = ticket.get("frontend_pod") or "unknown"
+
+        backend_pod = ""
+        for candidate in candidate_pods:
+            if candidate in reserved_pods:
+                continue
+            try:
+                self.pool.assign_pod(candidate, frontend_identity)
+            except PodConflictError as exc:
+                ticket_format.log_queue_event(
+                    "debug",
+                    "backend_contention_skip",
+                    ticket,
+                    backend_pod=candidate,
+                    reason=f"Backend contention: {exc}",
+                )
+                continue
+            backend_pod = candidate
+            reserved_pods.add(backend_pod)
+            break
+
+        if not backend_pod:
+            self.tickets.requeue_ticket(
+                ticket_id,
+                reason="No available backend pods",
+                increment_retry=False,
+                claim_token=claim_token,
+            )
+            result["queued"] += 1
+            return None
+
+        backend_ip = self.pool.get_pod_ip(backend_pod) or ""
+        if not backend_ip:
+            try:
+                self.pool.release_pod(backend_pod)
+            except Exception:
+                pass
+            reserved_pods.discard(backend_pod)
+            self.tickets.requeue_ticket(
+                ticket_id,
+                reason="Backend IP unavailable",
+                increment_retry=False,
+                claim_token=claim_token,
+            )
+            ticket_format.log_queue_event(
+                "debug",
+                "ticket_requeued",
+                ticket,
+                backend_pod=backend_pod,
+                reason="Backend IP unavailable",
+            )
+            result["queued"] += 1
+            return None
+
+        committed = self.tickets.mark_allocating(
+            ticket_id,
+            backend_pod=backend_pod,
+            backend_ip=backend_ip,
+            claimed_by=ticket.get("claimed_by"),
+            claim_token=claim_token,
+        )
+        if not committed or committed.get("status") != "allocating":
+            try:
+                self.pool.release_pod(backend_pod)
+            except Exception:
+                pass
+            reserved_pods.discard(backend_pod)
+            ticket_format.log_queue_event(
+                "debug",
+                "ticket_requeued",
+                committed or ticket,
+                backend_pod=backend_pod,
+                reason="Ticket lost ownership before backend commit",
+            )
+            result["errors"].append(
+                {
+                    "ticket_id": ticket_id,
+                    "backend_type": backend_type_value,
+                    "error": "Ticket lost ownership before backend commit",
+                }
+            )
+            return None
+
+        return committed
 
     def _execute_allocated_ticket(self, ticket: Dict) -> Dict:
         ticket_id = ticket.get("ticket_id", "")

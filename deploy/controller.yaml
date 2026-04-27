@@ -43,6 +43,10 @@ spec:
           value: "1.0"
         - name: WAIT_QUEUE_BACKEND_REFRESH_SECONDS
           value: "15"
+        - name: WAIT_QUEUE_BATCH_LIMIT
+          value: "10"
+        - name: WAIT_QUEUE_MOUNT_CONCURRENCY
+          value: "10"
         - name: BACKEND_AGENT_TIMEOUT_SECONDS
           value: "30"
         - name: BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS
