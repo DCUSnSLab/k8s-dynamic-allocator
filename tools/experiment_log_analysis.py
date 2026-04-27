@@ -89,6 +89,14 @@ GRAFANA_COLUMNS = [
 
 KEY_VALUE_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\"[^\"]*\"|'[^']*'|[^\s]+)")
 EVENT_RE = re.compile(r"^\[(?P<component>[^\]]+)\]\s+(?P<event>[^\s]+)")
+DETAILED_WITH_LABEL_RE = re.compile(
+    r"^\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+"
+    r"\[(?P<level>[A-Z]+)\]\s+\[(?P<request_label>[^\]]*)\]\s+(?P<message>.*)$"
+)
+DETAILED_SIMPLE_RE = re.compile(
+    r"^\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+"
+    r"\[(?P<level>[A-Z]+)\]\s+(?P<message>.*)$"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,6 +199,23 @@ def parse_json_maybe(value: object) -> object:
     return value
 
 
+def parse_detailed_log_line(value: object) -> Optional[Dict[str, object]]:
+    if not isinstance(value, str):
+        return None
+    for pattern in (DETAILED_WITH_LABEL_RE, DETAILED_SIMPLE_RE):
+        match = pattern.match(value)
+        if not match:
+            continue
+        parsed = match.groupdict()
+        return {
+            "ts": parsed.get("ts", ""),
+            "level": parsed.get("level", ""),
+            "request_label": parsed.get("request_label", ""),
+            "message": parsed.get("message", ""),
+        }
+    return None
+
+
 def extract_app_log(record: Dict[str, object]) -> Dict[str, object]:
     app_log = parse_json_maybe(record.get("app_log"))
     if isinstance(app_log, dict):
@@ -199,6 +224,9 @@ def extract_app_log(record: Dict[str, object]) -> Dict[str, object]:
     log_value = parse_json_maybe(record.get("log"))
     if isinstance(log_value, dict):
         return dict(log_value)
+    detailed_log = parse_detailed_log_line(log_value)
+    if detailed_log:
+        return detailed_log
 
     app_log = {}
     for key in ("ts", "time", "asctime", "level", "levelname", "logger", "name", "request_label", "message"):
