@@ -171,6 +171,9 @@ REST_FRAMEWORK = {
     ],
 }
 
+_LOG_FORMAT = os.getenv('LOG_FORMAT', 'detailed').lower()
+_CONSOLE_FORMATTER = 'json' if _LOG_FORMAT == 'json' else 'detailed'
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -179,6 +182,12 @@ LOGGING = {
             'format': '[{asctime}] [{levelname}] [{request_label}] {message}',
             'style': '{',
             'datefmt': '%Y-%m-%d %H:%M:%S',
+        },
+        'json': {
+            '()': 'pythonjsonlogger.jsonlogger.JsonFormatter',
+            'format': '%(asctime)s %(levelname)s %(name)s %(request_label)s %(message)s',
+            'rename_fields': {'asctime': 'ts', 'levelname': 'level', 'name': 'logger'},
+            'datefmt': '%Y-%m-%dT%H:%M:%S',
         },
     },
     'filters': {
@@ -189,7 +198,7 @@ LOGGING = {
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
-            'formatter': 'detailed',
+            'formatter': _CONSOLE_FORMATTER,
             'filters': ['request_label'],
         },
     },

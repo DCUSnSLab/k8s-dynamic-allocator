@@ -23,6 +23,8 @@ spec:
         env:
         - name: DJANGO_SETTINGS_MODULE
           value: "config.settings"
+        - name: LOG_FORMAT
+          value: "json"
         - name: REDIS_URL
           value: "redis://controller-queue-redis:6379/0"
         - name: WAIT_QUEUE_PREFIX

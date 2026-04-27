@@ -18,11 +18,22 @@ from tcp_terminal import tcp_terminal
 HTTP_PORT = int(os.getenv("BACKEND_AGENT_HTTP_PORT", "8080"))
 TCP_TERMINAL_PORT = int(os.getenv("BACKEND_AGENT_TCP_PORT", "8081"))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+_LOG_FORMAT = os.getenv("LOG_FORMAT", "detailed").lower()
+if _LOG_FORMAT == "json":
+    from pythonjsonlogger import jsonlogger
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(jsonlogger.JsonFormatter(
+        '%(asctime)s %(levelname)s %(name)s %(message)s',
+        rename_fields={'asctime': 'ts', 'levelname': 'level', 'name': 'logger'},
+        datefmt='%Y-%m-%dT%H:%M:%S',
+    ))
+    logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
 logger = logging.getLogger(__name__)
 
 app = FastAPI(

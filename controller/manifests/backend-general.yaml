@@ -22,6 +22,9 @@ spec:
         image: harbor.cu.ac.kr/k8s_dynamic_allocator/backend:queue
         imagePullPolicy: Always
         args: ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
+        env:
+        - name: LOG_FORMAT
+          value: "json"
         ports:
         - containerPort: 8080
           name: agent
