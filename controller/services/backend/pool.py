@@ -145,7 +145,7 @@ class BackendPool(KubernetesClient):
 
         return template_backend_type
 
-    def initialize_pool(self) -> Dict:
+    def initialize_pool(self, *, log_existing: bool = True) -> Dict:
         """
         Create backend Deployments defined in the manifests directory.
         Safe to call multiple times because existing Deployments are skipped.
@@ -179,7 +179,8 @@ class BackendPool(KubernetesClient):
                 backend_type = self._validate_backend_manifest(spec)
 
                 if name in existing_deployments:
-                    logger.debug("Deployment exists: %s", name)
+                    if log_existing:
+                        logger.debug("Deployment exists: %s", name)
                     results["existing"].append(name)
                     continue
 
@@ -196,7 +197,8 @@ class BackendPool(KubernetesClient):
 
             except ApiException as e:
                 if e.status == 409:
-                    logger.debug("Deployment exists: %s", name)
+                    if log_existing:
+                        logger.debug("Deployment exists: %s", name)
                     results["existing"].append(name)
                 else:
                     logger.error(

@@ -2,7 +2,7 @@ import logging
 import threading
 from typing import Dict, Optional
 
-from config.settings import WAIT_QUEUE_WORKER_INTERVAL_SECONDS
+from config.settings import WAIT_QUEUE_WORKER_INTERVAL_SECONDS, set_request_label
 
 from .backend import BackendCleanup, BackendPool, BackendSessions
 from .infra import LeaseLeaderElector
@@ -58,10 +58,13 @@ class Orchestrator:
 
     def _queue_worker_loop(self) -> None:
         while not self.queue_worker_stop_event.wait(WAIT_QUEUE_WORKER_INTERVAL_SECONDS):
+            set_request_label("-")
             try:
                 self.process_wait_queues()
             except Exception:
                 logger.exception("Queue worker iteration failed")
+            finally:
+                set_request_label("-")
         logger.info("Queue worker stopped")
 
     def _start_queue_worker(self) -> None:

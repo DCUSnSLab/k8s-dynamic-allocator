@@ -322,7 +322,7 @@ class BackendSessions:
             self._last_backend_refresh = now
             backend_types = set()
             try:
-                self.pool.initialize_pool()
+                self.pool.initialize_pool(log_existing=False)
             except Exception as exc:
                 logger.debug("Backend manifest refresh skipped: %s", exc)
             backend_types.update(self.queues.known_backend_types())
@@ -436,12 +436,6 @@ class BackendSessions:
             if not ticket:
                 return result
             ticket_id = ticket["ticket_id"]
-            ticket_format.log_queue_event(
-                "debug",
-                "ticket_claimed",
-                ticket,
-                queue_position=ticket.get("queue_position"),
-            )
 
             backend = self._select_backend_pod(backend_type_value)
             if not backend:
@@ -451,25 +445,11 @@ class BackendSessions:
                     increment_retry=False,
                     claim_token=ticket.get("claim_token"),
                 )
-                ticket_format.log_queue_event(
-                    "debug",
-                    "WaitingNoBackend",
-                    ticket,
-                    queue_position=ticket.get("queue_position"),
-                    reason="No available backend pods",
-                )
                 result["queued"] += 1
                 return result
 
             backend_pod = backend.get("name", "")
             frontend_identity = ticket.get("frontend_pod") or "unknown"
-            ticket_format.log_queue_event(
-                "debug",
-                "allocation_started",
-                ticket,
-                backend_pod=backend_pod,
-                backend_ip=backend.get("ip") or "",
-            )
 
             try:
                 self.pool.assign_pod(backend_pod, frontend_identity)
