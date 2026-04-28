@@ -365,6 +365,21 @@ class BackendSessions:
                 "message": str(exc),
             }
 
+    def notify_backend_available(self, backend_type: Optional[str]) -> None:
+        backend_type_value = self.queues.normalize_backend_type(backend_type)
+        try:
+            if not self.queues.has_queued_tickets(backend_type_value):
+                return
+        except QueueUnavailableError as exc:
+            logger.debug(
+                "[BackendWatchSkipped] backend_type=%s reason=%r",
+                backend_type_value,
+                str(exc),
+            )
+            return
+
+        self._kick_wait_queue_worker(backend_type_value)
+
     def get_assigned_request_context(self, backend_pod: str) -> Optional[Dict[str, object]]:
         return self.tickets.get_assigned_request_context(backend_pod)
 

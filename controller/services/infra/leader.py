@@ -66,6 +66,7 @@ class LeaseLeaderElector(KubernetesClient):
         if self._thread and self._thread.is_alive():
             return
 
+        self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run,
             name="lease-leader-elector",
@@ -83,6 +84,10 @@ class LeaseLeaderElector(KubernetesClient):
         """Stop the election loop."""
         self._stop_event.set()
         self._set_leader(False)
+        if self._thread and self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout=max(2, self.retry_interval_seconds + 1))
+        if self._thread and not self._thread.is_alive():
+            self._thread = None
 
     def is_leader(self) -> bool:
         with self._lock:

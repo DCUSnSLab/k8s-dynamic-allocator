@@ -49,6 +49,12 @@ spec:
           value: "10"
         - name: WAIT_QUEUE_MOUNT_CONCURRENCY
           value: "10"
+        - name: BACKEND_AVAILABILITY_WATCH_ENABLED
+          value: "true"
+        - name: BACKEND_AVAILABILITY_WATCH_TIMEOUT_SECONDS
+          value: "60"
+        - name: BACKEND_AVAILABILITY_WATCH_RETRY_SECONDS
+          value: "1.0"
         - name: BACKEND_AGENT_TIMEOUT_SECONDS
           value: "30"
         - name: BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS

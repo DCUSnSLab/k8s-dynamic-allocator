@@ -79,6 +79,13 @@ def _env_float_any(names, default):
         return float(default)
 
 
+def _env_bool_any(names, default):
+    value = _env_first(names, default)
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in ("true", "1", "yes", "on")
+
+
 class RequestLabelMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
@@ -144,6 +151,18 @@ WAIT_QUEUE_BATCH_LIMIT = _env_int_any(('WAIT_QUEUE_BATCH_LIMIT',), 10)
 WAIT_QUEUE_MOUNT_CONCURRENCY = _env_int_any(
     ('WAIT_QUEUE_MOUNT_CONCURRENCY',),
     WAIT_QUEUE_BATCH_LIMIT,
+)
+BACKEND_AVAILABILITY_WATCH_ENABLED = _env_bool_any(
+    ('BACKEND_AVAILABILITY_WATCH_ENABLED',),
+    True,
+)
+BACKEND_AVAILABILITY_WATCH_TIMEOUT_SECONDS = _env_int_any(
+    ('BACKEND_AVAILABILITY_WATCH_TIMEOUT_SECONDS', 'BACKEND_AVAILABILITY_WATCH_RESYNC_SECONDS'),
+    60,
+)
+BACKEND_AVAILABILITY_WATCH_RETRY_SECONDS = _env_float_any(
+    ('BACKEND_AVAILABILITY_WATCH_RETRY_SECONDS',),
+    1.0,
 )
 BACKEND_AGENT_TIMEOUT_SECONDS = _env_float_any(('BACKEND_AGENT_TIMEOUT_SECONDS',), 30.0)
 BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS = _env_float_any(

@@ -2,9 +2,10 @@ import logging
 import threading
 from typing import Dict, Optional
 
-from config.settings import WAIT_QUEUE_WORKER_INTERVAL_SECONDS, set_request_label
+from config import settings
+from config.settings import set_request_label
 
-from .backend import BackendCleanup, BackendPool, BackendSessions
+from .backend import BackendAvailabilityWatcher, BackendCleanup, BackendPool, BackendSessions
 from .infra import LeaseLeaderElector
 from .queue import BackendQueues
 from .status import ControllerStatus
@@ -20,6 +21,20 @@ class Orchestrator:
         self.sessions = BackendSessions(self.pool, self.queues, self.tickets)
         self.status = ControllerStatus(self.pool, self.queues, self.tickets)
         self.cleanup = BackendCleanup(self.pool, self.queues, self.sessions)
+        self.backend_watcher = BackendAvailabilityWatcher(
+            v1=self.pool.v1,
+            namespace=self.pool.namespace,
+            label_selector=f"{self.pool.LABEL_APP}={self.pool.APP_WARM_POOL}",
+            on_backend_available=self.sessions.notify_backend_available,
+            enabled=settings.BACKEND_AVAILABILITY_WATCH_ENABLED,
+            timeout_seconds=settings.BACKEND_AVAILABILITY_WATCH_TIMEOUT_SECONDS,
+            retry_seconds=settings.BACKEND_AVAILABILITY_WATCH_RETRY_SECONDS,
+            app_label=self.pool.LABEL_APP,
+            app_value=self.pool.APP_WARM_POOL,
+            status_label=self.pool.LABEL_STATUS,
+            available_status=self.pool.STATUS_AVAILABLE,
+            backend_type_label=self.pool.LABEL_BACKEND_TYPE,
+        )
         self.leader_elector = None
         self.queue_worker_thread: Optional[threading.Thread] = None
         self.queue_worker_stop_event = threading.Event()
@@ -42,7 +57,10 @@ class Orchestrator:
         self._initial_pool_result = result
         self._start_queue_worker()
 
-        self.leader_elector = LeaseLeaderElector()
+        self.leader_elector = LeaseLeaderElector(
+            on_started_leading=self._start_backend_watcher,
+            on_stopped_leading=self._stop_backend_watcher,
+        )
         self.leader_elector.start()
         logger.info("Leader election initialized")
 
@@ -50,14 +68,15 @@ class Orchestrator:
         return result
 
     def stop(self) -> None:
+        if self.leader_elector:
+            self.leader_elector.stop()
+        self._stop_backend_watcher()
         self.queue_worker_stop_event.set()
         if self.queue_worker_thread and self.queue_worker_thread.is_alive():
             self.queue_worker_thread.join(timeout=5)
-        if self.leader_elector:
-            self.leader_elector.stop()
 
     def _queue_worker_loop(self) -> None:
-        while not self.queue_worker_stop_event.wait(WAIT_QUEUE_WORKER_INTERVAL_SECONDS):
+        while not self.queue_worker_stop_event.wait(settings.WAIT_QUEUE_WORKER_INTERVAL_SECONDS):
             set_request_label("-")
             try:
                 self.process_wait_queues()
@@ -78,6 +97,12 @@ class Orchestrator:
         )
         self.queue_worker_thread.start()
         logger.info("Queue worker started")
+
+    def _start_backend_watcher(self) -> None:
+        self.backend_watcher.start()
+
+    def _stop_backend_watcher(self) -> None:
+        self.backend_watcher.stop()
 
     def execute_command(
         self,
