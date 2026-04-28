@@ -79,6 +79,7 @@ class Tickets:
             "claimed_at",
             "allocation_deadline",
             "assigned_at",
+            "backend_available_at",
             "backend_ready_at",
             "backend_unavailable_started_at",
             "failed_at",
@@ -119,6 +120,7 @@ class Tickets:
             "created_at": _iso_now(),
             "updated_at": _iso_now(),
             "assigned_at": "",
+            "backend_available_at": "",
             "backend_ready_at": "",
             "backend_unavailable_started_at": "",
             "failed_at": "",
@@ -387,6 +389,7 @@ class Tickets:
         claimed_by: Optional[str] = None,
         claim_token: Optional[str] = None,
         backend_ready_at: Optional[object] = None,
+        backend_available_at: Optional[object] = None,
     ) -> Optional[Dict[str, object]]:
         ticket = self.get_ticket(ticket_id)
         if not ticket:
@@ -406,6 +409,7 @@ class Tickets:
                 "claim_token": claim_token or ticket.get("claim_token") or uuid.uuid4().hex,
                 "claimed_at": ticket.get("claimed_at") or _iso_now(),
                 "allocation_deadline": (_utc_now() + timedelta(seconds=self.queue.allocating_ttl_seconds)).isoformat(),
+                "backend_available_at": backend_available_at or ticket.get("backend_available_at") or "",
                 "backend_ready_at": backend_ready_at or ticket.get("backend_ready_at") or "",
                 "error": "",
             },
@@ -448,6 +452,8 @@ class Tickets:
                 "backend_pod": "",
                 "backend_ip": "",
                 "assigned_at": "",
+                "backend_available_at": "",
+                "backend_ready_at": "",
                 "failed_at": "",
                 "cancelled_at": "",
                 "error": reason or "",

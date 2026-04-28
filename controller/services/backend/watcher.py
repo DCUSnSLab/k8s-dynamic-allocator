@@ -2,6 +2,7 @@
 
 import logging
 import threading
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from kubernetes import watch
@@ -19,7 +20,7 @@ class BackendAvailabilityWatcher:
         v1,
         namespace: str,
         label_selector: str,
-        on_backend_available: Callable[[str], None],
+        on_backend_available: Callable[[str, str, str, str], None],
         enabled: bool = True,
         timeout_seconds: int = 60,
         retry_seconds: float = 1.0,
@@ -166,13 +167,10 @@ class BackendAvailabilityWatcher:
             namespace=self.namespace,
             label_selector=self.label_selector,
         )
-        backend_types = set()
         for pod in pods.items:
-            backend_type = self._available_backend_type(pod)
+            backend_type, backend_pod = self._available_backend_info(pod)
             if backend_type:
-                backend_types.add(backend_type)
-        for backend_type in sorted(backend_types):
-            self._notify_backend_type(backend_type)
+                self._notify_backend_available(backend_type, backend_pod, source="snapshot")
         return getattr(getattr(pods, "metadata", None), "resource_version", "") or ""
 
     def _handle_event(self, event: dict) -> None:
@@ -184,44 +182,46 @@ class BackendAvailabilityWatcher:
         self._notify_if_available(pod)
 
     def _notify_if_available(self, pod) -> None:
-        backend_type = self._available_backend_type(pod)
+        backend_type, backend_pod = self._available_backend_info(pod)
         if not backend_type:
             return
-        self._notify_backend_type(backend_type)
+        self._notify_backend_available(backend_type, backend_pod, source="watch")
 
-    def _notify_backend_type(self, backend_type: str) -> None:
+    def _notify_backend_available(self, backend_type: str, backend_pod: str, source: str) -> None:
+        observed_at = datetime.now(timezone.utc).isoformat()
         try:
-            self.on_backend_available(backend_type)
+            self.on_backend_available(backend_type, backend_pod, observed_at, source)
         except Exception as exc:
             logger.warning(
-                "[Warning] operation=backend_watch_callback backend_type=%s reason=%r",
+                "[Warning] operation=backend_watch_callback backend_type=%s backend_pod=%s reason=%r",
                 backend_type,
+                backend_pod,
                 str(exc),
             )
 
-    def _available_backend_type(self, pod) -> str:
+    def _available_backend_info(self, pod) -> tuple[str, str]:
         metadata = getattr(pod, "metadata", None)
         status = getattr(pod, "status", None)
         if not metadata or not status:
-            return ""
+            return "", ""
         if getattr(metadata, "deletion_timestamp", None):
-            return ""
+            return "", ""
 
         labels = getattr(metadata, "labels", None) or {}
         if labels.get(self.app_label) != self.app_value:
-            return ""
+            return "", ""
         if labels.get(self.status_label) != self.available_status:
-            return ""
+            return "", ""
         backend_type = labels.get(self.backend_type_label) or ""
         if not backend_type:
-            return ""
+            return "", ""
         if getattr(status, "phase", None) != "Running":
-            return ""
+            return "", ""
         if not getattr(status, "pod_ip", None):
-            return ""
+            return "", ""
         if not self._pod_is_ready(pod):
-            return ""
-        return backend_type
+            return "", ""
+        return backend_type, getattr(metadata, "name", "") or ""
 
     @staticmethod
     def _pod_is_ready(pod) -> bool:

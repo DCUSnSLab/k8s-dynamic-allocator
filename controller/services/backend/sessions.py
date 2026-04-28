@@ -2,7 +2,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from kubernetes.client.rest import ApiException
@@ -32,6 +32,8 @@ class BackendSessions:
         self._queue_kick_in_flight = False
         self._queue_kick_pending_backend_types = set()
         self._queue_kick_full_scan_pending = False
+        self._backend_available_lock = threading.Lock()
+        self._backend_available_at_by_pod: Dict[str, str] = {}
 
     def execute_command(
         self,
@@ -365,7 +367,13 @@ class BackendSessions:
                 "message": str(exc),
             }
 
-    def notify_backend_available(self, backend_type: Optional[str]) -> None:
+    def notify_backend_available(
+        self,
+        backend_type: Optional[str],
+        backend_pod: str = "",
+        backend_available_at: str = "",
+        source: str = "watch",
+    ) -> None:
         backend_type_value = self.queues.normalize_backend_type(backend_type)
         try:
             if not self.queues.has_queued_tickets(backend_type_value):
@@ -378,7 +386,48 @@ class BackendSessions:
             )
             return
 
+        self._remember_backend_available(
+            backend_type_value=backend_type_value,
+            backend_pod=backend_pod,
+            backend_available_at=backend_available_at,
+            source=source,
+        )
         self._kick_wait_queue_worker(backend_type_value)
+
+    def _remember_backend_available(
+        self,
+        *,
+        backend_type_value: str,
+        backend_pod: str,
+        backend_available_at: str,
+        source: str,
+    ) -> None:
+        backend_pod_value = (backend_pod or "").strip()
+        if not backend_pod_value:
+            return
+
+        observed_at = backend_available_at or datetime.now(timezone.utc).isoformat()
+        should_log = False
+        with self._backend_available_lock:
+            if backend_pod_value not in self._backend_available_at_by_pod:
+                self._backend_available_at_by_pod[backend_pod_value] = observed_at
+                should_log = True
+
+        if should_log:
+            logger.debug(
+                "[BackendAvailable] backend_type=%s backend_pod=%s backend_available_ts_ms=%s source=%s",
+                backend_type_value,
+                backend_pod_value,
+                ticket_format.datetime_to_epoch_ms(observed_at),
+                source or "watch",
+            )
+
+    def _pop_backend_available_at(self, backend_pod: str) -> str:
+        backend_pod_value = (backend_pod or "").strip()
+        if not backend_pod_value:
+            return ""
+        with self._backend_available_lock:
+            return self._backend_available_at_by_pod.pop(backend_pod_value, "")
 
     def get_assigned_request_context(self, backend_pod: str) -> Optional[Dict[str, object]]:
         return self.tickets.get_assigned_request_context(backend_pod)
@@ -743,6 +792,9 @@ class BackendSessions:
             result["queued"] += 1
             return None
 
+        backend_available_at = self._pop_backend_available_at(backend_pod)
+        if not backend_available_at:
+            backend_available_at = datetime.now(timezone.utc).isoformat()
         backend_ready_at = self.pool.get_pod_ready_at(backend_pod)
         backend_ip = self.pool.get_pod_ip(backend_pod) or ""
         if not backend_ip:
@@ -775,6 +827,7 @@ class BackendSessions:
             claimed_by=ticket.get("claimed_by"),
             claim_token=claim_token,
             backend_ready_at=backend_ready_at,
+            backend_available_at=backend_available_at,
         )
         if not committed or committed.get("status") != "allocating":
             try:

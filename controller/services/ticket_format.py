@@ -116,14 +116,17 @@ def log_queue_event(
             "retry_count",
             "ticket_short",
             "ingress_ts_ms",
+            "backend_available_ts_ms",
             "reason",
             "available_ready_backends",
             "leader",
             "attempt",
             "max_attempts",
             "queue_wait_ms",
-            "backend_ready_to_claim_ms",
+            "backend_wait_ms",
+            "controller_claim_delay_ms",
             "allocation_ms",
+            "total_assignment_ms",
             "session_ms",
             "release_ms",
         ]
@@ -174,8 +177,10 @@ def assignment_timing_fields(ticket: Optional[Dict]) -> Dict[str, int]:
 
     Returns dict with timing fields (only includes fields where all required timestamps are available):
     - queue_wait_ms: Time from ingress to claim
-    - backend_ready_to_claim_ms: Time from selected backend Ready to claim
+    - backend_wait_ms: Time from ingress to controller-observed backend availability
+    - controller_claim_delay_ms: Time from controller-observed backend availability to claim
     - allocation_ms: Time from claim to assignment
+    - total_assignment_ms: Time from ingress to assignment
 
     Missing timestamps result in omitted fields, not zero values, for clearer logs.
     """
@@ -190,15 +195,21 @@ def assignment_timing_fields(ticket: Optional[Dict]) -> Dict[str, int]:
     # Only calculate metrics where all required timestamps are available
     if ingress_ts_ms and claimed_at_ms:
         fields["queue_wait_ms"] = max(0, claimed_at_ms - ingress_ts_ms)
-    backend_ready_at_ms = datetime_to_epoch_ms(ticket.get("backend_ready_at"))
-    if backend_ready_at_ms and claimed_at_ms:
-        ready_or_ingress_ms = max(backend_ready_at_ms, ingress_ts_ms or 0)
-        fields["backend_ready_to_claim_ms"] = max(
+    backend_available_at_ms = datetime_to_epoch_ms(ticket.get("backend_available_at"))
+    if not backend_available_at_ms:
+        backend_available_at_ms = datetime_to_epoch_ms(ticket.get("backend_ready_at"))
+    if ingress_ts_ms and backend_available_at_ms:
+        fields["backend_wait_ms"] = max(0, backend_available_at_ms - ingress_ts_ms)
+    if backend_available_at_ms and claimed_at_ms:
+        available_or_ingress_ms = max(backend_available_at_ms, ingress_ts_ms or 0)
+        fields["controller_claim_delay_ms"] = max(
             0,
-            claimed_at_ms - ready_or_ingress_ms,
+            claimed_at_ms - available_or_ingress_ms,
         )
     if claimed_at_ms and assigned_at_ms:
         fields["allocation_ms"] = max(0, assigned_at_ms - claimed_at_ms)
+    if ingress_ts_ms and assigned_at_ms:
+        fields["total_assignment_ms"] = max(0, assigned_at_ms - ingress_ts_ms)
     return fields
 
 
