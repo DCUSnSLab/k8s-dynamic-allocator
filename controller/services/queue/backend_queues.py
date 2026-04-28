@@ -47,6 +47,7 @@ class BackendQueues:
         ticket_ttl_seconds: Optional[int] = None,
         allocating_ttl_seconds: Optional[int] = None,
         assigned_context_ttl_seconds: Optional[int] = None,
+        backend_available_ttl_seconds: Optional[int] = None,
         max_retries: Optional[int] = None,
         worker_identity: Optional[str] = None,
     ):
@@ -61,6 +62,9 @@ class BackendQueues:
         self.allocating_ttl_seconds = allocating_ttl_seconds or settings.WAIT_QUEUE_ALLOCATING_TTL_SECONDS
         self.assigned_context_ttl_seconds = (
             assigned_context_ttl_seconds or settings.ASSIGNED_CONTEXT_TTL_SECONDS
+        )
+        self.backend_available_ttl_seconds = (
+            backend_available_ttl_seconds or settings.BACKEND_AVAILABLE_TTL_SECONDS
         )
         self.max_retries = max_retries or settings.WAIT_QUEUE_MAX_RETRIES
         self.worker_identity = worker_identity or os.getenv("HOSTNAME", "controller-unknown")
@@ -131,6 +135,48 @@ class BackendQueues:
 
     def _backend_ticket_key(self, backend_pod: str) -> str:
         return f"{self.prefix}:backend-ticket:{backend_pod}"
+
+    def _backend_available_key(self, backend_pod: str) -> str:
+        return f"{self.prefix}:backend-available:{backend_pod}"
+
+    def record_backend_available(self, backend_pod: str, backend_available_at: Optional[str] = None) -> bool:
+        backend_pod_value = (backend_pod or "").strip()
+        if not backend_pod_value:
+            return False
+
+        observed_at = backend_available_at or _iso_now()
+        client = self._redis_client()
+        try:
+            return bool(
+                client.set(
+                    self._backend_available_key(backend_pod_value),
+                    observed_at,
+                    nx=True,
+                    ex=max(1, int(self.backend_available_ttl_seconds)),
+                )
+            )
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to record backend availability for {backend_pod_value}: {exc}"
+            ) from exc
+
+    def pop_backend_available_at(self, backend_pod: str) -> str:
+        backend_pod_value = (backend_pod or "").strip()
+        if not backend_pod_value:
+            return ""
+
+        client = self._redis_client()
+        key = self._backend_available_key(backend_pod_value)
+        try:
+            pipe = client.pipeline(transaction=True)
+            pipe.get(key)
+            pipe.delete(key)
+            value, _ = pipe.execute()
+            return value or ""
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to pop backend availability for {backend_pod_value}: {exc}"
+            ) from exc
 
     def register_backend_types(self, backend_types: Iterable[str]) -> List[str]:
         normalized = []

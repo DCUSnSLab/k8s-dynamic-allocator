@@ -39,6 +39,8 @@ spec:
           value: "60"
         - name: WAIT_QUEUE_ALLOCATING_TTL_SECONDS
           value: "60"
+        - name: BACKEND_AVAILABLE_TTL_SECONDS
+          value: "600"
         - name: WAIT_QUEUE_MAX_RETRIES
           value: "3"
         - name: WAIT_QUEUE_WORKER_INTERVAL_SECONDS
