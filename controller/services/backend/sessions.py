@@ -68,6 +68,7 @@ class BackendSessions:
                 "info",
                 "Enqueued",
                 ticket=ticket,
+                include_ticket_fields=(),
                 queue_position=ticket.get("queue_position"),
                 ingress_ts_ms=ticket.get("ingress_ts_ms"),
             )
@@ -91,19 +92,44 @@ class BackendSessions:
                 "error_type": "invalid_backend_type",
             }
         except QueueUnavailableError as exc:
-            logger.error("Queue unavailable during execute: %s", exc)
+            ticket_format.log_queue_event(
+                "error",
+                "Failed",
+                ticket=None,
+                include_ticket_fields=(),
+                operation="execute",
+                error_type="queue_unavailable",
+                reason=str(exc),
+            )
             return {
                 "status": "error",
                 "message": str(exc),
             }
         except ApiException as exc:
-            logger.error("[FAILED] Execute: K8s API error (%s %s)", exc.status, exc.reason)
+            ticket_format.log_queue_event(
+                "error",
+                "Failed",
+                ticket=None,
+                include_ticket_fields=(),
+                operation="execute",
+                error_type="k8s_api",
+                status=exc.status,
+                reason=exc.reason,
+            )
             return {
                 "status": "error",
                 "message": f"K8s API error: {exc.reason}",
             }
         except Exception as exc:
-            logger.error("[FAILED] Execute: Unexpected error (%s)", exc)
+            ticket_format.log_queue_event(
+                "error",
+                "Failed",
+                ticket=None,
+                include_ticket_fields=(),
+                operation="execute",
+                error_type="unexpected",
+                reason=str(exc),
+            )
             return {
                 "status": "error",
                 "message": f"Unexpected error: {exc}",
@@ -132,21 +158,32 @@ class BackendSessions:
                     "info",
                     "Cancelled",
                     final_ticket,
+                    include_ticket_fields=(),
                     reason=reason or final_ticket.get("error") or "user_cancel",
                     queue_wait_ms=queue_wait_ms,
                 )
             elif final_ticket:
-                logger.debug(
-                    "Cancel no-op for ticket %s: %s",
-                    ticket_id,
-                    reason or final_ticket.get("error") or "cancel no-op",
+                ticket_format.log_queue_event(
+                    "debug",
+                    "CancelNoop",
+                    final_ticket,
+                    include_ticket_fields=(),
+                    reason=reason or final_ticket.get("error") or "cancel no-op",
                 )
             backend_pod = final_ticket.get("backend_pod") or ""
             if backend_pod and final_ticket.get("status") in {"cancelled", "failed"}:
                 try:
                     self.pool.release_pod(backend_pod)
                 except Exception as exc:
-                    logger.warning("Failed to release backend pod %s after cancel: %s", backend_pod, exc)
+                    ticket_format.log_queue_event(
+                        "warning",
+                        "Warning",
+                        final_ticket,
+                        include_ticket_fields=(),
+                        operation="cancel_release",
+                        backend_pod=backend_pod,
+                        reason=str(exc),
+                    )
                 self._clear_assigned_request_context_best_effort(backend_pod)
 
             if str(final_ticket.get("status") or "").lower() == "cancelled":
@@ -188,7 +225,7 @@ class BackendSessions:
             except ApiException as exc:
                 if exc.status != 404:
                     raise
-                logger.debug("Backend pod already released: %s", backend_pod)
+                logger.debug("[Released] backend_pod=%s status=already_released", backend_pod)
                 cleanup_context = True
                 return {
                     "status": "success",
@@ -200,7 +237,11 @@ class BackendSessions:
                 try:
                     assigned_context = self.tickets.get_assigned_request_context(backend_pod) or {}
                 except QueueUnavailableError as exc:
-                    logger.debug("Assigned request context unavailable for %s: %s", backend_pod, exc)
+                    logger.debug(
+                        "[AssignedContextUnavailable] backend_pod=%s reason=%r",
+                        backend_pod,
+                        str(exc),
+                    )
 
             if assigned_context.get("request_label"):
                 set_request_label(assigned_context.get("request_label"))
@@ -225,7 +266,7 @@ class BackendSessions:
 
             released_now = self.pool.release_pod(backend_pod)
             if not released_now:
-                logger.debug("Backend pod already released or terminating during release: %s", backend_pod)
+                logger.debug("[Released] backend_pod=%s status=already_released_or_terminating", backend_pod)
                 cleanup_context = True
                 return {
                     "status": "success",
@@ -244,10 +285,9 @@ class BackendSessions:
                 "Released",
                 ticket,
                 component="SUCCESS",
-                frontend_pod=frontend,
+                include_ticket_fields=(),
                 backend_pod=backend_pod,
                 backend_ip=backend_ip or "",
-                backend_type=backend_type,
                 session_ms=session_ms,
                 release_ms=release_ms,
             )
@@ -268,14 +308,14 @@ class BackendSessions:
                     last_error = exc
                     if attempt < self._RELEASE_MAX_ATTEMPTS:
                         logger.debug(
-                            "Release retry %s/%s for %s: %s",
+                            "[ReleaseRetry] backend_pod=%s attempt=%s max_attempts=%s reason=%r",
+                            backend_pod,
                             attempt,
                             self._RELEASE_MAX_ATTEMPTS,
-                            backend_pod,
-                            exc,
+                            str(exc),
                         )
                         continue
-                    logger.error("[FAILED] Release: %s (%s)", backend_pod, exc)
+                    logger.error("[Failed] operation=release backend_pod=%s reason=%r", backend_pod, str(exc))
                     return {
                         "status": "error",
                         "message": str(exc),
@@ -302,7 +342,11 @@ class BackendSessions:
                 try:
                     processed.append(self._drain_wait_queue_for_type(backend_type))
                 except Exception as exc:
-                    logger.exception("Failed to drain wait queue for %s", backend_type)
+                    logger.exception(
+                        "[Failed] operation=drain_wait_queue backend_type=%s reason=%r",
+                        backend_type,
+                        str(exc),
+                    )
                     processed.append(
                         {
                             "backend_type": backend_type,
@@ -339,7 +383,7 @@ class BackendSessions:
             try:
                 self.pool.initialize_pool(log_existing=False)
             except Exception as exc:
-                logger.debug("Backend manifest refresh skipped: %s", exc)
+                logger.debug("[BackendRefreshSkipped] reason=%r", str(exc))
             backend_types.update(self.queues.known_backend_types())
             for item in self.pool.list_pool_status():
                 if item.get("backend_type"):
@@ -374,7 +418,16 @@ class BackendSessions:
                 )
                 if recovered and recovered.get("status") == "queued":
                     self._release_pod_best_effort(backend_pod, ticket_id)
-                    ticket_format.log_queue_event("debug", "stale_recovered", recovered, reason="stale allocation recovered")
+                    ticket_format.log_queue_event(
+                        "debug",
+                        "Requeued",
+                        recovered,
+                        include_ticket_fields=(),
+                        source="stale_allocation",
+                        backend_pod=backend_pod,
+                        retry_count=recovered.get("retry_count"),
+                        reason="stale allocation recovered",
+                    )
                     return {"ticket_id": ticket_id, "backend_type": backend_type, "status": "requeued"}
                 return skipped
 
@@ -385,7 +438,16 @@ class BackendSessions:
             )
             if failed and failed.get("status") == "failed":
                 self._release_pod_best_effort(backend_pod, ticket_id)
-                ticket_format.log_queue_event("debug", "ticket_failed", failed, reason="stale allocation exceeded retry budget")
+                ticket_format.log_queue_event(
+                    "debug",
+                    "Failed",
+                    failed,
+                    include_ticket_fields=(),
+                    source="stale_allocation",
+                    backend_pod=backend_pod,
+                    retry_count=failed.get("retry_count"),
+                    reason="stale allocation exceeded retry budget",
+                )
                 return {"ticket_id": ticket_id, "backend_type": backend_type, "status": "failed"}
             return skipped
         except QueueUnavailableError as exc:
@@ -482,11 +544,11 @@ class BackendSessions:
 
         if ttl <= mount_timeout:
             logger.warning(
-                "WAIT_QUEUE_ALLOCATING_TTL_SECONDS (%s) <= "
-                "BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS (%s); "
-                "even a single mount can be flagged stale before completion",
+                "[Warning] operation=queue_batch_plan allocating_ttl_seconds=%s "
+                "mount_timeout_seconds=%s reason=%r",
                 ttl,
                 mount_timeout,
+                "allocating TTL is not greater than backend mount timeout",
             )
 
         usable_ttl = max(1.0, ttl - max(2.0, worker_interval))
@@ -601,15 +663,21 @@ class BackendSessions:
         try:
             self.queues.mark_backend_unavailable_started(backend_type_value)
         except QueueUnavailableError as exc:
-            logger.debug("Failed to mark backend-unavailable start for %s: %s", backend_type_value, exc)
+            logger.debug(
+                "[BackendUnavailableMarkSkipped] backend_type=%s reason=%r",
+                backend_type_value,
+                str(exc),
+            )
 
     def _safe_execute_allocated_ticket(self, ticket: Dict, backend_type_value: str) -> Dict:
         try:
             return self._execute_allocated_ticket(ticket)
         except Exception as exc:
             logger.exception(
-                "Unexpected execution failure for ticket %s",
+                "[Failed] operation=execute_allocated_ticket ticket_id=%s backend_type=%s reason=%r",
                 ticket.get("ticket_id"),
+                backend_type_value,
+                str(exc),
             )
             return {
                 "ticket_id": ticket.get("ticket_id", ""),
@@ -639,8 +707,9 @@ class BackendSessions:
             except PodConflictError as exc:
                 ticket_format.log_queue_event(
                     "debug",
-                    "backend_contention_skip",
+                    "BackendContention",
                     ticket,
+                    include_ticket_fields=(),
                     backend_pod=candidate,
                     reason=f"Backend contention: {exc}",
                 )
@@ -675,8 +744,9 @@ class BackendSessions:
             )
             ticket_format.log_queue_event(
                 "debug",
-                "ticket_requeued",
+                "Requeued",
                 ticket,
+                include_ticket_fields=(),
                 backend_pod=backend_pod,
                 reason="Backend IP unavailable",
             )
@@ -699,8 +769,9 @@ class BackendSessions:
             reserved_pods.discard(backend_pod)
             ticket_format.log_queue_event(
                 "debug",
-                "ticket_requeued",
+                "Requeued",
                 committed or ticket,
+                include_ticket_fields=(),
                 backend_pod=backend_pod,
                 reason="Ticket lost ownership before backend commit",
             )
@@ -726,7 +797,17 @@ class BackendSessions:
         claim_token = ticket.get("claim_token") or ""
 
         if not backend_pod or not frontend_ip:
-            self.tickets.mark_failed(ticket_id, "Missing backend or frontend context", claim_token=claim_token)
+            failed = self.tickets.mark_failed(ticket_id, "Missing backend or frontend context", claim_token=claim_token)
+            ticket_format.log_queue_event(
+                "info",
+                "Failed",
+                failed or ticket,
+                include_ticket_fields=(),
+                backend_pod=backend_pod,
+                backend_ip=backend_ip,
+                retry_count=(failed or ticket).get("retry_count"),
+                reason="Missing backend or frontend context",
+            )
             return {
                 "ticket_id": ticket_id,
                 "backend_type": backend_type,
@@ -740,7 +821,14 @@ class BackendSessions:
                 self.pool.release_pod(backend_pod)
             except Exception:
                 pass
-            ticket_format.log_queue_event("debug", "ticket_requeued", ticket, reason="Ticket no longer owns the allocation")
+            ticket_format.log_queue_event(
+                "debug",
+                "Requeued",
+                ticket,
+                include_ticket_fields=(),
+                backend_pod=backend_pod,
+                reason="Ticket no longer owns the allocation",
+            )
             return {
                 "ticket_id": ticket_id,
                 "backend_type": backend_type,
@@ -752,7 +840,15 @@ class BackendSessions:
             with BackendAgent(backend_ip) as agent:
                 agent.mount(frontend_ip, command, frontend_pod)
         except BackendAgentError as exc:
-            logger.warning("Mount failed for ticket %s on %s: %s", ticket_id, backend_pod, exc)
+            ticket_format.log_queue_event(
+                "warning",
+                "Warning",
+                ticket,
+                include_ticket_fields=(),
+                operation="mount",
+                backend_pod=backend_pod,
+                reason=str(exc),
+            )
             return self._handle_mount_failure(
                 ticket_id=ticket_id,
                 backend_pod=backend_pod,
@@ -760,7 +856,12 @@ class BackendSessions:
                 exc=exc,
             )
         except Exception as exc:
-            logger.exception("Unexpected mount failure for ticket %s on %s", ticket_id, backend_pod)
+            ticket_format.set_ticket_context(ticket)
+            logger.exception(
+                "[Failed] operation=mount error_type=unexpected backend_pod=%s reason=%r",
+                backend_pod,
+                str(exc),
+            )
             return self._handle_mount_failure(
                 ticket_id=ticket_id,
                 backend_pod=backend_pod,
@@ -789,8 +890,11 @@ class BackendSessions:
                 "info",
                 "Assigned",
                 committed,
+                include_ticket_fields=(),
+                claimed_by=committed.get("claimed_by"),
                 backend_pod=backend_pod,
                 backend_ip=backend_ip,
+                retry_count=committed.get("retry_count"),
                 **ticket_format.assignment_timing_fields(committed),
             )
             response = ticket_format.ticket_response(committed, "Command assigned to backend")
@@ -810,7 +914,14 @@ class BackendSessions:
             pass
         current = self.tickets.get_ticket(ticket_id)
         if current:
-            ticket_format.log_queue_event("debug", "ticket_requeued", current, reason="Ticket no longer owns the allocation")
+            ticket_format.log_queue_event(
+                "debug",
+                "Requeued",
+                current,
+                include_ticket_fields=(),
+                backend_pod=backend_pod,
+                reason="Ticket no longer owns the allocation",
+            )
         return ticket_format.ticket_response(current or ticket, "Ticket no longer owns the allocation")
 
     def _handle_mount_failure(
@@ -825,9 +936,10 @@ class BackendSessions:
             self.pool.release_pod(backend_pod)
         except Exception as release_exc:
             logger.warning(
-                "Failed to release backend pod %s after mount error: %s",
+                "[Warning] operation=release_after_mount_error ticket_id=%s backend_pod=%s reason=%r",
+                ticket_id,
                 backend_pod,
-                release_exc,
+                str(release_exc),
             )
 
         current = self.tickets.get_ticket(ticket_id)
@@ -840,13 +952,31 @@ class BackendSessions:
             )
             requeued_ticket = requeued if requeued and requeued.get("status") == "queued" else self.tickets.get_ticket(ticket_id)
             if requeued_ticket:
-                ticket_format.log_queue_event("debug", "ticket_requeued", requeued_ticket, reason=reason)
+                ticket_format.log_queue_event(
+                    "debug",
+                    "Requeued",
+                    requeued_ticket,
+                    include_ticket_fields=(),
+                    backend_pod=backend_pod,
+                    backend_ip=requeued_ticket.get("backend_ip"),
+                    retry_count=requeued_ticket.get("retry_count"),
+                    reason=reason,
+                )
             return ticket_format.ticket_response(requeued_ticket, str(exc))
 
         failed = self.tickets.mark_failed(ticket_id, reason, claim_token=claim_token)
         failed_ticket = failed if failed and failed.get("status") == "failed" else self.tickets.get_ticket(ticket_id)
         if failed_ticket:
-            ticket_format.log_queue_event("info", "Failed", failed_ticket, reason=reason)
+            ticket_format.log_queue_event(
+                "info",
+                "Failed",
+                failed_ticket,
+                include_ticket_fields=(),
+                backend_pod=backend_pod,
+                backend_ip=failed_ticket.get("backend_ip"),
+                retry_count=failed_ticket.get("retry_count"),
+                reason=reason,
+            )
         return ticket_format.ticket_response(failed_ticket, str(exc))
 
     def _select_backend_pod(self, backend_type: str) -> Dict:
@@ -895,7 +1025,12 @@ class BackendSessions:
             try:
                 ticket = self.tickets.get_ticket_snapshot(ticket_id)
             except QueueUnavailableError as exc:
-                logger.debug("Ticket lookup by id failed for %s: %s", ticket_id, exc)
+                logger.debug(
+                    "[TicketLookupSkipped] ticket_id=%s backend_pod=%s reason=%r",
+                    ticket_id,
+                    backend_pod,
+                    str(exc),
+                )
             else:
                 if ticket:
                     assigned_backend = (ticket.get("backend_pod") or "").strip()
@@ -911,16 +1046,24 @@ class BackendSessions:
             self.pool.release_pod(backend_pod)
         except Exception as exc:
             logger.warning(
-                "Failed to release stale backend %s for ticket %s: %s",
+                "[Warning] operation=release_stale_backend backend_pod=%s ticket_id=%s reason=%r",
                 backend_pod,
                 ticket_id,
-                exc,
+                str(exc),
             )
 
     def _clear_assigned_request_context_best_effort(self, backend_pod: str) -> None:
         try:
             self.tickets.clear_assigned_request_context(backend_pod)
         except QueueUnavailableError as exc:
-            logger.warning("Assigned request context cleanup skipped for %s: %s", backend_pod, exc)
+            logger.warning(
+                "[Warning] operation=assigned_context_cleanup backend_pod=%s status=skipped reason=%r",
+                backend_pod,
+                str(exc),
+            )
         except Exception as exc:
-            logger.warning("Assigned request context cleanup failed for %s: %s", backend_pod, exc)
+            logger.warning(
+                "[Warning] operation=assigned_context_cleanup backend_pod=%s status=failed reason=%r",
+                backend_pod,
+                str(exc),
+            )

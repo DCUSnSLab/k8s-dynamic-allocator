@@ -53,10 +53,8 @@ EVENT_COLUMNS = [
     "retry_count",
     "ingress_ts_ms",
     "queue_wait_ms",
-    "backend_unavailable_ms",
     "backend_ready_to_claim_ms",
     "allocation_ms",
-    "total_assignment_ms",
     "session_ms",
     "release_ms",
     "source_file",
@@ -65,7 +63,7 @@ EVENT_COLUMNS = [
 TIMELINE_COLUMNS = ["Time", *EVENT_COLUMNS]
 
 KEY_VALUE_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\"[^\"]*\"|'[^']*'|[^\s]+)")
-EVENT_RE = re.compile(r"^\[(?P<component>[^\]]+)\]\s+(?P<event>[^\s]+)")
+EVENT_TAG_RE = re.compile(r"^\[(?P<tag>[^\]]+)\](?:\s+(?P<rest>.*))?$")
 DETAILED_TS_RE = r"(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\s+[+-]\d{4})?)"
 DETAILED_WITH_LABEL_RE = re.compile(
     r"^\[" + DETAILED_TS_RE + r"\]\s+"
@@ -212,10 +210,16 @@ def extract_app_log(record: Dict[str, object]) -> Dict[str, object]:
 def parse_message_fields(message: str) -> Tuple[str, str, Dict[str, str]]:
     component = ""
     event = ""
-    match = EVENT_RE.search(message or "")
+    match = EVENT_TAG_RE.search(message or "")
     if match:
-        component = match.group("component")
-        event = match.group("event")
+        tag = match.group("tag")
+        rest = match.group("rest") or ""
+        first_token = rest.split(maxsplit=1)[0] if rest else ""
+        if tag in {"QUEUE", "SUCCESS", "FAILED"} and first_token and "=" not in first_token:
+            component = tag
+            event = first_token.rstrip(":")
+        else:
+            event = tag
 
     fields: Dict[str, str] = {}
     for item in KEY_VALUE_RE.finditer(message or ""):

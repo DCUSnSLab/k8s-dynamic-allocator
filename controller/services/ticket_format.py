@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional
 
 from config import settings
 from config.settings import build_request_label, set_request_label
@@ -8,6 +8,19 @@ from config.settings import build_request_label, set_request_label
 from .queue import parse_datetime, safe_int
 
 logger = logging.getLogger(__name__)
+
+
+def _format_log_value(value: object) -> str:
+    text = str(value)
+    if text == "":
+        return '""'
+    if not any(char.isspace() for char in text) and '"' not in text and "'" not in text:
+        return text
+    if "'" not in text:
+        return f"'{text}'"
+    if '"' not in text:
+        return f'"{text}"'
+    return f'"{text.replace(chr(34), chr(39))}"'
 
 
 def ticket_short(ticket_id: Optional[str]) -> str:
@@ -33,23 +46,31 @@ def set_ticket_context(ticket: Optional[Dict]) -> str:
     return label
 
 
-def ticket_event_fields(ticket: Optional[Dict], **fields) -> Dict[str, object]:
+DEFAULT_TICKET_EVENT_FIELDS = (
+    "ticket_id",
+    "backend_type",
+    "frontend_pod",
+    "frontend_ip",
+    "username",
+    "claimed_by",
+    "backend_pod",
+    "backend_ip",
+    "queue_position",
+    "retry_count",
+    "ticket_short",
+    "ingress_ts_ms",
+)
+
+
+def ticket_event_fields(
+    ticket: Optional[Dict],
+    *,
+    include_ticket_fields: Optional[Iterable[str]] = DEFAULT_TICKET_EVENT_FIELDS,
+    **fields,
+) -> Dict[str, object]:
     payload = {}
-    if ticket:
-        for key in (
-            "ticket_id",
-            "backend_type",
-            "frontend_pod",
-            "frontend_ip",
-            "username",
-            "claimed_by",
-            "backend_pod",
-            "backend_ip",
-            "queue_position",
-            "retry_count",
-            "ticket_short",
-            "ingress_ts_ms",
-        ):
+    if ticket and include_ticket_fields is not None:
+        for key in include_ticket_fields:
             value = ticket.get(key)
             if value not in (None, ""):
                 payload[key] = value
@@ -65,16 +86,25 @@ def log_queue_event(
     ticket: Optional[Dict] = None,
     *,
     component: str = "QUEUE",
+    include_ticket_fields: Optional[Iterable[str]] = DEFAULT_TICKET_EVENT_FIELDS,
     **fields,
 ) -> None:
     if ticket:
         set_ticket_context(ticket)
 
-    parts = [f"[{component}] {event}"]
-    payload = ticket_event_fields(ticket, **fields)
+    parts = [f"[{event}]"]
+    payload = ticket_event_fields(
+        ticket,
+        include_ticket_fields=include_ticket_fields,
+        **fields,
+    )
     if payload:
         ordered_keys = [
             "ticket_id",
+            "operation",
+            "status",
+            "source",
+            "error_type",
             "backend_type",
             "username",
             "frontend_pod",
@@ -89,23 +119,23 @@ def log_queue_event(
             "reason",
             "available_ready_backends",
             "leader",
+            "attempt",
+            "max_attempts",
             "queue_wait_ms",
-            "backend_unavailable_ms",
             "backend_ready_to_claim_ms",
             "allocation_ms",
-            "total_assignment_ms",
             "session_ms",
             "release_ms",
         ]
         used = set()
         for key in ordered_keys:
             if key in payload:
-                parts.append(f"{key}={payload[key]}")
+                parts.append(f"{key}={_format_log_value(payload[key])}")
                 used.add(key)
         for key in sorted(payload):
             if key in used:
                 continue
-            parts.append(f"{key}={payload[key]}")
+            parts.append(f"{key}={_format_log_value(payload[key])}")
 
     message = " ".join(parts)
     getattr(logger, level, logger.info)(message)
@@ -144,8 +174,8 @@ def assignment_timing_fields(ticket: Optional[Dict]) -> Dict[str, int]:
 
     Returns dict with timing fields (only includes fields where all required timestamps are available):
     - queue_wait_ms: Time from ingress to claim
+    - backend_ready_to_claim_ms: Time from selected backend Ready to claim
     - allocation_ms: Time from claim to assignment
-    - total_assignment_ms: Time from ingress to assignment
 
     Missing timestamps result in omitted fields, not zero values, for clearer logs.
     """
@@ -160,14 +190,6 @@ def assignment_timing_fields(ticket: Optional[Dict]) -> Dict[str, int]:
     # Only calculate metrics where all required timestamps are available
     if ingress_ts_ms and claimed_at_ms:
         fields["queue_wait_ms"] = max(0, claimed_at_ms - ingress_ts_ms)
-    backend_unavailable_started_ms = datetime_to_epoch_ms(
-        ticket.get("backend_unavailable_started_at")
-    )
-    if backend_unavailable_started_ms and claimed_at_ms:
-        fields["backend_unavailable_ms"] = max(
-            0,
-            claimed_at_ms - backend_unavailable_started_ms,
-        )
     backend_ready_at_ms = datetime_to_epoch_ms(ticket.get("backend_ready_at"))
     if backend_ready_at_ms and claimed_at_ms:
         ready_or_ingress_ms = max(backend_ready_at_ms, ingress_ts_ms or 0)
@@ -177,8 +199,6 @@ def assignment_timing_fields(ticket: Optional[Dict]) -> Dict[str, int]:
         )
     if claimed_at_ms and assigned_at_ms:
         fields["allocation_ms"] = max(0, assigned_at_ms - claimed_at_ms)
-    if ingress_ts_ms and assigned_at_ms:
-        fields["total_assignment_ms"] = max(0, assigned_at_ms - ingress_ts_ms)
     return fields
 
 

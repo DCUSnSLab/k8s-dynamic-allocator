@@ -95,14 +95,14 @@ class LeaseLeaderElector(KubernetesClient):
                 if currently_leader:
                     success = self._renew_lease()
                     if not success:
-                        logger.warning("Leadership lost while renewing lease")
+                        logger.warning("[Warning] operation=lease_renew status=lost_leadership identity=%s", self.identity)
                         self._set_leader(False)
                 else:
                     success = self._try_acquire_lease()
                     if success:
                         self._set_leader(True)
             except Exception as e:
-                logger.warning("Lease election loop error: %s", e)
+                logger.warning("[Warning] operation=lease_election_loop identity=%s reason=%r", self.identity, str(e))
                 self._set_leader(False)
 
             interval = (
@@ -250,7 +250,7 @@ class LeaseLeaderElector(KubernetesClient):
             try:
                 callback()
             except Exception as e:
-                logger.warning("Leader transition callback failed: %s", e)
+                logger.warning("[Warning] operation=leader_transition_callback identity=%s reason=%r", self.identity, str(e))
 
     @staticmethod
     def _holder_identity(lease) -> str:

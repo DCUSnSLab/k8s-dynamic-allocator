@@ -34,7 +34,7 @@ class BackendCleanup:
                 elif recovered["status"] == "failed":
                     queue_failed.append(recovered["ticket_id"])
         except QueueUnavailableError as exc:
-            logger.warning("Queue stale recovery skipped: %s", exc)
+            logger.warning("[Warning] operation=stale_recovery status=skipped reason=%r", str(exc))
             queue_recovery_skipped = True
             queue_recovery_error = str(exc)
 
@@ -55,7 +55,7 @@ class BackendCleanup:
 
             if frontend_status is None or frontend_status != "Running":
                 logger.warning(
-                    "Frontend '%s' is %s, releasing '%s'",
+                    "[Warning] operation=orphan_backend_release frontend_pod=%s frontend_status=%s backend_pod=%s",
                     frontend_pod,
                     frontend_status,
                     backend_pod,

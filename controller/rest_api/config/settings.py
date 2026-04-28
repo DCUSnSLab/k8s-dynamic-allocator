@@ -173,6 +173,7 @@ REST_FRAMEWORK = {
 
 _LOG_FORMAT = os.getenv('LOG_FORMAT', 'detailed').lower()
 _CONSOLE_FORMATTER = 'json' if _LOG_FORMAT == 'json' else 'detailed'
+_APP_LOG_LEVEL = os.getenv('APP_LOG_LEVEL', 'INFO').upper()
 
 LOGGING = {
     'version': 1,
@@ -224,12 +225,12 @@ LOGGING = {
         },
         'api': {
             'handlers': ['console'],
-            'level': 'DEBUG',
+            'level': _APP_LOG_LEVEL,
             'propagate': False,
         },
         'services': {
             'handlers': ['console'],
-            'level': 'DEBUG',
+            'level': _APP_LOG_LEVEL,
             'propagate': False,
         },
         'httpx': {

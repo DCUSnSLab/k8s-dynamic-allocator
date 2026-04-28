@@ -41,6 +41,6 @@ class ApiConfig(AppConfig):
                 failed,
             )
 
-        except Exception:
-            logger.exception("Controller startup failed")
+        except Exception as exc:
+            logger.exception("[Failed] operation=controller_startup reason=%r", str(exc))
             raise

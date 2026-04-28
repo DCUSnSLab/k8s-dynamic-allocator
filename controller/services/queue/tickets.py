@@ -373,8 +373,9 @@ class Tickets:
                     return ticket
 
         logger.warning(
-            "No backend-ticket index for backend pod %s; release correlation degraded",
+            "[Warning] operation=release_correlation backend_pod=%s reason=%r",
             backend_pod_value,
+            "missing backend-ticket index",
         )
         return None
 
@@ -493,7 +494,11 @@ class Tickets:
                 )
                 pipe.execute()
             except (RedisError, QueueUnavailableError):
-                logger.debug("Failed to extend TTL / store backend ticket index for %s", backend_pod)
+                logger.debug(
+                    "[BackendTicketIndexSkipped] backend_pod=%s reason=%r",
+                    backend_pod,
+                    "failed to extend TTL or store backend ticket index",
+                )
         return ticket
 
     def mark_failed(

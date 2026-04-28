@@ -93,7 +93,7 @@ def execute_command(request: HttpRequest) -> HttpResponse:
         ingress_ts_ms = int(time.time() * 1000)
         set_request_label(build_request_label(username, ticket_id[:10]))
         logger.info(
-            "Execute request: ticket_id=%s, frontend=%s, frontend_ip=%s, backend_type=%s, ingress_ts_ms=%s, command=%s",
+            "[Request] ticket_id=%s frontend=%s frontend_ip=%s backend_type=%s ingress_ts_ms=%s command=%r",
             ticket_id,
             frontend_pod or frontend_ip,
             frontend_ip,
@@ -130,10 +130,10 @@ def execute_command(request: HttpRequest) -> HttpResponse:
         return json_response(result, status=status_code)
 
     except json.JSONDecodeError as exc:
-        logger.error("JSON parse error: %s", exc)
+        logger.error("[Failed] operation=request_parse reason=%r", str(exc))
         return _error_response(f"Invalid JSON format: {exc}")
     except Exception as exc:
-        logger.error("Unexpected error: %s", exc, exc_info=True)
+        logger.error("[Failed] operation=execute reason=%r", str(exc), exc_info=True)
         return _error_response("Internal server error", status=500)
 
 
@@ -170,7 +170,7 @@ def queue_status(request: HttpRequest) -> HttpResponse:
     except ValueError as exc:
         return _error_response(str(exc))
     except Exception as exc:
-        logger.error("Queue status error: %s", exc, exc_info=True)
+        logger.error("[Failed] operation=queue_status backend_type=%s reason=%r", backend_type, str(exc), exc_info=True)
         return _error_response(str(exc), status=500)
 
 
@@ -183,7 +183,7 @@ def pool_status(request: HttpRequest) -> HttpResponse:
         result = _get_orchestrator().get_pool_status()
         return json_response(result)
     except Exception as exc:
-        logger.error("Pool status error: %s", exc, exc_info=True)
+        logger.error("[Failed] operation=pool_status reason=%r", str(exc), exc_info=True)
         return _error_response(str(exc), status=500)
 
 
@@ -198,7 +198,7 @@ def ticket_detail(request: HttpRequest, ticket_id: str) -> HttpResponse:
             return json_response(result, status=404)
         return json_response(result)
     except Exception as exc:
-        logger.error("Ticket detail error: %s", exc, exc_info=True)
+        logger.error("[Failed] operation=ticket_detail ticket_id=%s reason=%r", ticket_id, str(exc), exc_info=True)
         return _error_response(str(exc), status=500)
 
 
@@ -228,7 +228,7 @@ def cancel_ticket(request: HttpRequest, ticket_id: str) -> HttpResponse:
             return json_response(result, status=500)
         return json_response(result)
     except Exception as exc:
-        logger.error("Ticket cancel error: %s", exc, exc_info=True)
+        logger.error("[Failed] operation=ticket_cancel ticket_id=%s reason=%r", ticket_id, str(exc), exc_info=True)
         return _error_response(str(exc), status=500)
 
 
@@ -241,7 +241,7 @@ def initialize_pool(request: HttpRequest) -> HttpResponse:
         result = _get_orchestrator().initialize_pool()
         return json_response({"status": "success", "message": "Pool initialized", "result": result})
     except Exception as exc:
-        logger.error("Pool init error: %s", exc, exc_info=True)
+        logger.error("[Failed] operation=pool_init reason=%r", str(exc), exc_info=True)
         return _error_response(str(exc), status=500)
 
 
@@ -261,7 +261,11 @@ def release_backend(request: HttpRequest) -> HttpResponse:
         try:
             request_context = orchestrator.get_assigned_request_context(backend_pod)
         except Exception as exc:
-            logger.warning("Release request context unavailable for %s: %s", backend_pod, exc)
+            logger.warning(
+                "[Warning] operation=release_context backend_pod=%s reason=%r",
+                backend_pod,
+                str(exc),
+            )
             request_context = None
 
         caller_hints = {}
@@ -297,7 +301,7 @@ def release_backend(request: HttpRequest) -> HttpResponse:
     except json.JSONDecodeError:
         return _error_response("Invalid JSON format")
     except Exception as exc:
-        logger.error("Release error: %s", exc, exc_info=True)
+        logger.error("[Failed] operation=release reason=%r", str(exc), exc_info=True)
         return _error_response(str(exc), status=500)
 
 
@@ -323,5 +327,5 @@ def check_stale(request: HttpRequest) -> HttpResponse:
             )
         return json_response({"status": "success", **result})
     except Exception as exc:
-        logger.error("Stale check error: %s", exc, exc_info=True)
+        logger.error("[Failed] operation=stale_check reason=%r", str(exc), exc_info=True)
         return _error_response(str(exc), status=500)

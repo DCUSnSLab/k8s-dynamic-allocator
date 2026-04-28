@@ -61,8 +61,8 @@ class Orchestrator:
             set_request_label("-")
             try:
                 self.process_wait_queues()
-            except Exception:
-                logger.exception("Queue worker iteration failed")
+            except Exception as exc:
+                logger.exception("[Failed] operation=queue_worker_iteration reason=%r", str(exc))
             finally:
                 set_request_label("-")
         logger.info("Queue worker stopped")

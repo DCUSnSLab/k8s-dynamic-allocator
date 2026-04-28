@@ -163,7 +163,7 @@ class BackendPool(KubernetesClient):
 
         yaml_files = glob.glob(os.path.join(MANIFESTS_DIR, "*.yaml"))
         if not yaml_files:
-            logger.warning("No manifest files found in %s", MANIFESTS_DIR)
+            logger.warning("[Warning] operation=manifest_discovery manifest_dir=%s reason=%r", MANIFESTS_DIR, "no manifest files found")
             return results
 
         try:
@@ -172,7 +172,7 @@ class BackendPool(KubernetesClient):
                 for deployment in self.apps_v1.list_namespaced_deployment(namespace=self.namespace).items
             }
         except Exception as exc:
-            logger.debug("Failed to prefetch existing backend deployments: %s", exc)
+            logger.debug("[DeploymentPrefetchSkipped] reason=%r", str(exc))
 
         for yaml_file in yaml_files:
             try:
@@ -210,15 +210,15 @@ class BackendPool(KubernetesClient):
                     results["existing"].append(name)
                 else:
                     logger.error(
-                        "Deployment creation failed (%s): %s",
+                        "[Failed] operation=deployment_create manifest=%s reason=%r",
                         os.path.basename(yaml_file),
-                        e,
+                        str(e),
                     )
                     results["failed"].append(
                         {"file": os.path.basename(yaml_file), "error": str(e)}
                     )
             except Exception as e:
-                logger.error("Manifest load failed (%s): %s", os.path.basename(yaml_file), e)
+                logger.error("[Failed] operation=manifest_load manifest=%s reason=%r", os.path.basename(yaml_file), str(e))
                 results["failed"].append(
                     {"file": os.path.basename(yaml_file), "error": str(e)}
                 )
@@ -236,20 +236,20 @@ class BackendPool(KubernetesClient):
         try:
             pod_name = os.getenv("HOSTNAME")
             if not pod_name:
-                logger.warning("HOSTNAME not set, skipping OwnerReference")
+                logger.warning("[Warning] operation=owner_ref reason=%r", "HOSTNAME not set")
                 BackendPool._owner_ref_resolved = True
                 return None
 
             pod = self.v1.read_namespaced_pod(pod_name, self.namespace)
             if not pod.metadata.owner_references:
-                logger.warning("Pod has no ownerReferences")
+                logger.warning("[Warning] operation=owner_ref pod=%s reason=%r", pod_name, "pod has no ownerReferences")
                 BackendPool._owner_ref_resolved = True
                 return None
 
             rs_ref = pod.metadata.owner_references[0]
             rs = self.apps_v1.read_namespaced_replica_set(rs_ref.name, self.namespace)
             if not rs.metadata.owner_references:
-                logger.warning("ReplicaSet has no ownerReferences")
+                logger.warning("[Warning] operation=owner_ref replicaset=%s reason=%r", rs_ref.name, "replicaset has no ownerReferences")
                 BackendPool._owner_ref_resolved = True
                 return None
 
@@ -268,7 +268,7 @@ class BackendPool(KubernetesClient):
             return owner_ref
 
         except Exception as e:
-            logger.warning("Failed to get owner deployment: %s", e)
+            logger.warning("[Warning] operation=owner_ref reason=%r", str(e))
             BackendPool._owner_ref_resolved = True
             return None
 
@@ -375,11 +375,11 @@ class BackendPool(KubernetesClient):
                 namespace=self.namespace,
                 grace_period_seconds=0,
             )
-            logger.debug("Deleted assigned backend pod: %s", pod_name)
+            logger.debug("[BackendDeleted] backend_pod=%s", pod_name)
             return True
         except ApiException as e:
             if e.status in (404, 409):
-                logger.debug("Backend pod already deleted or terminating: %s", pod_name)
+                logger.debug("[BackendDeleted] backend_pod=%s status=already_deleted_or_terminating", pod_name)
                 return False
             raise
 
