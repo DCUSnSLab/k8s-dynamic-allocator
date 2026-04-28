@@ -87,6 +87,7 @@ class Orchestrator:
         frontend_pod: str = "",
         backend_type: Optional[str] = None,
         ingress_ts_ms: Optional[int] = None,
+        ticket_id: Optional[str] = None,
     ) -> Dict:
         return self.sessions.execute_command(
             username=username,
@@ -95,6 +96,7 @@ class Orchestrator:
             frontend_pod=frontend_pod,
             backend_type=backend_type,
             ingress_ts_ms=ingress_ts_ms,
+            ticket_id=ticket_id,
         )
 
     def cancel_ticket(self, ticket_id: str, reason: str = "") -> Dict:

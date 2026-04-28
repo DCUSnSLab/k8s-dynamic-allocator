@@ -79,6 +79,7 @@ class Tickets:
             "claimed_at",
             "allocation_deadline",
             "assigned_at",
+            "backend_ready_at",
             "backend_unavailable_started_at",
             "failed_at",
             "cancelled_at",
@@ -118,6 +119,7 @@ class Tickets:
             "created_at": _iso_now(),
             "updated_at": _iso_now(),
             "assigned_at": "",
+            "backend_ready_at": "",
             "backend_unavailable_started_at": "",
             "failed_at": "",
             "cancelled_at": "",
@@ -135,10 +137,11 @@ class Tickets:
         backend_type: Optional[str] = None,
         request_id: Optional[str] = None,
         ingress_ts_ms: Optional[int] = None,
+        ticket_id: Optional[str] = None,
     ) -> Dict[str, object]:
         backend_type_value = self.queue.normalize_backend_type(backend_type)
-        ticket_id = uuid.uuid4().hex
-        ticket_short = ticket_id[:10]
+        ticket_id_value = (ticket_id or "").strip() or uuid.uuid4().hex
+        ticket_short = ticket_id_value[:10]
         request_label = settings.build_request_label(username, ticket_short)
         ticket = self._ticket_fields(
             status="queued",
@@ -156,13 +159,13 @@ class Tickets:
         client = self.queue._redis_client()
         try:
             pipe = client.pipeline(transaction=True)
-            pipe.hset(self.queue._ticket_key(ticket_id), mapping=ticket)
-            pipe.expire(self.queue._ticket_key(ticket_id), self.queue.ticket_ttl_seconds)
-            pipe.rpush(self.queue._queue_key(backend_type_value), ticket_id)
-            pipe.sadd(self.queue._active_key(backend_type_value), ticket_id)
+            pipe.hset(self.queue._ticket_key(ticket_id_value), mapping=ticket)
+            pipe.expire(self.queue._ticket_key(ticket_id_value), self.queue.ticket_ttl_seconds)
+            pipe.rpush(self.queue._queue_key(backend_type_value), ticket_id_value)
+            pipe.sadd(self.queue._active_key(backend_type_value), ticket_id_value)
             pipe.sadd(self.queue._types_key(), backend_type_value)
             pipe.execute()
-            return self.get_ticket(ticket_id) or {"ticket_id": ticket_id, **ticket}
+            return self.get_ticket(ticket_id_value) or {"ticket_id": ticket_id_value, **ticket}
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to create ticket: {exc}") from exc
 
@@ -382,6 +385,7 @@ class Tickets:
         backend_ip: str,
         claimed_by: Optional[str] = None,
         claim_token: Optional[str] = None,
+        backend_ready_at: Optional[object] = None,
     ) -> Optional[Dict[str, object]]:
         ticket = self.get_ticket(ticket_id)
         if not ticket:
@@ -401,6 +405,7 @@ class Tickets:
                 "claim_token": claim_token or ticket.get("claim_token") or uuid.uuid4().hex,
                 "claimed_at": ticket.get("claimed_at") or _iso_now(),
                 "allocation_deadline": (_utc_now() + timedelta(seconds=self.queue.allocating_ttl_seconds)).isoformat(),
+                "backend_ready_at": backend_ready_at or ticket.get("backend_ready_at") or "",
                 "error": "",
             },
         )

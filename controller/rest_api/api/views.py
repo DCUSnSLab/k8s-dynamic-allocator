@@ -2,13 +2,14 @@ import ipaddress
 import json
 import logging
 import time
+import uuid
 from datetime import datetime
 from typing import Any, Dict
 
 from django.http import HttpRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from config.settings import DEFAULT_BACKEND_TYPE, set_request_label
+from config.settings import DEFAULT_BACKEND_TYPE, build_request_label, set_request_label
 
 logger = logging.getLogger(__name__)
 
@@ -88,14 +89,15 @@ def execute_command(request: HttpRequest) -> HttpResponse:
         if not frontend_ip:
             return _error_response("frontend_ip is required")
 
+        ticket_id = uuid.uuid4().hex
         ingress_ts_ms = int(time.time() * 1000)
-        set_request_label(username)
+        set_request_label(build_request_label(username, ticket_id[:10]))
         logger.info(
-            "Execute request: frontend=%s, frontend_ip=%s, backend_type=%s, user=%s, ingress_ts_ms=%s, command=%s",
+            "Execute request: ticket_id=%s, frontend=%s, frontend_ip=%s, backend_type=%s, ingress_ts_ms=%s, command=%s",
+            ticket_id,
             frontend_pod or frontend_ip,
             frontend_ip,
             backend_type,
-            username,
             ingress_ts_ms,
             command,
         )
@@ -107,6 +109,7 @@ def execute_command(request: HttpRequest) -> HttpResponse:
             frontend_pod=frontend_pod,
             backend_type=backend_type,
             ingress_ts_ms=ingress_ts_ms,
+            ticket_id=ticket_id,
         )
 
         ticket = result.get("ticket") or {}

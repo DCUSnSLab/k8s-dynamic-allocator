@@ -88,6 +88,14 @@ class BackendPool(KubernetesClient):
                 return condition.status == "True"
         return False
 
+    @staticmethod
+    def _pod_ready_at(pod):
+        conditions = getattr(pod.status, "conditions", None) or []
+        for condition in conditions:
+            if condition.type == "Ready" and condition.status == "True":
+                return getattr(condition, "last_transition_time", None)
+        return None
+
     def _validate_backend_manifest(self, spec: Dict) -> str:
         selector_labels = (
             spec.get("spec", {})
@@ -268,6 +276,15 @@ class BackendPool(KubernetesClient):
         """Return one Ready warm backend pod that is currently available."""
         names = self.get_available_pods(backend_type=backend_type, limit=1)
         return names[0] if names else None
+
+    def get_pod_ready_at(self, pod_name: str):
+        try:
+            pod = self.v1.read_namespaced_pod(pod_name, self.namespace)
+        except ApiException as exc:
+            if exc.status == 404:
+                return None
+            raise
+        return self._pod_ready_at(pod)
 
     def get_available_pods(
         self,

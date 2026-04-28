@@ -41,6 +41,7 @@ class BackendSessions:
         frontend_pod: str = "",
         backend_type: Optional[str] = None,
         ingress_ts_ms: Optional[int] = None,
+        ticket_id: Optional[str] = None,
     ) -> Dict:
         try:
             if not frontend_ip:
@@ -59,6 +60,7 @@ class BackendSessions:
                 backend_type=backend_type_value,
                 request_id=get_request_label(),
                 ingress_ts_ms=ingress_ts_ms,
+                ticket_id=ticket_id,
             )
 
             ticket_format.set_ticket_context(ticket)
@@ -657,6 +659,7 @@ class BackendSessions:
             result["queued"] += 1
             return None
 
+        backend_ready_at = self.pool.get_pod_ready_at(backend_pod)
         backend_ip = self.pool.get_pod_ip(backend_pod) or ""
         if not backend_ip:
             try:
@@ -686,6 +689,7 @@ class BackendSessions:
             backend_ip=backend_ip,
             claimed_by=ticket.get("claimed_by"),
             claim_token=claim_token,
+            backend_ready_at=backend_ready_at,
         )
         if not committed or committed.get("status") != "allocating":
             try:

@@ -54,6 +54,7 @@ EVENT_COLUMNS = [
     "ingress_ts_ms",
     "queue_wait_ms",
     "backend_unavailable_ms",
+    "backend_ready_to_claim_ms",
     "allocation_ms",
     "total_assignment_ms",
     "session_ms",
