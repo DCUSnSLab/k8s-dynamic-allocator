@@ -163,7 +163,7 @@ async def mount(request: MountRequest):
     await state.set_mounting(request.frontend_ip, request.frontend_pod, request.command)
 
     logger.info(
-        "[MountRequested] frontend_pod=%s frontend_ip=%s",
+        "[MountRequested] frontend=%s frontend_ip=%s",
         request.frontend_pod or "",
         request.frontend_ip,
     )

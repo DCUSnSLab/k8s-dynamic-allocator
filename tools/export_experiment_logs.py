@@ -44,7 +44,7 @@ CONTROLLER_EVENT_COLUMNS = [
     "request_label",
     "event",
     "ticket_id",
-    "frontend_pod",
+    "frontend",
     "frontend_ip",
     "backend_pod",
     "backend_ip",
@@ -67,7 +67,7 @@ BACKEND_EVENT_COLUMNS = [
     "timestamp",
     "pod",
     "event",
-    "frontend_pod",
+    "frontend",
     "frontend_ip",
     "client_ip",
     "connect_to_ready_ms",
@@ -296,6 +296,8 @@ def parse_message_fields(message: str, level: str = "") -> Tuple[str, str, str, 
             value = value[1:-1]
         value = value.rstrip(",")
         fields[item.group("key")] = value
+    if "frontend" not in fields and "frontend_pod" in fields:
+        fields["frontend"] = fields["frontend_pod"]
     return component, event, body.strip(), fields
 
 
