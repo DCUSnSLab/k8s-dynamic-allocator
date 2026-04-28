@@ -17,6 +17,7 @@ import struct
 import fcntl
 import json
 import threading
+import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -55,6 +56,9 @@ class TCPTerminalServer:
         self._release_notify_cancelled = threading.Event()
         self._release_notify_http_connection_lock = threading.Lock()
         self._release_notify_http_connection = None
+        self._frontend_ip = ""
+        self._frontend_pod = ""
+        self._mount_context_lock = threading.Lock()
 
     async def start(self) -> None:
         """TCP 서버 시작"""
@@ -101,6 +105,7 @@ class TCPTerminalServer:
         """primary cleanup 성공 후 호출 — fallback release를 확정적으로 억제한다."""
         self._skip_release_notify = True
         self._release_notify_cancelled.set()
+        self._clear_mount_context()
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._close_release_notify_http_connection_sync)
@@ -122,7 +127,11 @@ class TCPTerminalServer:
             except Exception:
                 pass
 
-    async def begin_session_lifecycle(self) -> None:
+    async def begin_session_lifecycle(self, frontend_ip: str = "", frontend_pod: str = "") -> None:
+        with self._mount_context_lock:
+            self._frontend_ip = frontend_ip or ""
+            self._frontend_pod = frontend_pod or ""
+
         self._release_notify_cancelled.clear()
         async with self._release_notify_lock:
             self._skip_release_notify = False
@@ -132,6 +141,18 @@ class TCPTerminalServer:
             if self._release_notify_task and not self._release_notify_task.done():
                 self._release_notify_task.cancel()
             self._release_notify_task = None
+
+    def _mount_context_snapshot(self) -> Dict[str, str]:
+        with self._mount_context_lock:
+            return {
+                "frontend_ip": self._frontend_ip,
+                "frontend_pod": self._frontend_pod,
+            }
+
+    def _clear_mount_context(self) -> None:
+        with self._mount_context_lock:
+            self._frontend_ip = ""
+            self._frontend_pod = ""
 
     @staticmethod
     def _configure_keepalive(sock: socket.socket) -> None:
@@ -166,6 +187,12 @@ class TCPTerminalServer:
         session_id = id(writer)
         client_ip = addr[0]
         client_port = addr[1]
+        connection_started = time.perf_counter()
+        ready_at = None
+        mount_context = self._mount_context_snapshot()
+        mount_frontend_ip = mount_context.get("frontend_ip") or client_ip
+
+        logger.info("[ConnectionOpened] client_ip=%s", client_ip)
 
         # 클라이언트 소켓에 TCP Keepalive 적용
         client_sock = writer.get_extra_info('socket')
@@ -262,8 +289,9 @@ class TCPTerminalServer:
 
                 # 3. Mount Namespace & Chroot 환경 구성
                 # unshare -> mount -> chroot -> chdir 수행
-                MountManager.setup_chroot_namespace(addr[0], cwd=cwd)
+                MountManager.setup_chroot_namespace(mount_frontend_ip, cwd=cwd)
 
+            mount_setup_started = time.perf_counter()
             process = subprocess.Popen(
                 final_command,
                 stdin=slave_fd,
@@ -273,6 +301,9 @@ class TCPTerminalServer:
                 preexec_fn=preexec,
                 env=env
             )
+            ready_at = time.perf_counter()
+            mount_setup_ms = int((ready_at - mount_setup_started) * 1000)
+            connect_to_ready_ms = int((ready_at - connection_started) * 1000)
             os.close(slave_fd)
 
             # 세션 추적 등록
@@ -281,7 +312,13 @@ class TCPTerminalServer:
                 "addr": addr,
                 "command": command,
                 "started_at": datetime.now(),
+                "ready_at": ready_at,
             }
+            logger.info(
+                "[SessionReady] connect_to_ready_ms=%s mount_setup_ms=%s",
+                connect_to_ready_ms,
+                mount_setup_ms,
+            )
 
             # 3. 비동기 I/O 처리
             await self._handle_io(reader, writer, master_fd, process, verase_byte)
@@ -306,11 +343,14 @@ class TCPTerminalServer:
                     logger.warning("Force killed process for session %s", session_id)
 
             # 세션 추적 제거
-            self._active_sessions.pop(session_id, None)
+            session_info = self._active_sessions.pop(session_id, None)
 
             writer.close()
             await writer.wait_closed()
-            logger.info("TCP connection closed: %s:%s", client_ip, client_port)
+            session_ready_at = session_info.get("ready_at") if session_info else None
+            session_started_at = session_ready_at or ready_at or connection_started
+            session_ms = int((time.perf_counter() - session_started_at) * 1000)
+            logger.info("[ConnectionClosed] session_ms=%s", max(0, session_ms))
 
             # 활성 세션이 없으면 Controller에 자원 해제 요청
             await self._maybe_notify_release()

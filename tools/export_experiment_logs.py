@@ -19,6 +19,7 @@ import json
 import re
 import subprocess
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -26,24 +27,23 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT_DIR = REPO_ROOT / "tools" / "log_export"
+OUTPUT_TZ = timezone(timedelta(hours=9))
 
-EVENT_COLUMNS = [
-    "ts_utc",
-    "ts_ms",
-    "minute_utc",
+TIMELINE_COLUMNS = [
+    "timestamp",
     "node",
-    "namespace",
     "pod",
-    "container",
-    "app_label",
+    "module",
     "level",
-    "logger",
-    "request_label",
-    "component",
     "event",
     "message",
+]
+
+CONTROLLER_EVENT_COLUMNS = [
+    "timestamp",
+    "request_label",
+    "event",
     "ticket_id",
-    "username",
     "frontend_pod",
     "frontend_ip",
     "backend_pod",
@@ -61,13 +61,27 @@ EVENT_COLUMNS = [
     "total_assignment_ms",
     "session_ms",
     "release_ms",
-    "source_file",
 ]
 
-TIMELINE_COLUMNS = ["Time", *EVENT_COLUMNS]
+BACKEND_EVENT_COLUMNS = [
+    "timestamp",
+    "pod",
+    "event",
+    "frontend_pod",
+    "frontend_ip",
+    "client_ip",
+    "connect_to_ready_ms",
+    "mount_setup_ms",
+    "session_ms",
+    "cleanup_ms",
+]
+
+CONTROLLER_METRIC_FIELDS = set(CONTROLLER_EVENT_COLUMNS) - {"timestamp", "request_label", "event"}
+BACKEND_METRIC_FIELDS = set(BACKEND_EVENT_COLUMNS) - {"timestamp", "pod", "event"}
 
 KEY_VALUE_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\"[^\"]*\"|'[^']*'|[^\s]+)")
 EVENT_TAG_RE = re.compile(r"^\[(?P<tag>[^\]]+)\](?:\s+(?P<rest>.*))?$")
+LEVEL_PREFIX_RE = re.compile(r"^(?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL):\s*(?P<message>.*)$")
 DETAILED_TS_RE = r"(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\s+[+-]\d{4})?)"
 DETAILED_WITH_LABEL_RE = re.compile(
     r"^\[" + DETAILED_TS_RE + r"\]\s+"
@@ -77,6 +91,7 @@ DETAILED_SIMPLE_RE = re.compile(
     r"^\[" + DETAILED_TS_RE + r"\]\s+"
     r"\[(?P<level>[A-Z]+)\]\s+(?P<message>.*)$"
 )
+REQUEST_LABEL_RE = re.compile(r"^-?$|^[A-Za-z0-9_.]+-[A-Fa-f0-9]{6,}$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,7 +107,12 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_OUT_DIR),
         help="Directory for copied JSONL logs and generated program-log CSV files.",
     )
-    parser.add_argument("--bucket-seconds", type=int, default=60, help="Aggregation bucket size.")
+    parser.add_argument(
+        "--bucket-seconds",
+        type=int,
+        default=60,
+        help="Deprecated compatibility option. Timeline CSV now keeps per-log timestamps.",
+    )
     parser.add_argument("--skip-analysis", action="store_true", help="Only copy raw JSONL logs.")
     parser.add_argument("--keep-reader-pod", action="store_true", help="Do not delete the temporary reader pod.")
     return parser.parse_args()
@@ -149,7 +169,7 @@ def parse_datetime_value(value: object) -> Optional[datetime]:
             return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    return parsed
 
 
 def floor_time(dt: datetime, bucket_seconds: int) -> datetime:
@@ -160,6 +180,10 @@ def floor_time(dt: datetime, bucket_seconds: int) -> datetime:
 
 def format_time(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_timestamp(dt: datetime) -> str:
+    return dt.astimezone(OUTPUT_TZ).isoformat(timespec="milliseconds")
 
 
 def parse_json_maybe(value: object) -> object:
@@ -181,11 +205,17 @@ def parse_detailed_log_line(value: object) -> Optional[Dict[str, object]]:
         if not match:
             continue
         parsed = match.groupdict()
+        request_label = parsed.get("request_label", "")
+        message = parsed.get("message", "")
+        looks_like_legacy_request_label = bool(request_label and message.startswith("Execute request"))
+        if request_label and not REQUEST_LABEL_RE.match(request_label) and not looks_like_legacy_request_label:
+            message = f"[{request_label}] {message}".strip()
+            request_label = ""
         return {
             "ts": parsed.get("ts", ""),
             "level": parsed.get("level", ""),
-            "request_label": parsed.get("request_label", ""),
-            "message": parsed.get("message", ""),
+            "request_label": request_label,
+            "message": message,
         }
     return None
 
@@ -211,9 +241,37 @@ def extract_app_log(record: Dict[str, object]) -> Dict[str, object]:
     return app_log
 
 
-def parse_message_fields(message: str) -> Tuple[str, str, Dict[str, str]]:
+def normalize_message_level(level: str, message: str) -> Tuple[str, str]:
+    level_value = (level or "").strip()
+    message_value = message or ""
+    if level_value:
+        return level_value, message_value
+    match = LEVEL_PREFIX_RE.match(message_value)
+    if not match:
+        return level_value, message_value
+    return match.group("level"), match.group("message").strip()
+
+
+def classify_plain_event(message: str, level: str) -> str:
+    text = (message or "").strip()
+    if text.startswith("Execute request"):
+        return "Request"
+    if text.startswith("Traceback "):
+        return "traceback"
+    if text.startswith("File ") or text.startswith('File "'):
+        return "traceback"
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception|Warning):", text):
+        return "exception"
+    level_value = (level or "").strip().lower()
+    if level_value in {"warning", "error", "critical"}:
+        return level_value
+    return ""
+
+
+def parse_message_fields(message: str, level: str = "") -> Tuple[str, str, str, Dict[str, str]]:
     component = ""
     event = ""
+    body = message or ""
     match = EVENT_TAG_RE.search(message or "")
     if match:
         tag = match.group("tag")
@@ -222,42 +280,61 @@ def parse_message_fields(message: str) -> Tuple[str, str, Dict[str, str]]:
         if tag in {"QUEUE", "SUCCESS", "FAILED"} and first_token and "=" not in first_token:
             component = tag
             event = first_token.rstrip(":")
+            body = rest.split(maxsplit=1)[1] if len(rest.split(maxsplit=1)) > 1 else ""
         else:
             event = tag
+            body = rest
+    else:
+        event = classify_plain_event(body, level)
+        if event == "Request" and ":" in body:
+            body = body.split(":", 1)[1].strip()
 
     fields: Dict[str, str] = {}
-    for item in KEY_VALUE_RE.finditer(message or ""):
+    for item in KEY_VALUE_RE.finditer(body or ""):
         value = item.group("value")
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
             value = value[1:-1]
+        value = value.rstrip(",")
         fields[item.group("key")] = value
-    return component, event, fields
+    return component, event, body.strip(), fields
 
 
-def identify_resource(labels: Dict[str, object], pod_name: str, container_name: str) -> str:
+def identify_module(labels: Dict[str, object], pod_name: str, container_name: str) -> str:
     app_label = str(labels.get("app") or "")
     kubessh_label = str(labels.get("kubessh") or "")
+    container_value = container_name.lower()
+    pod_value = pod_name.lower()
 
     if app_label == "controller":
         return "controller"
     if app_label == "backend-pool":
-        return "backend-general"
-    if kubessh_label == "swlabssh":
+        return "backend"
+    if app_label == "controller-queue-redis":
+        return "redis"
+    if app_label == "fluent-bit":
+        return "fluent-bit"
+    if kubessh_label in {"swlabssh", "userpods"}:
         return "dcusshk8s"
     if pod_name.startswith("controller-"):
         return "controller"
     if pod_name.startswith("backend-general-") or container_name == "backend-agent":
-        return "backend-general"
+        return "backend"
+    if pod_name.startswith("ssh-") or "kubessh" in container_value or "kubessh" in pod_value:
+        return "dcusshk8s"
+    if pod_name.startswith("controller-queue-redis-") or container_name == "redis":
+        return "redis"
+    if pod_name.startswith("fluent-bit-"):
+        return "fluent-bit"
     return app_label or kubessh_label or "unknown"
 
 
 def event_time(record: Dict[str, object], app_log: Dict[str, object]) -> Optional[datetime]:
-    for key in ("time", "@timestamp", "timestamp", "date"):
-        parsed = parse_datetime_value(record.get(key))
+    for key in ("ts", "asctime", "time", "timestamp", "@timestamp"):
+        parsed = parse_datetime_value(app_log.get(key))
         if parsed:
             return parsed
-    for key in ("ts", "asctime", "time"):
-        parsed = parse_datetime_value(app_log.get(key))
+    for key in ("time", "@timestamp", "timestamp", "date"):
+        parsed = parse_datetime_value(record.get(key))
         if parsed:
             return parsed
     return None
@@ -282,37 +359,32 @@ def parse_fluent_bit_record(line: str, source_file: Path, bucket_seconds: int) -
     dt = event_time(record, app_log)
     if dt is None:
         return None
-    minute = floor_time(dt, bucket_seconds)
     kubernetes = record.get("kubernetes") if isinstance(record.get("kubernetes"), dict) else {}
     labels = kubernetes.get("labels") if isinstance(kubernetes.get("labels"), dict) else {}
     pod_name = str(kubernetes.get("pod_name") or "")
     container_name = str(kubernetes.get("container_name") or "")
-    component, event, fields = parse_message_fields(message)
+    level, message = normalize_message_level(str(app_log.get("level") or app_log.get("levelname") or ""), message)
+    component, event, message_body, fields = parse_message_fields(message, level)
+    module = identify_module(labels, pod_name, container_name)
 
-    row = {column: "" for column in EVENT_COLUMNS}
+    row = {column: "" for column in TIMELINE_COLUMNS}
     row.update(
         {
-            "ts_utc": dt.isoformat().replace("+00:00", "Z"),
-            "ts_ms": str(int(dt.timestamp() * 1000)),
-            "minute_utc": format_time(minute),
+            "timestamp": format_timestamp(dt),
+            "_ts_ms": str(int(dt.timestamp() * 1000)),
             "node": str(kubernetes.get("host") or kubernetes.get("node_name") or ""),
-            "namespace": str(kubernetes.get("namespace_name") or ""),
             "pod": pod_name,
-            "container": container_name,
-            "app_label": str(labels.get("app") or ""),
-            "level": str(app_log.get("level") or app_log.get("levelname") or ""),
-            "logger": str(app_log.get("logger") or app_log.get("name") or ""),
+            "module": module,
+            "level": level,
             "request_label": str(app_log.get("request_label") or ""),
             "component": component,
             "event": event,
-            "message": message,
+            "message": message_body,
             "source_file": str(source_file),
         }
     )
-    for key in fields:
-        if key in row:
-            row[key] = fields[key]
-    row["resource"] = identify_resource(labels, pod_name, container_name)
+    row.update(fields)
+    row["resource"] = module
     return row
 
 
@@ -324,7 +396,7 @@ def read_log_events(paths: List[Path], bucket_seconds: int) -> List[Dict[str, st
                 row = parse_fluent_bit_record(line, path, bucket_seconds)
                 if row:
                     events.append(row)
-    events.sort(key=lambda item: (item["ts_ms"], item["source_file"]))
+    events.sort(key=lambda item: (int(item.get("_ts_ms") or 0), item.get("source_file") or ""))
     return events
 
 
@@ -353,7 +425,6 @@ def write_resource_timelines(events: List[Dict[str, str]], resource_dir: Path) -
     for event in events:
         resource = event.get("resource") or "unknown"
         row = {column: "" for column in TIMELINE_COLUMNS}
-        row["Time"] = event["minute_utc"]
         row.update(event)
         rows_by_resource.setdefault(resource, []).append(row)
 
@@ -361,6 +432,32 @@ def write_resource_timelines(events: List[Dict[str, str]], resource_dir: Path) -
         path = resource_dir / f"{safe_filename(resource)}.csv"
         write_csv(path, rows_by_resource[resource], TIMELINE_COLUMNS)
         print(f"wrote {path}")
+
+
+def has_any_field(row: Dict[str, str], fields: set) -> bool:
+    return any(str(row.get(field) or "") for field in fields)
+
+
+def controller_event_rows(events: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for event in events:
+        if event.get("module") != "controller":
+            continue
+        if not has_any_field(event, CONTROLLER_METRIC_FIELDS):
+            continue
+        rows.append({column: str(event.get(column) or "") for column in CONTROLLER_EVENT_COLUMNS})
+    return rows
+
+
+def backend_event_rows(events: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for event in events:
+        if event.get("module") != "backend":
+            continue
+        if not has_any_field(event, BACKEND_METRIC_FIELDS):
+            continue
+        rows.append({column: str(event.get(column) or "") for column in BACKEND_EVENT_COLUMNS})
+    return rows
 
 
 def write_analysis_outputs(raw_dir: Path, out_dir: Path, bucket_seconds: int) -> None:
@@ -374,13 +471,16 @@ def write_analysis_outputs(raw_dir: Path, out_dir: Path, bucket_seconds: int) ->
     timeline_rows = []
     for event in events:
         row = {column: "" for column in TIMELINE_COLUMNS}
-        row["Time"] = event["minute_utc"]
         row.update(event)
         timeline_rows.append(row)
     write_csv(out_dir / "timeline.csv", timeline_rows, TIMELINE_COLUMNS)
     write_resource_timelines(events, out_dir / "timeline_by_resource")
+    write_csv(out_dir / "controller_events.csv", controller_event_rows(events), CONTROLLER_EVENT_COLUMNS)
+    write_csv(out_dir / "backend_events.csv", backend_event_rows(events), BACKEND_EVENT_COLUMNS)
 
     print(f"wrote {out_dir / 'timeline.csv'}")
+    print(f"wrote {out_dir / 'controller_events.csv'}")
+    print(f"wrote {out_dir / 'backend_events.csv'}")
 
 
 def reader_pod_overrides(pvc_name: str, reader_image: str) -> str:

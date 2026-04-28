@@ -5,6 +5,7 @@ Backend Agent - HTTP API Server
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -19,9 +20,9 @@ HTTP_PORT = int(os.getenv("BACKEND_AGENT_HTTP_PORT", "8080"))
 TCP_TERMINAL_PORT = int(os.getenv("BACKEND_AGENT_TCP_PORT", "8081"))
 
 _LOG_FORMAT = os.getenv("LOG_FORMAT", "detailed").lower()
+_handler = logging.StreamHandler()
 if _LOG_FORMAT == "json":
     from pythonjsonlogger import jsonlogger
-    _handler = logging.StreamHandler()
     _handler.setFormatter(jsonlogger.JsonFormatter(
         '%(asctime)s %(levelname)s %(name)s %(message)s',
         rename_fields={'asctime': 'ts', 'levelname': 'level', 'name': 'logger'},
@@ -29,11 +30,11 @@ if _LOG_FORMAT == "json":
     ))
     logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 else:
-    logging.basicConfig(
-        level=logging.INFO,
-        format='[%(asctime)s] [%(levelname)s] %(message)s',
+    _handler.setFormatter(logging.Formatter(
+        fmt='[%(asctime)s] [%(levelname)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S %z',
-    )
+    ))
+    logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -162,29 +163,31 @@ async def mount(request: MountRequest):
     await state.set_mounting(request.frontend_ip, request.frontend_pod, request.command)
 
     logger.info(
-        "Mount requested: frontend=%s(%s), command=%s",
-        request.frontend_pod,
+        "[MountRequested] frontend_pod=%s frontend_ip=%s",
+        request.frontend_pod or "",
         request.frontend_ip,
-        request.command,
     )
 
     mount_success = await mount_manager.mount(request.frontend_ip)
 
     if not mount_success:
-        logger.error("SSHFS mount failed!")
+        logger.error("[MountFailed] reason=%r", "SSHFS mount failed")
         await state.set_error("SSHFS mount failed")
         return FormattedJSONResponse({
             "status": "error",
             "message": "SSHFS mount failed"
         }, status_code=500)
 
-    logger.info("Mount successful")
+    logger.info("[MountContextAccepted] tcp_port=%s", TCP_TERMINAL_PORT)
     await state.set_running()
-    await tcp_terminal.begin_session_lifecycle()
+    await tcp_terminal.begin_session_lifecycle(
+        frontend_ip=request.frontend_ip,
+        frontend_pod=request.frontend_pod or "",
+    )
 
     return FormattedJSONResponse({
         "status": "success",
-        "message": "Mount completed, ready for TCP connection",
+        "message": "Mount context accepted, ready for TCP connection",
         "frontend_ip": request.frontend_ip,
         "tcp_port": TCP_TERMINAL_PORT
     })
@@ -192,9 +195,10 @@ async def mount(request: MountRequest):
 
 @app.post("/unmount")
 async def unmount():
-    logger.info("Unmount requested")
+    cleanup_started = time.perf_counter()
 
     if mount_manager.frontend_ip is None:
+        logger.info("[Unmounted] cleanup_ms=0 status=already_unmounted")
         return FormattedJSONResponse({
             "status": "success",
             "message": "Already unmounted"
@@ -207,6 +211,8 @@ async def unmount():
         if success:
             await state.reset()
             await tcp_terminal.suppress_fallback_release()
+            cleanup_ms = int((time.perf_counter() - cleanup_started) * 1000)
+            logger.info("[Unmounted] cleanup_ms=%s", cleanup_ms)
             return FormattedJSONResponse({
                 "status": "success",
                 "message": "Unmounted and reset"
@@ -216,7 +222,8 @@ async def unmount():
             "message": "Unmount completed with warnings"
         })
     except Exception as e:
-        logger.error("Unmount error: %s", e)
+        cleanup_ms = int((time.perf_counter() - cleanup_started) * 1000)
+        logger.error("[UnmountFailed] cleanup_ms=%s reason=%r", cleanup_ms, str(e))
         return FormattedJSONResponse({
             "status": "error",
             "message": str(e)
