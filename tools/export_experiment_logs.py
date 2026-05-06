@@ -5,7 +5,7 @@ This is the one-command wrapper for the logging pipeline:
 
 1. Create a temporary pod that mounts the logs PVC.
 2. Copy /mnt/logs from that pod into this repository under tools/log_export.
-3. Run experiment_log_analysis.py against the copied JSONL files.
+3. Generate thin timeline CSV files from the copied JSONL files.
 4. Delete the temporary pod.
 """
 
@@ -33,51 +33,12 @@ TIMELINE_COLUMNS = [
     "timestamp",
     "node",
     "pod",
+    "compute_pod",
     "module",
     "level",
     "event",
     "message",
 ]
-
-CONTROLLER_EVENT_COLUMNS = [
-    "timestamp",
-    "request_label",
-    "event",
-    "ticket_id",
-    "frontend",
-    "frontend_ip",
-    "backend_pod",
-    "backend_ip",
-    "backend_type",
-    "queue_position",
-    "retry_count",
-    "ingress_ts_ms",
-    "backend_available_ts_ms",
-    "queue_wait_ms",
-    "backend_ready_to_claim_ms",
-    "backend_wait_ms",
-    "controller_claim_delay_ms",
-    "allocation_ms",
-    "total_assignment_ms",
-    "session_ms",
-    "release_ms",
-]
-
-BACKEND_EVENT_COLUMNS = [
-    "timestamp",
-    "pod",
-    "event",
-    "frontend",
-    "frontend_ip",
-    "client_ip",
-    "connect_to_ready_ms",
-    "mount_setup_ms",
-    "session_ms",
-    "cleanup_ms",
-]
-
-CONTROLLER_METRIC_FIELDS = set(CONTROLLER_EVENT_COLUMNS) - {"timestamp", "request_label", "event"}
-BACKEND_METRIC_FIELDS = set(BACKEND_EVENT_COLUMNS) - {"timestamp", "pod", "event"}
 
 KEY_VALUE_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\"[^\"]*\"|'[^']*'|[^\s]+)")
 EVENT_TAG_RE = re.compile(r"^\[(?P<tag>[^\]]+)\](?:\s+(?P<rest>.*))?$")
@@ -296,8 +257,6 @@ def parse_message_fields(message: str, level: str = "") -> Tuple[str, str, str, 
             value = value[1:-1]
         value = value.rstrip(",")
         fields[item.group("key")] = value
-    if "frontend" not in fields and "frontend_pod" in fields:
-        fields["frontend"] = fields["frontend_pod"]
     return component, event, body.strip(), fields
 
 
@@ -309,8 +268,8 @@ def identify_module(labels: Dict[str, object], pod_name: str, container_name: st
 
     if app_label == "controller":
         return "controller"
-    if app_label == "backend-pool":
-        return "backend"
+    if app_label == "warm-pod-pool":
+        return "compute"
     if app_label == "controller-queue-redis":
         return "redis"
     if app_label == "fluent-bit":
@@ -319,8 +278,8 @@ def identify_module(labels: Dict[str, object], pod_name: str, container_name: st
         return "dcusshk8s"
     if pod_name.startswith("controller-"):
         return "controller"
-    if pod_name.startswith("backend-general-") or container_name == "backend-agent":
-        return "backend"
+    if pod_name.startswith("compute-general-") or container_name == "compute-agent":
+        return "compute"
     if pod_name.startswith("ssh-") or "kubessh" in container_value or "kubessh" in pod_value:
         return "dcusshk8s"
     if pod_name.startswith("controller-queue-redis-") or container_name == "redis":
@@ -368,6 +327,9 @@ def parse_fluent_bit_record(line: str, source_file: Path, bucket_seconds: int) -
     level, message = normalize_message_level(str(app_log.get("level") or app_log.get("levelname") or ""), message)
     component, event, message_body, fields = parse_message_fields(message, level)
     module = identify_module(labels, pod_name, container_name)
+    compute_pod = fields.get("compute_pod") or ""
+    if module == "compute" and not compute_pod:
+        compute_pod = pod_name
 
     row = {column: "" for column in TIMELINE_COLUMNS}
     row.update(
@@ -376,6 +338,7 @@ def parse_fluent_bit_record(line: str, source_file: Path, bucket_seconds: int) -
             "_ts_ms": str(int(dt.timestamp() * 1000)),
             "node": str(kubernetes.get("host") or kubernetes.get("node_name") or ""),
             "pod": pod_name,
+            "compute_pod": compute_pod,
             "module": module,
             "level": level,
             "request_label": str(app_log.get("request_label") or ""),
@@ -436,34 +399,16 @@ def write_resource_timelines(events: List[Dict[str, str]], resource_dir: Path) -
         print(f"wrote {path}")
 
 
-def has_any_field(row: Dict[str, str], fields: set) -> bool:
-    return any(str(row.get(field) or "") for field in fields)
-
-
-def controller_event_rows(events: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
-    for event in events:
-        if event.get("module") != "controller":
-            continue
-        if not has_any_field(event, CONTROLLER_METRIC_FIELDS):
-            continue
-        rows.append({column: str(event.get(column) or "") for column in CONTROLLER_EVENT_COLUMNS})
-    return rows
-
-
-def backend_event_rows(events: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
-    for event in events:
-        if event.get("module") != "backend":
-            continue
-        if not has_any_field(event, BACKEND_METRIC_FIELDS):
-            continue
-        rows.append({column: str(event.get(column) or "") for column in BACKEND_EVENT_COLUMNS})
-    return rows
+def remove_stale_event_csvs(out_dir: Path) -> None:
+    for name in ("controller_events.csv", "compute_events.csv"):
+        path = out_dir / name
+        if path.exists():
+            path.unlink()
 
 
 def write_analysis_outputs(raw_dir: Path, out_dir: Path, bucket_seconds: int) -> None:
     log_paths = iter_input_paths([str(raw_dir)])
+    remove_stale_event_csvs(out_dir)
     if not log_paths:
         print("No JSONL files were found. Generate a request first, then run this command again.")
         return
@@ -477,12 +422,8 @@ def write_analysis_outputs(raw_dir: Path, out_dir: Path, bucket_seconds: int) ->
         timeline_rows.append(row)
     write_csv(out_dir / "timeline.csv", timeline_rows, TIMELINE_COLUMNS)
     write_resource_timelines(events, out_dir / "timeline_by_resource")
-    write_csv(out_dir / "controller_events.csv", controller_event_rows(events), CONTROLLER_EVENT_COLUMNS)
-    write_csv(out_dir / "backend_events.csv", backend_event_rows(events), BACKEND_EVENT_COLUMNS)
 
     print(f"wrote {out_dir / 'timeline.csv'}")
-    print(f"wrote {out_dir / 'controller_events.csv'}")
-    print(f"wrote {out_dir / 'backend_events.csv'}")
 
 
 def reader_pod_overrides(pvc_name: str, reader_image: str) -> str:

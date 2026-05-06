@@ -9,6 +9,6 @@ urlpatterns = [
     path('ticket/<str:ticket_id>/cancel/', views.cancel_ticket, name='cancel_ticket'),
     path('pool/status/', views.pool_status, name='pool_status'),
     path('pool/initialize/', views.initialize_pool, name='initialize_pool'),
-    path('pool/release/', views.release_backend, name='release_backend'),
+    path('compute/release/', views.release_compute_pod, name='release_compute_pod'),
     path('pool/check-stale/', views.check_stale, name='check_stale'),
 ]

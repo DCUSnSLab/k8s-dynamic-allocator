@@ -2,7 +2,7 @@
 Mount Manager (Chroot Version)
 
 - SSHFS 원격 마운트 및 Mount Namespace 프로세스 격리 모듈
-- Target Frontend Pod 파일시스템 바인딩 및 세션 종료 시의 자동 Cleanup 환경 제어
+- Target User Pod 파일시스템 바인딩 및 세션 종료 시의 자동 Cleanup 환경 제어
 """
 
 import logging
@@ -30,7 +30,7 @@ DEFAULT_HOME = f"/home/{DEFAULT_USER}"
 BIND_MOUNT_TARGETS = ["proc", "sys", "dev", "usr/lib/sudo"]
 
 
-class MountManager:
+class WorkspaceConnector:
     """
     SSHFS 마운트 및 Namespace 관리자
     """
@@ -38,10 +38,10 @@ class MountManager:
     CHROOT_PATH = "/mnt/chroot"
     
     def __init__(self) -> None:
-        self.frontend_ip: Optional[str] = None
+        self.user_pod_ip: Optional[str] = None
 
-    async def mount(self, frontend_ip: str, frontend_pod: Optional[str] = None) -> bool:
-        self.frontend_ip = frontend_ip
+    async def mount(self, user_pod_ip: str, user_pod: Optional[str] = None) -> bool:
+        self.user_pod_ip = user_pod_ip
         return True
 
     def setup_ssh_key(self) -> bool:
@@ -84,7 +84,7 @@ class MountManager:
 
     async def unmount(self) -> bool:
         """Namespace 사용으로 프로세스 종료 시 자동 정리, IP만 리셋"""
-        self.frontend_ip = None
+        self.user_pod_ip = None
         return True
 
     @staticmethod
@@ -95,20 +95,20 @@ class MountManager:
             raise OSError("Failed to set mount propagation to private")
 
     @staticmethod
-    def _mount_sshfs(frontend_ip: str) -> None:
-        os.makedirs(MountManager.CHROOT_PATH, exist_ok=True)
+    def _mount_sshfs(user_pod_ip: str) -> None:
+        os.makedirs(WorkspaceConnector.CHROOT_PATH, exist_ok=True)
         sshfs_result = subprocess.run(
             [
                 "sshfs",
-                f"{DEFAULT_USER}@{frontend_ip}:/",
-                MountManager.CHROOT_PATH,
+                f"{DEFAULT_USER}@{user_pod_ip}:/",
+                WorkspaceConnector.CHROOT_PATH,
                 "-o", "allow_other,suid,StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null",
                 "-o", "sftp_server=/usr/bin/sudo /usr/lib/openssh/sftp-server",
             ],
             capture_output=True,
         )
         if sshfs_result.returncode != 0:
-            raise OSError(f"Failed to mount SSHFS from {frontend_ip}: {sshfs_result.stderr.decode(errors='replace')}")
+            raise OSError(f"Failed to mount SSHFS from {user_pod_ip}: {sshfs_result.stderr.decode(errors='replace')}")
 
     @staticmethod
     def _setup_secure_sudo(libc: Any) -> None:
@@ -124,7 +124,7 @@ class MountManager:
             shutil.copy(local_sudo, target_sudo_tmp)
             os.chmod(target_sudo_tmp, SUID_PERMISSION)
 
-        final_sudo_target_str = f"{MountManager.CHROOT_PATH}/usr/bin/sudo"
+        final_sudo_target_str = f"{WorkspaceConnector.CHROOT_PATH}/usr/bin/sudo"
         final_sudo_target = final_sudo_target_str.encode('utf-8')
 
         if not os.path.exists(final_sudo_target):
@@ -145,7 +145,7 @@ class MountManager:
     def _bind_mount_filesystems(libc: Any) -> None:
         for d in BIND_MOUNT_TARGETS:
             src = f"/{d}".encode('utf-8')
-            target = f"{MountManager.CHROOT_PATH}/{d}".encode('utf-8')
+            target = f"{WorkspaceConnector.CHROOT_PATH}/{d}".encode('utf-8')
             source_path = f"/{d}"
 
             if not os.path.exists(source_path):
@@ -167,7 +167,7 @@ class MountManager:
     @staticmethod
     def _fix_hostname(libc: Any) -> None:
         try:
-            chroot_hosts = f"{MountManager.CHROOT_PATH}/etc/hosts"
+            chroot_hosts = f"{WorkspaceConnector.CHROOT_PATH}/etc/hosts"
             temp_hosts = "/tmp/hosts_overlay"
 
             hosts_content = ""
@@ -190,7 +190,7 @@ class MountManager:
     @staticmethod
     def _fix_apt_sandbox() -> None:
         try:
-            apt_conf_d = f"{MountManager.CHROOT_PATH}/etc/apt/apt.conf.d"
+            apt_conf_d = f"{WorkspaceConnector.CHROOT_PATH}/etc/apt/apt.conf.d"
             apt_conf_file = f"{apt_conf_d}/99nosandbox"
             if os.path.exists(apt_conf_d):
                 with open(apt_conf_file, 'w') as f:
@@ -200,7 +200,7 @@ class MountManager:
 
     @staticmethod
     def _enter_chroot_and_drop_privileges(cwd: str) -> None:
-        os.chroot(MountManager.CHROOT_PATH)
+        os.chroot(WorkspaceConnector.CHROOT_PATH)
 
         try:
             os.chdir(cwd)
@@ -214,9 +214,9 @@ class MountManager:
         os.environ["USER"] = DEFAULT_USER
 
     @staticmethod
-    def setup_chroot_namespace(frontend_ip: str, cwd: str = DEFAULT_HOME) -> None:
+    def setup_chroot_namespace(user_pod_ip: str, cwd: str = DEFAULT_HOME) -> None:
         """
-        Mount Namespace 생성 기반 Frontend Pod 대상 SSHFS 격리 마운트 (Chroot)
+        Mount Namespace 생성 기반 User Pod 대상 SSHFS 격리 마운트 (Chroot)
 
         - 호출 시점: Subprocess 생성 시 preexec_fn
         - 영향 범위: 호스트(부모)가 아닌 분기된 자식 세션 프로세스의 네임스페이스 한정
@@ -225,13 +225,13 @@ class MountManager:
             import ctypes
             libc = ctypes.CDLL(None)
 
-            MountManager._create_mount_namespace(libc)
-            MountManager._mount_sshfs(frontend_ip)
-            MountManager._bind_mount_filesystems(libc)
-            MountManager._setup_secure_sudo(libc)
-            MountManager._fix_hostname(libc)
-            MountManager._fix_apt_sandbox()
-            MountManager._enter_chroot_and_drop_privileges(cwd)
+            WorkspaceConnector._create_mount_namespace(libc)
+            WorkspaceConnector._mount_sshfs(user_pod_ip)
+            WorkspaceConnector._bind_mount_filesystems(libc)
+            WorkspaceConnector._setup_secure_sudo(libc)
+            WorkspaceConnector._fix_hostname(libc)
+            WorkspaceConnector._fix_apt_sandbox()
+            WorkspaceConnector._enter_chroot_and_drop_privileges(cwd)
 
         except Exception as e:
             print(f"Error in setup_chroot_namespace: {e}", file=sys.stderr)

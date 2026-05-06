@@ -30,8 +30,8 @@ from .tickets import (
 logger = logging.getLogger(__name__)
 
 
-class BackendQueues:
-    """Redis-backed backend-type queues and ticket facade."""
+class ComputeQueues:
+    """Redis-backed compute-type queues and ticket facade."""
 
     FINAL_STATES = Tickets.FINAL_STATES
     ACTIVE_STATES = Tickets.ACTIVE_STATES
@@ -41,20 +41,20 @@ class BackendQueues:
         self,
         redis_url: Optional[str] = None,
         prefix: Optional[str] = None,
-        default_backend_type: Optional[str] = None,
+        default_compute_type: Optional[str] = None,
         lock_ttl_seconds: Optional[int] = None,
         wait_timeout_seconds: Optional[int] = None,
         ticket_ttl_seconds: Optional[int] = None,
         allocating_ttl_seconds: Optional[int] = None,
         assigned_context_ttl_seconds: Optional[int] = None,
-        backend_available_ttl_seconds: Optional[int] = None,
+        compute_available_ttl_seconds: Optional[int] = None,
         max_retries: Optional[int] = None,
         worker_identity: Optional[str] = None,
     ):
         self.redis_url = redis_url or settings.REDIS_URL
         self.prefix = prefix or settings.WAIT_QUEUE_PREFIX
-        self.default_backend_type = (
-            (default_backend_type or settings.DEFAULT_BACKEND_TYPE).strip().lower() or "general"
+        self.default_compute_type = (
+            (default_compute_type or settings.DEFAULT_COMPUTE_TYPE).strip().lower() or "general"
         )
         self.lock_ttl_seconds = lock_ttl_seconds or settings.WAIT_QUEUE_LOCK_TTL_SECONDS
         self.wait_timeout_seconds = wait_timeout_seconds or settings.WAIT_QUEUE_TIMEOUT_SECONDS
@@ -63,8 +63,8 @@ class BackendQueues:
         self.assigned_context_ttl_seconds = (
             assigned_context_ttl_seconds or settings.ASSIGNED_CONTEXT_TTL_SECONDS
         )
-        self.backend_available_ttl_seconds = (
-            backend_available_ttl_seconds or settings.BACKEND_AVAILABLE_TTL_SECONDS
+        self.compute_available_ttl_seconds = (
+            compute_available_ttl_seconds or settings.COMPUTE_AVAILABLE_TTL_SECONDS
         )
         self.max_retries = max_retries or settings.WAIT_QUEUE_MAX_RETRIES
         self.worker_identity = worker_identity or os.getenv("HOSTNAME", "controller-unknown")
@@ -72,31 +72,31 @@ class BackendQueues:
         self._client_lock = threading.Lock()
         self.tickets = Tickets(self)
 
-    def normalize_backend_type(self, backend_type: Optional[str]) -> str:
-        value = (backend_type or self.default_backend_type).strip().lower()
-        return value or self.default_backend_type
+    def normalize_compute_type(self, compute_type: Optional[str]) -> str:
+        value = (compute_type or self.default_compute_type).strip().lower()
+        return value or self.default_compute_type
 
-    def validate_backend_type(
+    def validate_compute_type(
         self,
-        backend_type: Optional[str],
-        known_backend_types: Optional[Iterable[str]] = None,
+        compute_type: Optional[str],
+        known_compute_types: Optional[Iterable[str]] = None,
     ) -> str:
-        value = self.normalize_backend_type(backend_type)
-        if known_backend_types is None:
-            known_backend_types = self.known_backend_types()
+        value = self.normalize_compute_type(compute_type)
+        if known_compute_types is None:
+            known_compute_types = self.known_compute_types()
 
         normalized_known = []
-        for item in known_backend_types:
-            normalized = self.normalize_backend_type(item)
+        for item in known_compute_types:
+            normalized = self.normalize_compute_type(item)
             if normalized not in normalized_known:
                 normalized_known.append(normalized)
 
         if not normalized_known:
-            normalized_known = [self.default_backend_type]
+            normalized_known = [self.default_compute_type]
 
         if value not in normalized_known:
             raise ValueError(
-                f"Unknown backend_type '{value}'. Known backend types: {', '.join(sorted(normalized_known))}"
+                f"Unknown compute_type '{value}'. Known compute types: {', '.join(sorted(normalized_known))}"
             )
         return value
 
@@ -115,58 +115,58 @@ class BackendQueues:
                 )
             return self._client
 
-    def _queue_key(self, backend_type: str) -> str:
-        return f"{self.prefix}:queue:{backend_type}"
+    def _queue_key(self, compute_type: str) -> str:
+        return f"{self.prefix}:queue:{compute_type}"
 
     def _ticket_key(self, ticket_id: str) -> str:
         return f"{self.prefix}:ticket:{ticket_id}"
 
-    def _active_key(self, backend_type: str) -> str:
-        return f"{self.prefix}:active:{backend_type}"
+    def _active_key(self, compute_type: str) -> str:
+        return f"{self.prefix}:active:{compute_type}"
 
     def _types_key(self) -> str:
         return f"{self.prefix}:types"
 
-    def _lock_key(self, backend_type: str) -> str:
-        return f"{self.prefix}:lock:{backend_type}"
+    def _lock_key(self, compute_type: str) -> str:
+        return f"{self.prefix}:lock:{compute_type}"
 
-    def _assigned_request_key(self, backend_pod: str) -> str:
-        return f"{self.prefix}:assigned-request:{backend_pod}"
+    def _assigned_request_key(self, compute_pod: str) -> str:
+        return f"{self.prefix}:assigned-request:{compute_pod}"
 
-    def _backend_ticket_key(self, backend_pod: str) -> str:
-        return f"{self.prefix}:backend-ticket:{backend_pod}"
+    def _compute_ticket_key(self, compute_pod: str) -> str:
+        return f"{self.prefix}:compute-ticket:{compute_pod}"
 
-    def _backend_available_key(self, backend_pod: str) -> str:
-        return f"{self.prefix}:backend-available:{backend_pod}"
+    def _compute_available_key(self, compute_pod: str) -> str:
+        return f"{self.prefix}:compute-available:{compute_pod}"
 
-    def record_backend_available(self, backend_pod: str, backend_available_at: Optional[str] = None) -> bool:
-        backend_pod_value = (backend_pod or "").strip()
-        if not backend_pod_value:
+    def record_compute_available(self, compute_pod: str, compute_available_at: Optional[str] = None) -> bool:
+        compute_pod_value = (compute_pod or "").strip()
+        if not compute_pod_value:
             return False
 
-        observed_at = backend_available_at or _iso_now()
+        observed_at = compute_available_at or _iso_now()
         client = self._redis_client()
         try:
             return bool(
                 client.set(
-                    self._backend_available_key(backend_pod_value),
+                    self._compute_available_key(compute_pod_value),
                     observed_at,
                     nx=True,
-                    ex=max(1, int(self.backend_available_ttl_seconds)),
+                    ex=max(1, int(self.compute_available_ttl_seconds)),
                 )
             )
         except RedisError as exc:
             raise QueueUnavailableError(
-                f"Failed to record backend availability for {backend_pod_value}: {exc}"
+                f"Failed to record compute availability for {compute_pod_value}: {exc}"
             ) from exc
 
-    def pop_backend_available_at(self, backend_pod: str) -> str:
-        backend_pod_value = (backend_pod or "").strip()
-        if not backend_pod_value:
+    def pop_compute_available_at(self, compute_pod: str) -> str:
+        compute_pod_value = (compute_pod or "").strip()
+        if not compute_pod_value:
             return ""
 
         client = self._redis_client()
-        key = self._backend_available_key(backend_pod_value)
+        key = self._compute_available_key(compute_pod_value)
         try:
             pipe = client.pipeline(transaction=True)
             pipe.get(key)
@@ -175,13 +175,13 @@ class BackendQueues:
             return value or ""
         except RedisError as exc:
             raise QueueUnavailableError(
-                f"Failed to pop backend availability for {backend_pod_value}: {exc}"
+                f"Failed to pop compute availability for {compute_pod_value}: {exc}"
             ) from exc
 
-    def register_backend_types(self, backend_types: Iterable[str]) -> List[str]:
+    def register_compute_types(self, compute_types: Iterable[str]) -> List[str]:
         normalized = []
-        for backend_type in backend_types:
-            value = self.normalize_backend_type(backend_type)
+        for compute_type in compute_types:
+            value = self.normalize_compute_type(compute_type)
             if value not in normalized:
                 normalized.append(value)
 
@@ -193,22 +193,22 @@ class BackendQueues:
             client.sadd(self._types_key(), *normalized)
             return normalized
         except RedisError as exc:
-            raise QueueUnavailableError(f"Failed to register backend types: {exc}") from exc
+            raise QueueUnavailableError(f"Failed to register compute types: {exc}") from exc
 
-    def known_backend_types(self) -> List[str]:
+    def known_compute_types(self) -> List[str]:
         client = self._redis_client()
         try:
             values = client.smembers(self._types_key())
             if not values:
-                return [self.default_backend_type]
-            return sorted(self.normalize_backend_type(value) for value in values if value)
+                return [self.default_compute_type]
+            return sorted(self.normalize_compute_type(value) for value in values if value)
         except RedisError as exc:
-            raise QueueUnavailableError(f"Failed to read backend types: {exc}") from exc
+            raise QueueUnavailableError(f"Failed to read compute types: {exc}") from exc
 
-    def has_queued_tickets(self, backend_type: str) -> bool:
-        backend_type_value = self.normalize_backend_type(backend_type)
-        self._repair_queue_membership(backend_type_value)
-        for ticket_id in self._queue_ids(backend_type_value):
+    def has_queued_tickets(self, compute_type: str) -> bool:
+        compute_type_value = self.normalize_compute_type(compute_type)
+        self._repair_queue_membership(compute_type_value)
+        for ticket_id in self._queue_ids(compute_type_value):
             ticket = self.tickets.get_ticket_raw(ticket_id)
             if not ticket:
                 continue
@@ -216,32 +216,32 @@ class BackendQueues:
                 return True
         return False
 
-    def backend_types_with_queued_tickets(self) -> List[str]:
+    def compute_types_with_queued_tickets(self) -> List[str]:
         queued_types = []
-        for backend_type in self.known_backend_types():
-            backend_type_value = self.normalize_backend_type(backend_type)
-            if self.has_queued_tickets(backend_type_value):
-                queued_types.append(backend_type_value)
+        for compute_type in self.known_compute_types():
+            compute_type_value = self.normalize_compute_type(compute_type)
+            if self.has_queued_tickets(compute_type_value):
+                queued_types.append(compute_type_value)
         return sorted(set(queued_types))
 
-    def mark_backend_unavailable_started(self, backend_type: str) -> int:
-        backend_type_value = self.normalize_backend_type(backend_type)
+    def mark_compute_unavailable_started(self, compute_type: str) -> int:
+        compute_type_value = self.normalize_compute_type(compute_type)
         now = _iso_now()
         client = self._redis_client()
         marked = 0
         try:
             pipe = client.pipeline(transaction=False)
-            for ticket_id in self._queue_ids(backend_type_value):
+            for ticket_id in self._queue_ids(compute_type_value):
                 raw = self.tickets.get_ticket_raw(ticket_id)
                 if not raw:
                     continue
                 if str(raw.get("status") or "").lower() != "queued":
                     continue
-                if raw.get("backend_unavailable_started_at"):
+                if raw.get("compute_unavailable_started_at"):
                     continue
                 pipe.hsetnx(
                     self._ticket_key(ticket_id),
-                    "backend_unavailable_started_at",
+                    "compute_unavailable_started_at",
                     now,
                 )
                 pipe.expire(self._ticket_key(ticket_id), self.ticket_ttl_seconds)
@@ -251,13 +251,13 @@ class BackendQueues:
             return marked
         except RedisError as exc:
             raise QueueUnavailableError(
-                f"Failed to mark backend unavailable start for {backend_type_value}: {exc}"
+                f"Failed to mark compute unavailable start for {compute_type_value}: {exc}"
             ) from exc
 
-    def _queue_position_snapshot(self, ticket_id: str, backend_type: str) -> Optional[int]:
-        backend_type_value = self.normalize_backend_type(backend_type)
+    def _queue_position_snapshot(self, ticket_id: str, compute_type: str) -> Optional[int]:
+        compute_type_value = self.normalize_compute_type(compute_type)
         position = 0
-        for current_ticket_id in self._queue_ids(backend_type_value):
+        for current_ticket_id in self._queue_ids(compute_type_value):
             current = self.tickets.get_ticket_raw(current_ticket_id)
             if not current:
                 continue
@@ -272,22 +272,22 @@ class BackendQueues:
         ticket = self.tickets.get_ticket_raw(ticket_id)
         if not ticket:
             return None
-        backend_type = self.normalize_backend_type(ticket.get("backend_type"))
-        self._repair_queue_membership(backend_type)
+        compute_type = self.normalize_compute_type(ticket.get("compute_type"))
+        self._repair_queue_membership(compute_type)
         client = self._redis_client()
-        queue_ids = self._queue_ids(backend_type)
+        queue_ids = self._queue_ids(compute_type)
         position = 0
         for current_ticket_id in queue_ids:
             current = self.tickets.get_ticket_raw(current_ticket_id)
             if not current:
-                self._remove_ticket_from_queue(backend_type, current_ticket_id)
-                client.srem(self._active_key(backend_type), current_ticket_id)
+                self._remove_ticket_from_queue(compute_type, current_ticket_id)
+                client.srem(self._active_key(compute_type), current_ticket_id)
                 continue
 
             status = current.get("status", "")
             if status in self.FINAL_STATES:
-                self._remove_ticket_from_queue(backend_type, current_ticket_id)
-                client.srem(self._active_key(backend_type), current_ticket_id)
+                self._remove_ticket_from_queue(compute_type, current_ticket_id)
+                client.srem(self._active_key(compute_type), current_ticket_id)
                 continue
             if status == "queued":
                 position += 1
@@ -295,35 +295,35 @@ class BackendQueues:
                     return position
         return None
 
-    def _queue_ids(self, backend_type: str) -> List[str]:
+    def _queue_ids(self, compute_type: str) -> List[str]:
         client = self._redis_client()
         try:
-            return client.lrange(self._queue_key(backend_type), 0, -1)
+            return client.lrange(self._queue_key(compute_type), 0, -1)
         except RedisError as exc:
-            raise QueueUnavailableError(f"Failed to read queue {backend_type}: {exc}") from exc
+            raise QueueUnavailableError(f"Failed to read queue {compute_type}: {exc}") from exc
 
-    def _active_ticket_ids(self, backend_type: str) -> List[str]:
+    def _active_ticket_ids(self, compute_type: str) -> List[str]:
         client = self._redis_client()
         try:
-            return sorted(client.smembers(self._active_key(backend_type)))
+            return sorted(client.smembers(self._active_key(compute_type)))
         except RedisError as exc:
-            raise QueueUnavailableError(f"Failed to read active tickets for {backend_type}: {exc}") from exc
+            raise QueueUnavailableError(f"Failed to read active tickets for {compute_type}: {exc}") from exc
 
-    def _queue_contains(self, client, backend_type: str, ticket_id: str) -> bool:
+    def _queue_contains(self, client, compute_type: str, ticket_id: str) -> bool:
         try:
-            return client.lpos(self._queue_key(backend_type), ticket_id) is not None
+            return client.lpos(self._queue_key(compute_type), ticket_id) is not None
         except (AttributeError, RedisError):
             try:
-                return ticket_id in client.lrange(self._queue_key(backend_type), 0, -1)
+                return ticket_id in client.lrange(self._queue_key(compute_type), 0, -1)
             except RedisError as exc:
                 raise QueueUnavailableError(
-                    f"Failed to inspect queue {backend_type} for ticket {ticket_id}: {exc}"
+                    f"Failed to inspect queue {compute_type} for ticket {ticket_id}: {exc}"
                 ) from exc
 
-    def _repair_queue_membership(self, backend_type: str) -> None:
+    def _repair_queue_membership(self, compute_type: str) -> None:
         client = self._redis_client()
-        queue_key = self._queue_key(backend_type)
-        active_key = self._active_key(backend_type)
+        queue_key = self._queue_key(compute_type)
+        active_key = self._active_key(compute_type)
         try:
             active_ids = list(client.smembers(active_key))
             for ticket_id in active_ids:
@@ -340,41 +340,41 @@ class BackendQueues:
                     continue
 
                 if status in self.ACTIVE_STATES:
-                    if not self._queue_contains(client, backend_type, ticket_id):
+                    if not self._queue_contains(client, compute_type, ticket_id):
                         client.rpush(queue_key, ticket_id)
                     client.sadd(active_key, ticket_id)
                 else:
                     client.srem(active_key, ticket_id)
                     client.lrem(queue_key, 0, ticket_id)
         except RedisError as exc:
-            raise QueueUnavailableError(f"Failed to repair queue state for {backend_type}: {exc}") from exc
+            raise QueueUnavailableError(f"Failed to repair queue state for {compute_type}: {exc}") from exc
 
-    def _snapshot_ticket_ids(self, backend_type: str) -> List[str]:
-        backend_type_value = self.normalize_backend_type(backend_type)
+    def _snapshot_ticket_ids(self, compute_type: str) -> List[str]:
+        compute_type_value = self.normalize_compute_type(compute_type)
         ordered: List[str] = []
         seen = set()
-        for ticket_id in self._queue_ids(backend_type_value):
+        for ticket_id in self._queue_ids(compute_type_value):
             if ticket_id and ticket_id not in seen:
                 seen.add(ticket_id)
                 ordered.append(ticket_id)
-        for ticket_id in self._active_ticket_ids(backend_type_value):
+        for ticket_id in self._active_ticket_ids(compute_type_value):
             if ticket_id and ticket_id not in seen:
                 seen.add(ticket_id)
                 ordered.append(ticket_id)
         return ordered
 
-    def list_waiting_frontends(
+    def list_waiting_users(
         self,
-        backend_type: str,
+        compute_type: str,
         *,
         now_ms: Optional[int] = None,
     ) -> Dict[str, object]:
-        backend_type_value = self.normalize_backend_type(backend_type)
+        compute_type_value = self.normalize_compute_type(compute_type)
         now_ms_value = now_ms if now_ms is not None else int(_utc_now().timestamp() * 1000)
-        waiting_frontends: List[Dict[str, object]] = []
+        waiting_users: List[Dict[str, object]] = []
         queue_position = 0
 
-        for ticket_id in self._queue_ids(backend_type_value):
+        for ticket_id in self._queue_ids(compute_type_value):
             raw = self.tickets.get_ticket_raw(ticket_id)
             if not raw:
                 continue
@@ -390,9 +390,9 @@ class BackendQueues:
                     created_ms = int(created_at.timestamp() * 1000)
 
             wait_ms = max(0, now_ms_value - created_ms) if created_ms else None
-            waiting_frontends.append(
+            waiting_users.append(
                 {
-                    "frontend_pod": (raw.get("frontend_pod") or "").strip(),
+                    "user_pod": (raw.get("user_pod") or "").strip(),
                     "ticket_id": ticket_id,
                     "queue_position": queue_position,
                     "wait_ms": wait_ms,
@@ -400,31 +400,31 @@ class BackendQueues:
             )
 
         return {
-            "backend_type": backend_type_value,
-            "queued_count": len(waiting_frontends),
-            "waiting_frontends": waiting_frontends,
+            "compute_type": compute_type_value,
+            "queued_count": len(waiting_users),
+            "waiting_users": waiting_users,
         }
 
-    def acquire_allocator_lock(self, backend_type: str, owner: Optional[str] = None) -> Optional[str]:
-        backend_type_value = self.normalize_backend_type(backend_type)
+    def acquire_allocator_lock(self, compute_type: str, owner: Optional[str] = None) -> Optional[str]:
+        compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()
         token = owner or uuid.uuid4().hex
         try:
             acquired = client.set(
-                self._lock_key(backend_type_value),
+                self._lock_key(compute_type_value),
                 token,
                 nx=True,
                 ex=self.lock_ttl_seconds,
             )
             return token if acquired else None
         except RedisError as exc:
-            raise QueueUnavailableError(f"Failed to acquire lock for {backend_type_value}: {exc}") from exc
+            raise QueueUnavailableError(f"Failed to acquire lock for {compute_type_value}: {exc}") from exc
 
-    def release_allocator_lock(self, backend_type: str, token: Optional[str]) -> bool:
+    def release_allocator_lock(self, compute_type: str, token: Optional[str]) -> bool:
         if not token:
             return False
 
-        backend_type_value = self.normalize_backend_type(backend_type)
+        compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()
         release_script = """
         if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -433,10 +433,10 @@ class BackendQueues:
         return 0
         """
         try:
-            result = client.eval(release_script, 1, self._lock_key(backend_type_value), token)
+            result = client.eval(release_script, 1, self._lock_key(compute_type_value), token)
             return bool(result)
         except RedisError as exc:
-            raise QueueUnavailableError(f"Failed to release lock for {backend_type_value}: {exc}") from exc
+            raise QueueUnavailableError(f"Failed to release lock for {compute_type_value}: {exc}") from exc
 
     def is_allocation_stale(self, ticket: Dict[str, object]) -> bool:
         allocation_deadline = ticket.get("allocation_deadline")
@@ -450,8 +450,8 @@ class BackendQueues:
             return wait_deadline <= _utc_now()
         return False
 
-    def find_stale_allocating_tickets(self, backend_type: Optional[str] = None) -> List[Dict[str, object]]:
-        types = [self.normalize_backend_type(backend_type)] if backend_type else self.known_backend_types()
+    def find_stale_allocating_tickets(self, compute_type: Optional[str] = None) -> List[Dict[str, object]]:
+        types = [self.normalize_compute_type(compute_type)] if compute_type else self.known_compute_types()
         stale: List[Dict[str, object]] = []
         for type_name in types:
             for ticket_id in self._active_ticket_ids(type_name):
@@ -463,23 +463,23 @@ class BackendQueues:
         stale.sort(key=lambda item: item.get("created_at") or _utc_now())
         return stale
 
-    def claim_next_ticket(self, backend_type: str, worker_id: Optional[str] = None) -> Optional[Dict[str, object]]:
-        backend_type_value = self.normalize_backend_type(backend_type)
+    def claim_next_ticket(self, compute_type: str, worker_id: Optional[str] = None) -> Optional[Dict[str, object]]:
+        compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()
         worker_name = worker_id or self.worker_identity
-        self._repair_queue_membership(backend_type_value)
+        self._repair_queue_membership(compute_type_value)
 
-        for ticket_id in self._queue_ids(backend_type_value):
+        for ticket_id in self._queue_ids(compute_type_value):
             ticket = self.tickets.get_ticket(ticket_id)
             if not ticket:
-                self._remove_ticket_from_queue(backend_type_value, ticket_id)
-                client.srem(self._active_key(backend_type_value), ticket_id)
+                self._remove_ticket_from_queue(compute_type_value, ticket_id)
+                client.srem(self._active_key(compute_type_value), ticket_id)
                 continue
 
             status = ticket.get("status")
             if status in self.FINAL_STATES:
-                self._remove_ticket_from_queue(backend_type_value, ticket_id)
-                client.srem(self._active_key(backend_type_value), ticket_id)
+                self._remove_ticket_from_queue(compute_type_value, ticket_id)
+                client.srem(self._active_key(compute_type_value), ticket_id)
                 continue
             if status != "queued":
                 continue
@@ -492,7 +492,7 @@ class BackendQueues:
             allocation_deadline = (_utc_now() + timedelta(seconds=self.allocating_ttl_seconds)).isoformat()
             ticket = self.tickets._ticket_transition(
                 ticket_id,
-                backend_type=backend_type_value,
+                compute_type=compute_type_value,
                 expected_statuses={"queued"},
                 updates={
                     "status": "allocating",
@@ -511,9 +511,9 @@ class BackendQueues:
 
         return None
 
-    def _remove_ticket_from_queue(self, backend_type: str, ticket_id: str) -> None:
+    def _remove_ticket_from_queue(self, compute_type: str, ticket_id: str) -> None:
         client = self._redis_client()
         try:
-            client.lrem(self._queue_key(backend_type), 0, ticket_id)
+            client.lrem(self._queue_key(compute_type), 0, ticket_id)
         except RedisError as exc:
-            raise QueueUnavailableError(f"Failed to remove ticket {ticket_id} from queue {backend_type}: {exc}") from exc
+            raise QueueUnavailableError(f"Failed to remove ticket {ticket_id} from queue {compute_type}: {exc}") from exc

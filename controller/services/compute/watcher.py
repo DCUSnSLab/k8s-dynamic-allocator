@@ -1,4 +1,4 @@
-"""Leader-only backend availability watch."""
+"""Leader-only compute availability watch."""
 
 import logging
 import threading
@@ -11,8 +11,8 @@ from kubernetes.client.rest import ApiException
 logger = logging.getLogger(__name__)
 
 
-class BackendAvailabilityWatcher:
-    """Watch backend pods and wake queue processing when a Ready backend appears."""
+class ComputeAvailabilityWatcher:
+    """Watch compute pods and wake queue processing when a Ready compute pod appears."""
 
     def __init__(
         self,
@@ -20,20 +20,20 @@ class BackendAvailabilityWatcher:
         v1,
         namespace: str,
         label_selector: str,
-        on_backend_available: Callable[[str, str, str, str], None],
+        on_compute_available: Callable[[str, str, str, str], None],
         enabled: bool = True,
         timeout_seconds: int = 60,
         retry_seconds: float = 1.0,
         app_label: str = "app",
-        app_value: str = "backend-pool",
+        app_value: str = "warm-pod-pool",
         status_label: str = "pool-status",
         available_status: str = "available",
-        backend_type_label: str = "backend-type",
+        compute_type_label: str = "compute-type",
     ):
         self.v1 = v1
         self.namespace = namespace
         self.label_selector = label_selector
-        self.on_backend_available = on_backend_available
+        self.on_compute_available = on_compute_available
         self.enabled = enabled
         self.timeout_seconds = max(1, int(timeout_seconds))
         self.retry_seconds = max(0.1, float(retry_seconds))
@@ -41,7 +41,7 @@ class BackendAvailabilityWatcher:
         self.app_value = app_value
         self.status_label = status_label
         self.available_status = available_status
-        self.backend_type_label = backend_type_label
+        self.compute_type_label = compute_type_label
 
         self._lock = threading.Lock()
         self._stop_event: Optional[threading.Event] = None
@@ -50,7 +50,7 @@ class BackendAvailabilityWatcher:
 
     def start(self) -> None:
         if not self.enabled:
-            logger.info("[BackendWatchDisabled]")
+            logger.info("[ComputeWatchDisabled]")
             return
 
         with self._lock:
@@ -62,14 +62,14 @@ class BackendAvailabilityWatcher:
             self._thread = threading.Thread(
                 target=self._run,
                 args=(stop_event,),
-                name="backend-availability-watch",
+                name="compute-availability-watch",
                 daemon=True,
             )
             self._stop_event = stop_event
             self._thread.start()
 
         logger.info(
-            "[BackendWatchStarted] namespace=%s label_selector=%s",
+            "[ComputeWatchStarted] namespace=%s label_selector=%s",
             self.namespace,
             self.label_selector,
         )
@@ -91,7 +91,7 @@ class BackendAvailabilityWatcher:
             try:
                 active_watch.stop()
             except Exception as exc:
-                logger.debug("[BackendWatchStopSkipped] reason=%r", str(exc))
+                logger.debug("[ComputeWatchStopSkipped] reason=%r", str(exc))
 
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(2.0, self.retry_seconds + 1.0))
@@ -104,7 +104,7 @@ class BackendAvailabilityWatcher:
             if self._watch is active_watch:
                 self._watch = None
 
-        logger.info("[BackendWatchStopped]")
+        logger.info("[ComputeWatchStopped]")
 
     def _run(self, stop_event: threading.Event) -> None:
         try:
@@ -133,14 +133,14 @@ class BackendAvailabilityWatcher:
                 except ApiException as exc:
                     if not stop_event.is_set():
                         logger.warning(
-                            "[Warning] operation=backend_watch error_type=k8s_api status=%s reason=%r",
+                            "[Warning] operation=compute_watch error_type=k8s_api status=%s reason=%r",
                             exc.status,
                             exc.reason,
                         )
                 except Exception as exc:
                     if not stop_event.is_set():
                         logger.warning(
-                            "[Warning] operation=backend_watch error_type=unexpected reason=%r",
+                            "[Warning] operation=compute_watch error_type=unexpected reason=%r",
                             str(exc),
                         )
                 finally:
@@ -168,9 +168,9 @@ class BackendAvailabilityWatcher:
             label_selector=self.label_selector,
         )
         for pod in pods.items:
-            backend_type, backend_pod = self._available_backend_info(pod)
-            if backend_type:
-                self._notify_backend_available(backend_type, backend_pod, source="snapshot")
+            compute_type, compute_pod = self._available_compute_info(pod)
+            if compute_type:
+                self._notify_compute_available(compute_type, compute_pod, source="snapshot")
         return getattr(getattr(pods, "metadata", None), "resource_version", "") or ""
 
     def _handle_event(self, event: dict) -> None:
@@ -182,24 +182,24 @@ class BackendAvailabilityWatcher:
         self._notify_if_available(pod)
 
     def _notify_if_available(self, pod) -> None:
-        backend_type, backend_pod = self._available_backend_info(pod)
-        if not backend_type:
+        compute_type, compute_pod = self._available_compute_info(pod)
+        if not compute_type:
             return
-        self._notify_backend_available(backend_type, backend_pod, source="watch")
+        self._notify_compute_available(compute_type, compute_pod, source="watch")
 
-    def _notify_backend_available(self, backend_type: str, backend_pod: str, source: str) -> None:
+    def _notify_compute_available(self, compute_type: str, compute_pod: str, source: str) -> None:
         observed_at = datetime.now(timezone.utc).isoformat()
         try:
-            self.on_backend_available(backend_type, backend_pod, observed_at, source)
+            self.on_compute_available(compute_type, compute_pod, observed_at, source)
         except Exception as exc:
             logger.warning(
-                "[Warning] operation=backend_watch_callback backend_type=%s backend_pod=%s reason=%r",
-                backend_type,
-                backend_pod,
+                "[Warning] operation=compute_watch_callback compute_type=%s compute_pod=%s reason=%r",
+                compute_type,
+                compute_pod,
                 str(exc),
             )
 
-    def _available_backend_info(self, pod) -> tuple[str, str]:
+    def _available_compute_info(self, pod) -> tuple[str, str]:
         metadata = getattr(pod, "metadata", None)
         status = getattr(pod, "status", None)
         if not metadata or not status:
@@ -212,8 +212,8 @@ class BackendAvailabilityWatcher:
             return "", ""
         if labels.get(self.status_label) != self.available_status:
             return "", ""
-        backend_type = labels.get(self.backend_type_label) or ""
-        if not backend_type:
+        compute_type = labels.get(self.compute_type_label) or ""
+        if not compute_type:
             return "", ""
         if getattr(status, "phase", None) != "Running":
             return "", ""
@@ -221,7 +221,7 @@ class BackendAvailabilityWatcher:
             return "", ""
         if not self._pod_is_ready(pod):
             return "", ""
-        return backend_type, getattr(metadata, "name", "") or ""
+        return compute_type, getattr(metadata, "name", "") or ""
 
     @staticmethod
     def _pod_is_ready(pod) -> bool:

@@ -1,7 +1,7 @@
 """
-TCP Terminal Server
+Session Handler
 
-- Controller 중계 없이 Frontend(WebTTY) 클라이언트 간 다이렉트 TCP 소켓 연결 서버
+- Controller 중계 없이 User(WebTTY) 클라이언트 간 다이렉트 TCP 소켓 연결 서버
 - PTY 모듈을 이용한 양방향 Raw 바이너리 TTY/Shell 에뮬레이션 전담
 """
 
@@ -21,7 +21,7 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from mount_manager import MountManager
+from workspace_connector import WorkspaceConnector
 
 logger = logging.getLogger(__name__)
 
@@ -30,23 +30,23 @@ TCP_KEEPINTVL = int(os.getenv("TCP_KEEPINTVL", "5"))
 TCP_KEEPCNT = int(os.getenv("TCP_KEEPCNT", "3"))
 
 
-class TCPTerminalServer:
+class SessionHandler:
     """
     TCP 기반 터미널 서버
 
-    - Frontend와 TCP로 직접 연결
+    - User와 TCP로 직접 연결
     - PTY를 통한 터미널 에뮬레이션
     - 실시간 입출력 전달, 터미널 설정 동기화
     - 동시 접속 지원 (세션별 로컬 변수 관리)
     """
 
     def __init__(self, port: Optional[int] = None) -> None:
-        self.port = port or int(os.getenv("BACKEND_AGENT_TCP_PORT", "8081"))
+        self.port = port or int(os.getenv("COMPUTE_AGENT_TCP_PORT", "8081"))
         self.server: Optional[asyncio.Server] = None
         self._active_sessions: Dict[int, Dict] = {}
         self._skip_release_notify = False
         self._release_notify_debounce_seconds = float(
-            os.getenv("BACKEND_AGENT_RELEASE_NOTIFY_DEBOUNCE_SECONDS", "10")
+            os.getenv("COMPUTE_AGENT_RELEASE_NOTIFY_DEBOUNCE_SECONDS", "10")
         )
         self._release_notify_lock = asyncio.Lock()
         self._release_notify_pending = False
@@ -56,8 +56,8 @@ class TCPTerminalServer:
         self._release_notify_cancelled = threading.Event()
         self._release_notify_http_connection_lock = threading.Lock()
         self._release_notify_http_connection = None
-        self._frontend_ip = ""
-        self._frontend_pod = ""
+        self._user_pod_ip = ""
+        self._user_pod = ""
         self._mount_context_lock = threading.Lock()
 
     async def start(self) -> None:
@@ -70,7 +70,7 @@ class TCPTerminalServer:
         # 서버 소켓에 TCP Keepalive 적용
         for sock in self.server.sockets:
             self._configure_keepalive(sock)
-        logger.info("TCP Terminal Server started on port %s", self.port)
+        logger.info("Session Handler started on port %s", self.port)
 
     async def stop(self) -> None:
         """TCP 서버 중지 — 모든 활성 세션 정리"""
@@ -84,7 +84,7 @@ class TCPTerminalServer:
         if self.server:
             self.server.close()
             await self.server.wait_closed()
-            logger.info("TCP Terminal Server stopped")
+            logger.info("Session Handler stopped")
 
     async def terminate_all_sessions(self) -> None:
         """외부 요청에 의한 모든 활성 세션/프로세스 강제 종료 (fallback 상태는 변경하지 않음)"""
@@ -127,10 +127,10 @@ class TCPTerminalServer:
             except Exception:
                 pass
 
-    async def begin_session_lifecycle(self, frontend_ip: str = "", frontend_pod: str = "") -> None:
+    async def begin_session_lifecycle(self, user_pod_ip: str = "", user_pod: str = "") -> None:
         with self._mount_context_lock:
-            self._frontend_ip = frontend_ip or ""
-            self._frontend_pod = frontend_pod or ""
+            self._user_pod_ip = user_pod_ip or ""
+            self._user_pod = user_pod or ""
 
         self._release_notify_cancelled.clear()
         async with self._release_notify_lock:
@@ -145,14 +145,14 @@ class TCPTerminalServer:
     def _mount_context_snapshot(self) -> Dict[str, str]:
         with self._mount_context_lock:
             return {
-                "frontend_ip": self._frontend_ip,
-                "frontend_pod": self._frontend_pod,
+                "user_pod_ip": self._user_pod_ip,
+                "user_pod": self._user_pod,
             }
 
     def _clear_mount_context(self) -> None:
         with self._mount_context_lock:
-            self._frontend_ip = ""
-            self._frontend_pod = ""
+            self._user_pod_ip = ""
+            self._user_pod = ""
 
     @staticmethod
     def _configure_keepalive(sock: socket.socket) -> None:
@@ -190,7 +190,7 @@ class TCPTerminalServer:
         connection_started = time.perf_counter()
         ready_at = None
         mount_context = self._mount_context_snapshot()
-        mount_frontend_ip = mount_context.get("frontend_ip") or client_ip
+        mount_user_pod_ip = mount_context.get("user_pod_ip") or client_ip
 
         logger.info("[ConnectionOpened] client_ip=%s", client_ip)
 
@@ -289,7 +289,7 @@ class TCPTerminalServer:
 
                 # 3. Mount Namespace & Chroot 환경 구성
                 # unshare -> mount -> chroot -> chdir 수행
-                MountManager.setup_chroot_namespace(mount_frontend_ip, cwd=cwd)
+                WorkspaceConnector.setup_chroot_namespace(mount_user_pod_ip, cwd=cwd)
 
             mount_setup_started = time.perf_counter()
             process = subprocess.Popen(
@@ -356,7 +356,7 @@ class TCPTerminalServer:
             await self._maybe_notify_release()
 
     async def _maybe_notify_release(self):
-        """Schedule one fallback release notify per backend lifecycle."""
+        """Schedule one fallback release notify per compute lifecycle."""
         # Fast path: avoid lock if obviously not needed (optimization)
         if self._skip_release_notify or self._active_sessions:
             return
@@ -375,7 +375,7 @@ class TCPTerminalServer:
 
     async def _notify_release(self, generation: int):
         """
-        Controller에 Backend 해제 요청 (TCP 끊김 시 안전망).
+        Controller에 Compute 해제 요청 (TCP 끊김 시 안전망).
 
         debounce → generation 검증 → cancelled_event 검사 → HTTP 전송 순서로 진행.
         primary cleanup이 먼저 끝나면 cancelled_event.set()와 HTTP 연결 종료로
@@ -396,8 +396,8 @@ class TCPTerminalServer:
                 return False
             import http.client
             body = json.dumps({
-                "backend_pod": hostname,
-                "source": "backend_fallback",
+                "compute_pod": hostname,
+                "source": "compute_fallback",
             }).encode("utf-8")
             release_notify_http_connection = None
             try:
@@ -409,7 +409,7 @@ class TCPTerminalServer:
                 release_notify_http_connection.connect()
                 if cancelled_event.is_set():
                     return False
-                release_notify_http_connection.request("POST", "/api/pool/release/", body=body, headers={
+                release_notify_http_connection.request("POST", "/api/compute/release/", body=body, headers={
                     "Content-Type": "application/json",
                     "Content-Length": str(len(body)),
                 })
@@ -534,4 +534,4 @@ class TCPTerminalServer:
 
 
 # 전역 인스턴스
-tcp_terminal = TCPTerminalServer()
+session_handler = SessionHandler()

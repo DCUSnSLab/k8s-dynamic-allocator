@@ -1,8 +1,8 @@
 """
-Services package for Kubernetes Backend Pod orchestration
+Services package for Kubernetes Compute Pod orchestration
 
 Public surface: only 'Orchestrator'
-All other components (pool, queues, sessions, cleanup, infra) are internal and should be accessed through 'Orchestrator'
+All other components (warm pod pool, queues, compute pod manager, cleanup, infra) are internal and should be accessed through 'Orchestrator'
 not imported directly from this package.
 """
 

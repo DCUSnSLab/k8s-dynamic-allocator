@@ -12,52 +12,52 @@ from config.settings import get_request_label, set_request_label
 
 from .. import ticket_format
 from ..queue import QueueUnavailableError, safe_int
-from .agent_client import BackendAgent, BackendAgentError
-from .pool import PodConflictError
+from .agent_client import ComputeAgent, ComputeAgentError
+from .warm_pool import PodConflictError
 
 logger = logging.getLogger(__name__)
 
 
-class BackendSessions:
+class ComputePodManager:
     _RELEASE_MAX_ATTEMPTS = 2
 
     def __init__(self, pool, queues, tickets):
         self.pool = pool
         self.queues = queues
         self.tickets = tickets
-        self._backend_refresh_lock = threading.Lock()
-        self._backend_refresh_interval = max(settings.WAIT_QUEUE_BACKEND_REFRESH_SECONDS, 1.0)
-        self._last_backend_refresh = 0.0
+        self._compute_refresh_lock = threading.Lock()
+        self._compute_refresh_interval = max(settings.WAIT_QUEUE_COMPUTE_REFRESH_SECONDS, 1.0)
+        self._last_compute_refresh = 0.0
         self._queue_kick_lock = threading.Lock()
         self._queue_kick_in_flight = False
-        self._queue_kick_pending_backend_types = set()
+        self._queue_kick_pending_compute_types = set()
         self._queue_kick_full_scan_pending = False
 
     def execute_command(
         self,
         username: str,
         command: str,
-        frontend_ip: str,
-        frontend_pod: str = "",
-        backend_type: Optional[str] = None,
+        user_pod_ip: str,
+        user_pod: str = "",
+        compute_type: Optional[str] = None,
         ingress_ts_ms: Optional[int] = None,
         ticket_id: Optional[str] = None,
     ) -> Dict:
         try:
-            if not frontend_ip:
+            if not user_pod_ip:
                 return {
                     "status": "error",
-                    "message": "frontend_ip is required",
+                    "message": "user_pod_ip is required",
                 }
 
-            backend_type_value = self._validate_backend_type_for_enqueue(backend_type)
-            frontend_pod_value = frontend_pod or ""
+            compute_type_value = self._validate_compute_type_for_enqueue(compute_type)
+            user_pod_value = user_pod or ""
             ticket = self.tickets.create_ticket(
                 username=username,
                 command=command,
-                frontend_pod=frontend_pod_value,
-                frontend_ip=frontend_ip,
-                backend_type=backend_type_value,
+                user_pod=user_pod_value,
+                user_pod_ip=user_pod_ip,
+                compute_type=compute_type_value,
                 request_id=get_request_label(),
                 ingress_ts_ms=ingress_ts_ms,
                 ticket_id=ticket_id,
@@ -73,11 +73,11 @@ class BackendSessions:
                 ingress_ts_ms=ticket.get("ingress_ts_ms"),
             )
 
-            self._kick_wait_queue_worker(backend_type_value)
+            self._kick_wait_queue_worker(compute_type_value)
             current_ticket = self.tickets.get_ticket(ticket["ticket_id"])
             response = ticket_format.ticket_response(current_ticket or ticket)
             if response["status"] == "assigned":
-                response["message"] = "Command assigned to backend"
+                response["message"] = "Command assigned to compute pod"
             elif response["status"] == "failed":
                 response["message"] = "Command failed during allocation"
             elif response["status"] == "cancelled":
@@ -89,7 +89,7 @@ class BackendSessions:
             return {
                 "status": "error",
                 "message": str(exc),
-                "error_type": "invalid_backend_type",
+                "error_type": "invalid_compute_type",
             }
         except QueueUnavailableError as exc:
             ticket_format.log_queue_event(
@@ -170,10 +170,10 @@ class BackendSessions:
                     include_ticket_fields=(),
                     reason=reason or final_ticket.get("error") or "cancel no-op",
                 )
-            backend_pod = final_ticket.get("backend_pod") or ""
-            if backend_pod and final_ticket.get("status") in {"cancelled", "failed"}:
+            compute_pod = final_ticket.get("compute_pod") or ""
+            if compute_pod and final_ticket.get("status") in {"cancelled", "failed"}:
                 try:
-                    self.pool.release_pod(backend_pod)
+                    self.pool.release_pod(compute_pod)
                 except Exception as exc:
                     ticket_format.log_queue_event(
                         "warning",
@@ -181,13 +181,13 @@ class BackendSessions:
                         final_ticket,
                         include_ticket_fields=(),
                         operation="cancel_release",
-                        backend_pod=backend_pod,
+                        compute_pod=compute_pod,
                         reason=str(exc),
                     )
-                self._clear_assigned_request_context_best_effort(backend_pod)
+                self._clear_assigned_request_context_best_effort(compute_pod)
 
             if str(final_ticket.get("status") or "").lower() == "cancelled":
-                self._kick_wait_queue_worker(final_ticket.get("backend_type"))
+                self._kick_wait_queue_worker(final_ticket.get("compute_type"))
 
             if final_ticket.get("status") == "assigned":
                 return {
@@ -203,74 +203,70 @@ class BackendSessions:
                 "message": str(exc),
             }
 
-    def release_backend(self, backend_pod: str, request_context: Optional[Dict[str, object]] = None) -> Dict:
+    def release_compute_pod(self, compute_pod: str, request_context: Optional[Dict[str, object]] = None) -> Dict:
         release_started_ms = int(time.time() * 1000)
         request_context_value = dict(request_context or {})
 
         last_error: Optional[Exception] = None
         cleanup_context = False
-        backend_unmounted = False
-        released_backend_type: Optional[str] = None
+        compute_unmounted = False
+        released_compute_type: Optional[str] = None
 
         def _release_once() -> Dict:
-            nonlocal cleanup_context, backend_unmounted, released_backend_type
+            nonlocal cleanup_context, compute_unmounted, released_compute_type
             release_started = time.perf_counter()
-            frontend = "unknown"
-            backend_type = self.queues.default_backend_type
+            compute_type = self.queues.default_compute_type
             try:
-                pod = self.pool.v1.read_namespaced_pod(backend_pod, self.pool.namespace)
+                pod = self.pool.v1.read_namespaced_pod(compute_pod, self.pool.namespace)
                 labels = pod.metadata.labels or {}
-                frontend = labels.get(self.pool.LABEL_FRONTEND, "unknown")
-                backend_type = self.queues.normalize_backend_type(labels.get(self.pool.LABEL_BACKEND_TYPE))
+                compute_type = self.queues.normalize_compute_type(labels.get(self.pool.LABEL_COMPUTE_TYPE))
             except ApiException as exc:
                 if exc.status != 404:
                     raise
-                logger.debug("[Released] backend_pod=%s status=already_released", backend_pod)
+                logger.debug("[Released] compute_pod=%s status=already_released", compute_pod)
                 cleanup_context = True
                 return {
                     "status": "success",
-                    "message": f"Backend already released: {backend_pod}",
+                    "message": f"Compute already released: {compute_pod}",
                 }
 
             assigned_context = dict(request_context_value)
             if not assigned_context:
                 try:
-                    assigned_context = self.tickets.get_assigned_request_context(backend_pod) or {}
+                    assigned_context = self.tickets.get_assigned_request_context(compute_pod) or {}
                 except QueueUnavailableError as exc:
                     logger.debug(
-                        "[AssignedContextUnavailable] backend_pod=%s reason=%r",
-                        backend_pod,
+                        "[AssignedContextUnavailable] compute_pod=%s reason=%r",
+                        compute_pod,
                         str(exc),
                     )
 
             if assigned_context.get("request_label"):
                 set_request_label(assigned_context.get("request_label"))
 
-            ticket = self._ticket_for_backend_pod_with_context(backend_pod, assigned_context)
+            ticket = self._ticket_for_compute_pod_with_context(compute_pod, assigned_context)
             if ticket:
                 ticket_format.set_ticket_context(ticket)
-                frontend = ticket.get("frontend_pod") or frontend
-                backend_type = self.queues.normalize_backend_type(ticket.get("backend_type"))
+                compute_type = self.queues.normalize_compute_type(ticket.get("compute_type"))
             elif assigned_context:
-                frontend = assigned_context.get("frontend_pod") or frontend
-                backend_type = self.queues.normalize_backend_type(
-                    assigned_context.get("backend_type") or backend_type
+                compute_type = self.queues.normalize_compute_type(
+                    assigned_context.get("compute_type") or compute_type
                 )
-            released_backend_type = backend_type
+            released_compute_type = compute_type
 
-            backend_ip = self.pool.get_pod_ip(backend_pod)
-            if backend_ip and not backend_unmounted:
-                with BackendAgent(backend_ip) as agent:
+            compute_pod_ip = self.pool.get_pod_ip(compute_pod)
+            if compute_pod_ip and not compute_unmounted:
+                with ComputeAgent(compute_pod_ip) as agent:
                     agent.unmount()
-                    backend_unmounted = True
+                    compute_unmounted = True
 
-            released_now = self.pool.release_pod(backend_pod)
+            released_now = self.pool.release_pod(compute_pod)
             if not released_now:
-                logger.debug("[Released] backend_pod=%s status=already_released_or_terminating", backend_pod)
+                logger.debug("[Released] compute_pod=%s status=already_released_or_terminating", compute_pod)
                 cleanup_context = True
                 return {
                     "status": "success",
-                    "message": f"Backend already released: {backend_pod}",
+                    "message": f"Compute already released: {compute_pod}",
                 }
 
             release_ms = int((time.perf_counter() - release_started) * 1000)
@@ -286,15 +282,15 @@ class BackendSessions:
                 ticket,
                 component="SUCCESS",
                 include_ticket_fields=(),
-                backend_pod=backend_pod,
-                backend_ip=backend_ip or "",
+                compute_pod=compute_pod,
+                compute_pod_ip=compute_pod_ip or "",
                 session_ms=session_ms,
                 release_ms=release_ms,
             )
             cleanup_context = True
             return {
                 "status": "success",
-                "message": f"Released: {backend_pod}",
+                "message": f"Released: {compute_pod}",
             }
 
         try:
@@ -302,54 +298,54 @@ class BackendSessions:
                 try:
                     response = _release_once()
                     if response.get("status") == "success":
-                        self._kick_wait_queue_worker(released_backend_type)
+                        self._kick_wait_queue_worker(released_compute_type)
                     return response
                 except Exception as exc:
                     last_error = exc
                     if attempt < self._RELEASE_MAX_ATTEMPTS:
                         logger.debug(
-                            "[ReleaseRetry] backend_pod=%s attempt=%s max_attempts=%s reason=%r",
-                            backend_pod,
+                            "[ReleaseRetry] compute_pod=%s attempt=%s max_attempts=%s reason=%r",
+                            compute_pod,
                             attempt,
                             self._RELEASE_MAX_ATTEMPTS,
                             str(exc),
                         )
                         continue
-                    logger.error("[Failed] operation=release backend_pod=%s reason=%r", backend_pod, str(exc))
+                    logger.error("[Failed] operation=release compute_pod=%s reason=%r", compute_pod, str(exc))
                     return {
                         "status": "error",
                         "message": str(exc),
                     }
         finally:
             if cleanup_context:
-                self._clear_assigned_request_context_best_effort(backend_pod)
+                self._clear_assigned_request_context_best_effort(compute_pod)
 
         return {
             "status": "error",
             "message": str(last_error) if last_error else "Unknown release failure",
         }
 
-    def process_wait_queues(self, backend_type: Optional[str] = None) -> Dict:
+    def process_wait_queues(self, compute_type: Optional[str] = None) -> Dict:
         try:
-            if backend_type:
-                backend_types = {self.queues.normalize_backend_type(backend_type)}
+            if compute_type:
+                compute_types = {self.queues.normalize_compute_type(compute_type)}
             else:
-                backend_types = set(self.queues.backend_types_with_queued_tickets())
-                backend_types.update(self._backend_types_with_stale_allocations())
+                compute_types = set(self.queues.compute_types_with_queued_tickets())
+                compute_types.update(self._compute_types_with_stale_allocations())
 
             processed = []
-            for backend_type in sorted(backend_types):
+            for compute_type in sorted(compute_types):
                 try:
-                    processed.append(self._drain_wait_queue_for_type(backend_type))
+                    processed.append(self._drain_wait_queue_for_type(compute_type))
                 except Exception as exc:
                     logger.exception(
-                        "[Failed] operation=drain_wait_queue backend_type=%s reason=%r",
-                        backend_type,
+                        "[Failed] operation=drain_wait_queue compute_type=%s reason=%r",
+                        compute_type,
                         str(exc),
                     )
                     processed.append(
                         {
-                            "backend_type": backend_type,
+                            "compute_type": compute_type,
                             "status": "error",
                             "error": str(exc),
                         }
@@ -365,116 +361,116 @@ class BackendSessions:
                 "message": str(exc),
             }
 
-    def notify_backend_available(
+    def notify_compute_available(
         self,
-        backend_type: Optional[str],
-        backend_pod: str = "",
-        backend_available_at: str = "",
+        compute_type: Optional[str],
+        compute_pod: str = "",
+        compute_available_at: str = "",
         source: str = "watch",
     ) -> None:
-        backend_type_value = self.queues.normalize_backend_type(backend_type)
+        compute_type_value = self.queues.normalize_compute_type(compute_type)
         try:
-            if not self.queues.has_queued_tickets(backend_type_value):
+            if not self.queues.has_queued_tickets(compute_type_value):
                 return
         except QueueUnavailableError as exc:
             logger.debug(
-                "[BackendWatchSkipped] backend_type=%s reason=%r",
-                backend_type_value,
+                "[ComputeWatchSkipped] compute_type=%s reason=%r",
+                compute_type_value,
                 str(exc),
             )
             return
 
-        self._remember_backend_available(
-            backend_type_value=backend_type_value,
-            backend_pod=backend_pod,
-            backend_available_at=backend_available_at,
+        self._remember_compute_available(
+            compute_type_value=compute_type_value,
+            compute_pod=compute_pod,
+            compute_available_at=compute_available_at,
             source=source,
         )
-        self._kick_wait_queue_worker(backend_type_value)
+        self._kick_wait_queue_worker(compute_type_value)
 
-    def _remember_backend_available(
+    def _remember_compute_available(
         self,
         *,
-        backend_type_value: str,
-        backend_pod: str,
-        backend_available_at: str,
+        compute_type_value: str,
+        compute_pod: str,
+        compute_available_at: str,
         source: str,
     ) -> None:
-        backend_pod_value = (backend_pod or "").strip()
-        if not backend_pod_value:
+        compute_pod_value = (compute_pod or "").strip()
+        if not compute_pod_value:
             return
 
-        observed_at = backend_available_at or datetime.now(timezone.utc).isoformat()
+        observed_at = compute_available_at or datetime.now(timezone.utc).isoformat()
         try:
-            recorded = self.queues.record_backend_available(
-                backend_pod_value,
+            recorded = self.queues.record_compute_available(
+                compute_pod_value,
                 observed_at,
             )
         except QueueUnavailableError as exc:
             logger.debug(
-                "[BackendAvailableSkipped] backend_type=%s backend_pod=%s reason=%r",
-                backend_type_value,
-                backend_pod_value,
+                "[ComputeAvailableSkipped] compute_type=%s compute_pod=%s reason=%r",
+                compute_type_value,
+                compute_pod_value,
                 str(exc),
             )
             return
 
         if recorded:
             logger.debug(
-                "[BackendAvailable] backend_type=%s backend_pod=%s backend_available_ts_ms=%s source=%s",
-                backend_type_value,
-                backend_pod_value,
+                "[ComputeAvailable] compute_type=%s compute_pod=%s compute_available_ts_ms=%s source=%s",
+                compute_type_value,
+                compute_pod_value,
                 ticket_format.datetime_to_epoch_ms(observed_at),
                 source or "watch",
             )
 
-    def _pop_backend_available_at(self, backend_pod: str) -> str:
+    def _pop_compute_available_at(self, compute_pod: str) -> str:
         try:
-            return self.queues.pop_backend_available_at(backend_pod)
+            return self.queues.pop_compute_available_at(compute_pod)
         except QueueUnavailableError as exc:
             logger.debug(
-                "[BackendAvailableLookupSkipped] backend_pod=%s reason=%r",
-                backend_pod,
+                "[ComputeAvailableLookupSkipped] compute_pod=%s reason=%r",
+                compute_pod,
                 str(exc),
             )
             return ""
 
-    def get_assigned_request_context(self, backend_pod: str) -> Optional[Dict[str, object]]:
-        return self.tickets.get_assigned_request_context(backend_pod)
+    def get_assigned_request_context(self, compute_pod: str) -> Optional[Dict[str, object]]:
+        return self.tickets.get_assigned_request_context(compute_pod)
 
-    def refresh_backend_types(self, force: bool = False) -> None:
+    def refresh_compute_types(self, force: bool = False) -> None:
         now = time.monotonic()
-        if not force and (now - self._last_backend_refresh) < self._backend_refresh_interval:
+        if not force and (now - self._last_compute_refresh) < self._compute_refresh_interval:
             return
 
-        with self._backend_refresh_lock:
+        with self._compute_refresh_lock:
             now = time.monotonic()
-            if not force and (now - self._last_backend_refresh) < self._backend_refresh_interval:
+            if not force and (now - self._last_compute_refresh) < self._compute_refresh_interval:
                 return
 
-            self._last_backend_refresh = now
-            backend_types = set()
+            self._last_compute_refresh = now
+            compute_types = set()
             try:
                 self.pool.initialize_pool(log_existing=False)
             except Exception as exc:
-                logger.debug("[BackendRefreshSkipped] reason=%r", str(exc))
-            backend_types.update(self.queues.known_backend_types())
+                logger.debug("[ComputeRefreshSkipped] reason=%r", str(exc))
+            compute_types.update(self.queues.known_compute_types())
             for item in self.pool.list_pool_status():
-                if item.get("backend_type"):
-                    backend_types.add(self.queues.normalize_backend_type(item.get("backend_type")))
+                if item.get("compute_type"):
+                    compute_types.add(self.queues.normalize_compute_type(item.get("compute_type")))
 
-            if backend_types:
-                self.queues.register_backend_types(sorted(backend_types))
+            if compute_types:
+                self.queues.register_compute_types(sorted(compute_types))
 
     def recover_stale_ticket(self, ticket: Dict) -> Dict:
-        """Public - shared with BackendCleanup."""
+        """Public - shared with ComputeCleanup."""
         ticket_id = ticket.get("ticket_id", "")
-        backend_type = self.queues.normalize_backend_type(ticket.get("backend_type"))
-        backend_pod = ticket.get("backend_pod", "")
+        compute_type = self.queues.normalize_compute_type(ticket.get("compute_type"))
+        compute_pod = ticket.get("compute_pod", "")
         claim_token = ticket.get("claim_token") or None
         retry_count = int(ticket.get("retry_count") or 0)
         max_retries = int(ticket.get("max_retries") or self.queues.max_retries)
-        skipped = {"ticket_id": ticket_id, "backend_type": backend_type, "status": "skipped"}
+        skipped = {"ticket_id": ticket_id, "compute_type": compute_type, "status": "skipped"}
 
         try:
             current = self.tickets.get_ticket(ticket_id)
@@ -491,18 +487,18 @@ class BackendSessions:
                     claim_token=claim_token,
                 )
                 if recovered and recovered.get("status") == "queued":
-                    self._release_pod_best_effort(backend_pod, ticket_id)
+                    self._release_pod_best_effort(compute_pod, ticket_id)
                     ticket_format.log_queue_event(
                         "debug",
                         "Requeued",
                         recovered,
                         include_ticket_fields=(),
                         source="stale_allocation",
-                        backend_pod=backend_pod,
+                        compute_pod=compute_pod,
                         retry_count=recovered.get("retry_count"),
                         reason="stale allocation recovered",
                     )
-                    return {"ticket_id": ticket_id, "backend_type": backend_type, "status": "requeued"}
+                    return {"ticket_id": ticket_id, "compute_type": compute_type, "status": "requeued"}
                 return skipped
 
             failed = self.tickets.mark_failed(
@@ -511,56 +507,56 @@ class BackendSessions:
                 claim_token=claim_token,
             )
             if failed and failed.get("status") == "failed":
-                self._release_pod_best_effort(backend_pod, ticket_id)
+                self._release_pod_best_effort(compute_pod, ticket_id)
                 ticket_format.log_queue_event(
                     "debug",
                     "Failed",
                     failed,
                     include_ticket_fields=(),
                     source="stale_allocation",
-                    backend_pod=backend_pod,
+                    compute_pod=compute_pod,
                     retry_count=failed.get("retry_count"),
                     reason="stale allocation exceeded retry budget",
                 )
-                return {"ticket_id": ticket_id, "backend_type": backend_type, "status": "failed"}
+                return {"ticket_id": ticket_id, "compute_type": compute_type, "status": "failed"}
             return skipped
         except QueueUnavailableError as exc:
             return {
                 "ticket_id": ticket_id,
-                "backend_type": backend_type,
+                "compute_type": compute_type,
                 "status": "error",
                 "error": str(exc),
             }
 
-    def _backend_types_with_stale_allocations(self) -> List[str]:
-        backend_types = []
-        for backend_type in self.queues.known_backend_types():
-            backend_type_value = self.queues.normalize_backend_type(backend_type)
-            if self.queues.find_stale_allocating_tickets(backend_type_value):
-                backend_types.append(backend_type_value)
-        return sorted(set(backend_types))
+    def _compute_types_with_stale_allocations(self) -> List[str]:
+        compute_types = []
+        for compute_type in self.queues.known_compute_types():
+            compute_type_value = self.queues.normalize_compute_type(compute_type)
+            if self.queues.find_stale_allocating_tickets(compute_type_value):
+                compute_types.append(compute_type_value)
+        return sorted(set(compute_types))
 
-    def _kick_wait_queue_worker(self, backend_type: Optional[str] = None) -> None:
-        backend_type_value = self.queues.normalize_backend_type(backend_type) if backend_type else None
+    def _kick_wait_queue_worker(self, compute_type: Optional[str] = None) -> None:
+        compute_type_value = self.queues.normalize_compute_type(compute_type) if compute_type else None
         with self._queue_kick_lock:
             if self._queue_kick_in_flight:
-                if backend_type_value:
-                    self._queue_kick_pending_backend_types.add(backend_type_value)
+                if compute_type_value:
+                    self._queue_kick_pending_compute_types.add(compute_type_value)
                 else:
                     self._queue_kick_full_scan_pending = True
                 return
             self._queue_kick_in_flight = True
 
         def _runner():
-            next_backend_type = backend_type_value
+            next_compute_type = compute_type_value
             lock_retry_count = 0
             try:
                 while True:
-                    result = self.process_wait_queues(backend_type=next_backend_type)
+                    result = self.process_wait_queues(compute_type=next_compute_type)
                     if (
-                        next_backend_type
+                        next_compute_type
                         and self._process_result_had_lock_miss(result)
-                        and self.queues.has_queued_tickets(next_backend_type)
+                        and self.queues.has_queued_tickets(next_compute_type)
                         and lock_retry_count < 3
                     ):
                         lock_retry_count += 1
@@ -570,11 +566,11 @@ class BackendSessions:
                     with self._queue_kick_lock:
                         if self._queue_kick_full_scan_pending:
                             self._queue_kick_full_scan_pending = False
-                            self._queue_kick_pending_backend_types.clear()
-                            next_backend_type = None
+                            self._queue_kick_pending_compute_types.clear()
+                            next_compute_type = None
                             continue
-                        if self._queue_kick_pending_backend_types:
-                            next_backend_type = self._queue_kick_pending_backend_types.pop()
+                        if self._queue_kick_pending_compute_types:
+                            next_compute_type = self._queue_kick_pending_compute_types.pop()
                             continue
                         self._queue_kick_in_flight = False
                         return
@@ -612,7 +608,7 @@ class BackendSessions:
             int(getattr(settings, "WAIT_QUEUE_MOUNT_CONCURRENCY", configured_batch)),
         )
 
-        mount_timeout = max(1.0, float(settings.BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS))
+        mount_timeout = max(1.0, float(settings.COMPUTE_AGENT_MOUNT_TIMEOUT_SECONDS))
         ttl = max(1.0, float(settings.WAIT_QUEUE_ALLOCATING_TTL_SECONDS))
         worker_interval = max(0.0, float(settings.WAIT_QUEUE_WORKER_INTERVAL_SECONDS))
 
@@ -622,7 +618,7 @@ class BackendSessions:
                 "mount_timeout_seconds=%s reason=%r",
                 ttl,
                 mount_timeout,
-                "allocating TTL is not greater than backend mount timeout",
+                "allocating TTL is not greater than compute mount timeout",
             )
 
         usable_ttl = max(1.0, ttl - max(2.0, worker_interval))
@@ -633,10 +629,10 @@ class BackendSessions:
         effective_concurrency = min(configured_concurrency, effective_batch)
         return effective_batch, effective_concurrency
 
-    def _drain_wait_queue_for_type(self, backend_type: str) -> Dict:
-        backend_type_value = self.queues.normalize_backend_type(backend_type)
+    def _drain_wait_queue_for_type(self, compute_type: str) -> Dict:
+        compute_type_value = self.queues.normalize_compute_type(compute_type)
         result = {
-            "backend_type": backend_type_value,
+            "compute_type": compute_type_value,
             "stale_recovered": 0,
             "claimed": 0,
             "assigned": 0,
@@ -649,13 +645,13 @@ class BackendSessions:
         effective_batch, mount_concurrency = self._compute_wait_queue_batch_plan()
         lock_token = None
         try:
-            lock_token = self.queues.acquire_allocator_lock(backend_type_value)
+            lock_token = self.queues.acquire_allocator_lock(compute_type_value)
             if not lock_token:
                 result["queued"] += 1
                 result["lock_missed"] = True
                 return result
 
-            for stale_ticket in self.queues.find_stale_allocating_tickets(backend_type_value):
+            for stale_ticket in self.queues.find_stale_allocating_tickets(compute_type_value):
                 recovered = self.recover_stale_ticket(stale_ticket)
                 if recovered["status"] == "requeued":
                     result["stale_recovered"] += 1
@@ -664,15 +660,15 @@ class BackendSessions:
                 elif recovered["status"] == "error":
                     result["errors"].append(recovered)
 
-            if not self.queues.has_queued_tickets(backend_type_value):
+            if not self.queues.has_queued_tickets(compute_type_value):
                 return result
 
             available = self.pool.get_available_pods(
-                backend_type=backend_type_value,
+                compute_type=compute_type_value,
                 limit=effective_batch,
             )
             if not available:
-                self._mark_backend_unavailable_started(backend_type_value)
+                self._mark_compute_unavailable_started(compute_type_value)
                 result["queued"] += 1
                 return result
 
@@ -680,15 +676,15 @@ class BackendSessions:
             max_claims = min(effective_batch, len(available))
             for _ in range(max_claims):
                 ticket = self.queues.claim_next_ticket(
-                    backend_type_value,
+                    compute_type_value,
                     worker_id=self.queues.worker_identity,
                 )
                 if not ticket:
                     break
 
-                reservation = self._reserve_backend_for_ticket(
+                reservation = self._reserve_compute_pod_for_ticket(
                     ticket=ticket,
-                    backend_type_value=backend_type_value,
+                    compute_type_value=compute_type_value,
                     candidate_pods=available,
                     reserved_pods=reserved_pods,
                     result=result,
@@ -700,7 +696,7 @@ class BackendSessions:
                 break
         finally:
             if lock_token:
-                self.queues.release_allocator_lock(backend_type_value, lock_token)
+                self.queues.release_allocator_lock(compute_type_value, lock_token)
 
         if not reserved_tickets:
             return result
@@ -708,14 +704,14 @@ class BackendSessions:
         executions: List[Dict] = []
         if mount_concurrency <= 1 or len(reserved_tickets) == 1:
             for ticket in reserved_tickets:
-                executions.append(self._safe_execute_allocated_ticket(ticket, backend_type_value))
+                executions.append(self._safe_execute_allocated_ticket(ticket, compute_type_value))
         else:
             with ThreadPoolExecutor(
                 max_workers=mount_concurrency,
                 thread_name_prefix="waitq-mount",
             ) as executor:
                 futures = [
-                    executor.submit(self._safe_execute_allocated_ticket, ticket, backend_type_value)
+                    executor.submit(self._safe_execute_allocated_ticket, ticket, compute_type_value)
                     for ticket in reserved_tickets
                 ]
                 for future in as_completed(futures):
@@ -733,87 +729,87 @@ class BackendSessions:
                 result["errors"].append(execution)
         return result
 
-    def _mark_backend_unavailable_started(self, backend_type_value: str) -> None:
+    def _mark_compute_unavailable_started(self, compute_type_value: str) -> None:
         try:
-            self.queues.mark_backend_unavailable_started(backend_type_value)
+            self.queues.mark_compute_unavailable_started(compute_type_value)
         except QueueUnavailableError as exc:
             logger.debug(
-                "[BackendUnavailableMarkSkipped] backend_type=%s reason=%r",
-                backend_type_value,
+                "[ComputeUnavailableMarkSkipped] compute_type=%s reason=%r",
+                compute_type_value,
                 str(exc),
             )
 
-    def _safe_execute_allocated_ticket(self, ticket: Dict, backend_type_value: str) -> Dict:
+    def _safe_execute_allocated_ticket(self, ticket: Dict, compute_type_value: str) -> Dict:
         try:
             return self._execute_allocated_ticket(ticket)
         except Exception as exc:
             logger.exception(
-                "[Failed] operation=execute_allocated_ticket ticket_id=%s backend_type=%s reason=%r",
+                "[Failed] operation=execute_allocated_ticket ticket_id=%s compute_type=%s reason=%r",
                 ticket.get("ticket_id"),
-                backend_type_value,
+                compute_type_value,
                 str(exc),
             )
             return {
                 "ticket_id": ticket.get("ticket_id", ""),
-                "backend_type": backend_type_value,
+                "compute_type": compute_type_value,
                 "status": "error",
                 "message": str(exc),
             }
 
-    def _reserve_backend_for_ticket(
+    def _reserve_compute_pod_for_ticket(
         self,
         ticket: Dict,
-        backend_type_value: str,
+        compute_type_value: str,
         candidate_pods: List[str],
         reserved_pods: set,
         result: Dict,
     ) -> Optional[Dict]:
         ticket_id = ticket["ticket_id"]
         claim_token = ticket.get("claim_token")
-        frontend_identity = ticket.get("frontend_pod") or "unknown"
+        user_pod_identity = ticket.get("user_pod") or "unknown"
 
-        backend_pod = ""
+        compute_pod = ""
         for candidate in candidate_pods:
             if candidate in reserved_pods:
                 continue
             try:
-                self.pool.assign_pod(candidate, frontend_identity)
+                self.pool.assign_pod(candidate, user_pod_identity)
             except PodConflictError as exc:
                 ticket_format.log_queue_event(
                     "debug",
-                    "BackendContention",
+                    "ComputeContention",
                     ticket,
                     include_ticket_fields=(),
-                    backend_pod=candidate,
-                    reason=f"Backend contention: {exc}",
+                    compute_pod=candidate,
+                    reason=f"Compute contention: {exc}",
                 )
                 continue
-            backend_pod = candidate
-            reserved_pods.add(backend_pod)
+            compute_pod = candidate
+            reserved_pods.add(compute_pod)
             break
 
-        if not backend_pod:
+        if not compute_pod:
             self.tickets.requeue_ticket(
                 ticket_id,
-                reason="No available backend pods",
+                reason="No available compute pods",
                 increment_retry=False,
                 claim_token=claim_token,
             )
             result["queued"] += 1
             return None
 
-        backend_ready_at = self.pool.get_pod_ready_at(backend_pod)
-        backend_available_at = self._pop_backend_available_at(backend_pod)
-        backend_ip = self.pool.get_pod_ip(backend_pod) or ""
-        if not backend_ip:
+        compute_ready_at = self.pool.get_pod_ready_at(compute_pod)
+        compute_available_at = self._pop_compute_available_at(compute_pod)
+        compute_pod_ip = self.pool.get_pod_ip(compute_pod) or ""
+        if not compute_pod_ip:
             try:
-                self.pool.release_pod(backend_pod)
+                self.pool.release_pod(compute_pod)
             except Exception:
                 pass
-            reserved_pods.discard(backend_pod)
+            reserved_pods.discard(compute_pod)
             self.tickets.requeue_ticket(
                 ticket_id,
-                reason="Backend IP unavailable",
+                reason="Compute IP unavailable",
                 increment_retry=False,
                 claim_token=claim_token,
             )
@@ -822,40 +818,40 @@ class BackendSessions:
                 "Requeued",
                 ticket,
                 include_ticket_fields=(),
-                backend_pod=backend_pod,
-                reason="Backend IP unavailable",
+                compute_pod=compute_pod,
+                reason="Compute IP unavailable",
             )
             result["queued"] += 1
             return None
 
         committed = self.tickets.mark_allocating(
             ticket_id,
-            backend_pod=backend_pod,
-            backend_ip=backend_ip,
+            compute_pod=compute_pod,
+            compute_pod_ip=compute_pod_ip,
             claimed_by=ticket.get("claimed_by"),
             claim_token=claim_token,
-            backend_ready_at=backend_ready_at,
-            backend_available_at=backend_available_at,
+            compute_ready_at=compute_ready_at,
+            compute_available_at=compute_available_at,
         )
         if not committed or committed.get("status") != "allocating":
             try:
-                self.pool.release_pod(backend_pod)
+                self.pool.release_pod(compute_pod)
             except Exception:
                 pass
-            reserved_pods.discard(backend_pod)
+            reserved_pods.discard(compute_pod)
             ticket_format.log_queue_event(
                 "debug",
                 "Requeued",
                 committed or ticket,
                 include_ticket_fields=(),
-                backend_pod=backend_pod,
-                reason="Ticket lost ownership before backend commit",
+                compute_pod=compute_pod,
+                reason="Ticket lost ownership before compute commit",
             )
             result["errors"].append(
                 {
                     "ticket_id": ticket_id,
-                    "backend_type": backend_type_value,
-                    "error": "Ticket lost ownership before backend commit",
+                    "compute_type": compute_type_value,
+                    "error": "Ticket lost ownership before compute commit",
                 }
             )
             return None
@@ -864,37 +860,37 @@ class BackendSessions:
 
     def _execute_allocated_ticket(self, ticket: Dict) -> Dict:
         ticket_id = ticket.get("ticket_id", "")
-        backend_type = self.queues.normalize_backend_type(ticket.get("backend_type"))
-        backend_pod = ticket.get("backend_pod", "")
-        backend_ip = ticket.get("backend_ip", "")
-        frontend_pod = ticket.get("frontend_pod") or ""
-        frontend_ip = ticket.get("frontend_ip") or ""
+        compute_type = self.queues.normalize_compute_type(ticket.get("compute_type"))
+        compute_pod = ticket.get("compute_pod", "")
+        compute_pod_ip = ticket.get("compute_pod_ip", "")
+        user_pod = ticket.get("user_pod") or ""
+        user_pod_ip = ticket.get("user_pod_ip") or ""
         command = ticket.get("command") or ""
         claim_token = ticket.get("claim_token") or ""
 
-        if not backend_pod or not frontend_ip:
-            failed = self.tickets.mark_failed(ticket_id, "Missing backend or frontend context", claim_token=claim_token)
+        if not compute_pod or not user_pod_ip:
+            failed = self.tickets.mark_failed(ticket_id, "Missing compute pod or user pod context", claim_token=claim_token)
             ticket_format.log_queue_event(
                 "info",
                 "Failed",
                 failed or ticket,
                 include_ticket_fields=(),
-                backend_pod=backend_pod,
-                backend_ip=backend_ip,
+                compute_pod=compute_pod,
+                compute_pod_ip=compute_pod_ip,
                 retry_count=(failed or ticket).get("retry_count"),
-                reason="Missing backend or frontend context",
+                reason="Missing compute pod or user pod context",
             )
             return {
                 "ticket_id": ticket_id,
-                "backend_type": backend_type,
+                "compute_type": compute_type,
                 "status": "failed",
-                "message": "Missing backend or frontend context",
+                "message": "Missing compute pod or user pod context",
             }
 
         current = self.tickets.get_ticket(ticket_id)
         if not current or current.get("status") != "allocating" or current.get("claim_token") != claim_token:
             try:
-                self.pool.release_pod(backend_pod)
+                self.pool.release_pod(compute_pod)
             except Exception:
                 pass
             ticket_format.log_queue_event(
@@ -902,45 +898,45 @@ class BackendSessions:
                 "Requeued",
                 ticket,
                 include_ticket_fields=(),
-                backend_pod=backend_pod,
+                compute_pod=compute_pod,
                 reason="Ticket no longer owns the allocation",
             )
             return {
                 "ticket_id": ticket_id,
-                "backend_type": backend_type,
+                "compute_type": compute_type,
                 "status": "queued",
                 "message": "Ticket no longer owns the allocation",
             }
 
         try:
-            with BackendAgent(backend_ip) as agent:
-                agent.mount(frontend_ip, command, frontend_pod)
-        except BackendAgentError as exc:
+            with ComputeAgent(compute_pod_ip) as agent:
+                agent.mount(user_pod_ip, command, user_pod)
+        except ComputeAgentError as exc:
             ticket_format.log_queue_event(
                 "warning",
                 "Warning",
                 ticket,
                 include_ticket_fields=(),
                 operation="mount",
-                backend_pod=backend_pod,
+                compute_pod=compute_pod,
                 reason=str(exc),
             )
             return self._handle_mount_failure(
                 ticket_id=ticket_id,
-                backend_pod=backend_pod,
+                compute_pod=compute_pod,
                 claim_token=claim_token,
                 exc=exc,
             )
         except Exception as exc:
             ticket_format.set_ticket_context(ticket)
             logger.exception(
-                "[Failed] operation=mount error_type=unexpected backend_pod=%s reason=%r",
-                backend_pod,
+                "[Failed] operation=mount error_type=unexpected compute_pod=%s reason=%r",
+                compute_pod,
                 str(exc),
             )
             return self._handle_mount_failure(
                 ticket_id=ticket_id,
-                backend_pod=backend_pod,
+                compute_pod=compute_pod,
                 claim_token=claim_token,
                 exc=exc,
             )
@@ -948,36 +944,36 @@ class BackendSessions:
         current = self.tickets.get_ticket(ticket_id)
         if not current or current.get("status") != "allocating" or current.get("claim_token") != claim_token:
             try:
-                self.pool.release_pod(backend_pod)
+                self.pool.release_pod(compute_pod)
             except Exception:
                 pass
             return {
                 "ticket_id": ticket_id,
-                "backend_type": backend_type,
+                "compute_type": compute_type,
                 "status": "queued",
                 "message": "Ticket was cancelled before commit",
             }
 
-        committed = self.tickets.mark_assigned(ticket_id, backend_pod, backend_ip, claim_token=claim_token)
+        committed = self.tickets.mark_assigned(ticket_id, compute_pod, compute_pod_ip, claim_token=claim_token)
         if committed and committed.get("status") == "assigned":
             assigned_context = ticket_format.assigned_request_context(committed)
-            self.tickets.set_assigned_request_context(backend_pod, assigned_context)
+            self.tickets.set_assigned_request_context(compute_pod, assigned_context)
             ticket_format.log_queue_event(
                 "info",
                 "Assigned",
                 committed,
                 include_ticket_fields=(),
                 claimed_by=committed.get("claimed_by"),
-                backend_pod=backend_pod,
-                backend_ip=backend_ip,
+                compute_pod=compute_pod,
+                compute_pod_ip=compute_pod_ip,
                 retry_count=committed.get("retry_count"),
                 **ticket_format.assignment_timing_fields(committed),
             )
-            response = ticket_format.ticket_response(committed, "Command assigned to backend")
+            response = ticket_format.ticket_response(committed, "Command assigned to compute pod")
             response.update(
                 {
-                    "frontend_pod": frontend_pod,
-                    "frontend_ip": frontend_ip,
+                    "user_pod": user_pod,
+                    "user_pod_ip": user_pod_ip,
                     "command": command,
                     "submitted_at": datetime.now().isoformat(),
                 }
@@ -985,7 +981,7 @@ class BackendSessions:
             return response
 
         try:
-            self.pool.release_pod(backend_pod)
+            self.pool.release_pod(compute_pod)
         except Exception:
             pass
         current = self.tickets.get_ticket(ticket_id)
@@ -995,7 +991,7 @@ class BackendSessions:
                 "Requeued",
                 current,
                 include_ticket_fields=(),
-                backend_pod=backend_pod,
+                compute_pod=compute_pod,
                 reason="Ticket no longer owns the allocation",
             )
         return ticket_format.ticket_response(current or ticket, "Ticket no longer owns the allocation")
@@ -1003,18 +999,18 @@ class BackendSessions:
     def _handle_mount_failure(
         self,
         ticket_id: str,
-        backend_pod: str,
+        compute_pod: str,
         claim_token: str,
         exc: Exception,
     ) -> Dict:
         reason = f"Mount failed: {exc}"
         try:
-            self.pool.release_pod(backend_pod)
+            self.pool.release_pod(compute_pod)
         except Exception as release_exc:
             logger.warning(
-                "[Warning] operation=release_after_mount_error ticket_id=%s backend_pod=%s reason=%r",
+                "[Warning] operation=release_after_mount_error ticket_id=%s compute_pod=%s reason=%r",
                 ticket_id,
-                backend_pod,
+                compute_pod,
                 str(release_exc),
             )
 
@@ -1033,8 +1029,8 @@ class BackendSessions:
                     "Requeued",
                     requeued_ticket,
                     include_ticket_fields=(),
-                    backend_pod=backend_pod,
-                    backend_ip=requeued_ticket.get("backend_ip"),
+                    compute_pod=compute_pod,
+                    compute_pod_ip=requeued_ticket.get("compute_pod_ip"),
                     retry_count=requeued_ticket.get("retry_count"),
                     reason=reason,
                 )
@@ -1048,98 +1044,98 @@ class BackendSessions:
                 "Failed",
                 failed_ticket,
                 include_ticket_fields=(),
-                backend_pod=backend_pod,
-                backend_ip=failed_ticket.get("backend_ip"),
+                compute_pod=compute_pod,
+                compute_pod_ip=failed_ticket.get("compute_pod_ip"),
                 retry_count=failed_ticket.get("retry_count"),
                 reason=reason,
             )
         return ticket_format.ticket_response(failed_ticket, str(exc))
 
-    def _select_backend_pod(self, backend_type: str) -> Dict:
-        backend_type_value = self.queues.normalize_backend_type(backend_type)
-        backend_pod = self.pool.get_available_pod(backend_type_value)
-        if not backend_pod:
+    def _select_compute_pod(self, compute_type: str) -> Dict:
+        compute_type_value = self.queues.normalize_compute_type(compute_type)
+        compute_pod = self.pool.get_available_pod(compute_type_value)
+        if not compute_pod:
             return {}
         return {
-            "name": backend_pod,
-            "ip": self.pool.get_pod_ip(backend_pod) or "",
+            "name": compute_pod,
+            "ip": self.pool.get_pod_ip(compute_pod) or "",
         }
 
-    def _discover_backend_types(self) -> List[str]:
-        self.refresh_backend_types()
-        return sorted(self.queues.known_backend_types())
+    def _discover_compute_types(self) -> List[str]:
+        self.refresh_compute_types()
+        return sorted(self.queues.known_compute_types())
 
-    def _validate_backend_type_for_enqueue(self, backend_type: Optional[str]) -> str:
+    def _validate_compute_type_for_enqueue(self, compute_type: Optional[str]) -> str:
         try:
-            return self.queues.validate_backend_type(backend_type, self.queues.known_backend_types())
+            return self.queues.validate_compute_type(compute_type, self.queues.known_compute_types())
         except ValueError:
-            self.refresh_backend_types(force=True)
-            return self.queues.validate_backend_type(backend_type, self.queues.known_backend_types())
+            self.refresh_compute_types(force=True)
+            return self.queues.validate_compute_type(compute_type, self.queues.known_compute_types())
 
-    def _ticket_for_backend_pod(self, backend_pod: str, backend_type: Optional[str] = None) -> Optional[Dict]:
+    def _ticket_for_compute_pod(self, compute_pod: str, compute_type: Optional[str] = None) -> Optional[Dict]:
         try:
-            ticket = self.tickets.find_ticket_by_backend_pod_index_only(
-                backend_pod,
-                backend_type=backend_type,
+            ticket = self.tickets.find_ticket_by_compute_pod_index_only(
+                compute_pod,
+                compute_type=compute_type,
             )
         except QueueUnavailableError:
             return None
         return ticket
 
-    def _ticket_for_backend_pod_with_context(
+    def _ticket_for_compute_pod_with_context(
         self,
-        backend_pod: str,
+        compute_pod: str,
         request_context: Optional[Dict[str, object]] = None,
     ) -> Optional[Dict]:
         ticket_id = ""
-        backend_type = None
+        compute_type = None
         if request_context:
             ticket_id = (request_context.get("ticket_id") or "").strip()
-            backend_type = request_context.get("backend_type") or None
+            compute_type = request_context.get("compute_type") or None
 
         if ticket_id:
             try:
                 ticket = self.tickets.get_ticket_snapshot(ticket_id)
             except QueueUnavailableError as exc:
                 logger.debug(
-                    "[TicketLookupSkipped] ticket_id=%s backend_pod=%s reason=%r",
+                    "[TicketLookupSkipped] ticket_id=%s compute_pod=%s reason=%r",
                     ticket_id,
-                    backend_pod,
+                    compute_pod,
                     str(exc),
                 )
             else:
                 if ticket:
-                    assigned_backend = (ticket.get("backend_pod") or "").strip()
-                    if assigned_backend == backend_pod and str(ticket.get("status") or "").lower() == "assigned":
+                    assigned_compute = (ticket.get("compute_pod") or "").strip()
+                    if assigned_compute == compute_pod and str(ticket.get("status") or "").lower() == "assigned":
                         return ticket
 
-        return self._ticket_for_backend_pod(backend_pod, backend_type=backend_type)
+        return self._ticket_for_compute_pod(compute_pod, compute_type=compute_type)
 
-    def _release_pod_best_effort(self, backend_pod: str, ticket_id: str) -> None:
-        if not backend_pod:
+    def _release_pod_best_effort(self, compute_pod: str, ticket_id: str) -> None:
+        if not compute_pod:
             return
         try:
-            self.pool.release_pod(backend_pod)
+            self.pool.release_pod(compute_pod)
         except Exception as exc:
             logger.warning(
-                "[Warning] operation=release_stale_backend backend_pod=%s ticket_id=%s reason=%r",
-                backend_pod,
+                "[Warning] operation=release_stale_compute compute_pod=%s ticket_id=%s reason=%r",
+                compute_pod,
                 ticket_id,
                 str(exc),
             )
 
-    def _clear_assigned_request_context_best_effort(self, backend_pod: str) -> None:
+    def _clear_assigned_request_context_best_effort(self, compute_pod: str) -> None:
         try:
-            self.tickets.clear_assigned_request_context(backend_pod)
+            self.tickets.clear_assigned_request_context(compute_pod)
         except QueueUnavailableError as exc:
             logger.warning(
-                "[Warning] operation=assigned_context_cleanup backend_pod=%s status=skipped reason=%r",
-                backend_pod,
+                "[Warning] operation=assigned_context_cleanup compute_pod=%s status=skipped reason=%r",
+                compute_pod,
                 str(exc),
             )
         except Exception as exc:
             logger.warning(
-                "[Warning] operation=assigned_context_cleanup backend_pod=%s status=failed reason=%r",
-                backend_pod,
+                "[Warning] operation=assigned_context_cleanup compute_pod=%s status=failed reason=%r",
+                compute_pod,
                 str(exc),
             )

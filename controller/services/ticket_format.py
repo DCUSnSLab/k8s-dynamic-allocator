@@ -9,7 +9,6 @@ from .queue import parse_datetime, safe_int
 
 logger = logging.getLogger(__name__)
 
-
 def _format_log_value(value: object) -> str:
     text = str(value)
     if text == "":
@@ -48,13 +47,13 @@ def set_ticket_context(ticket: Optional[Dict]) -> str:
 
 DEFAULT_TICKET_EVENT_FIELDS = (
     "ticket_id",
-    "backend_type",
-    "frontend_pod",
-    "frontend_ip",
+    "compute_type",
+    "user_pod",
+    "user_pod_ip",
     "username",
     "claimed_by",
-    "backend_pod",
-    "backend_ip",
+    "compute_pod",
+    "compute_pod_ip",
     "queue_position",
     "retry_count",
     "ticket_short",
@@ -105,25 +104,25 @@ def log_queue_event(
             "status",
             "source",
             "error_type",
-            "backend_type",
+            "compute_type",
             "username",
-            "frontend_pod",
-            "frontend_ip",
+            "user_pod",
+            "user_pod_ip",
             "queue_position",
             "claimed_by",
-            "backend_pod",
-            "backend_ip",
+            "compute_pod",
+            "compute_pod_ip",
             "retry_count",
             "ticket_short",
             "ingress_ts_ms",
-            "backend_available_ts_ms",
+            "compute_available_ts_ms",
             "reason",
-            "available_ready_backends",
+            "available_ready_compute_pods",
             "leader",
             "attempt",
             "max_attempts",
             "queue_wait_ms",
-            "backend_wait_ms",
+            "compute_wait_ms",
             "controller_claim_delay_ms",
             "allocation_ms",
             "total_assignment_ms",
@@ -177,8 +176,8 @@ def assignment_timing_fields(ticket: Optional[Dict]) -> Dict[str, int]:
 
     Returns dict with timing fields (only includes fields where all required timestamps are available):
     - queue_wait_ms: Time from ingress to claim
-    - backend_wait_ms: Time from ingress to controller-observed backend availability
-    - controller_claim_delay_ms: Time from controller-observed backend availability to claim
+    - compute_wait_ms: Time from ingress to controller-observed compute availability
+    - controller_claim_delay_ms: Time from controller-observed compute availability to claim
     - allocation_ms: Time from claim to assignment
     - total_assignment_ms: Time from ingress to assignment
 
@@ -195,13 +194,13 @@ def assignment_timing_fields(ticket: Optional[Dict]) -> Dict[str, int]:
     # Only calculate metrics where all required timestamps are available
     if ingress_ts_ms and claimed_at_ms:
         fields["queue_wait_ms"] = max(0, claimed_at_ms - ingress_ts_ms)
-    backend_available_at_ms = datetime_to_epoch_ms(ticket.get("backend_available_at"))
-    if not backend_available_at_ms:
-        backend_available_at_ms = datetime_to_epoch_ms(ticket.get("backend_ready_at"))
-    if ingress_ts_ms and backend_available_at_ms:
-        fields["backend_wait_ms"] = max(0, backend_available_at_ms - ingress_ts_ms)
-    if backend_available_at_ms and claimed_at_ms:
-        available_or_ingress_ms = max(backend_available_at_ms, ingress_ts_ms or 0)
+    compute_available_at_ms = datetime_to_epoch_ms(ticket.get("compute_available_at"))
+    if not compute_available_at_ms:
+        compute_available_at_ms = datetime_to_epoch_ms(ticket.get("compute_ready_at"))
+    if ingress_ts_ms and compute_available_at_ms:
+        fields["compute_wait_ms"] = max(0, compute_available_at_ms - ingress_ts_ms)
+    if compute_available_at_ms and claimed_at_ms:
+        available_or_ingress_ms = max(compute_available_at_ms, ingress_ts_ms or 0)
         fields["controller_claim_delay_ms"] = max(
             0,
             claimed_at_ms - available_or_ingress_ms,
@@ -233,9 +232,9 @@ def assigned_request_context(ticket: Optional[Dict]) -> Dict[str, object]:
         "ticket_id": ticket.get("ticket_id") or "",
         "ticket_short": ticket.get("ticket_short") or ticket_short(ticket.get("ticket_id")),
         "username": ticket.get("username") or "",
-        "frontend_pod": ticket.get("frontend_pod") or "",
-        "frontend_ip": ticket.get("frontend_ip") or "",
-        "backend_type": ticket.get("backend_type") or "",
+        "user_pod": ticket.get("user_pod") or "",
+        "user_pod_ip": ticket.get("user_pod_ip") or "",
+        "compute_type": ticket.get("compute_type") or "",
         "assigned_at_ms": datetime_to_epoch_ms(ticket.get("assigned_at")),
     }
 
@@ -254,17 +253,17 @@ def ticket_response(ticket: Optional[Dict], message: Optional[str] = None) -> Di
         "ticket_status": status,
         "message": message or "",
         "ticket_id": ticket_id,
-        "backend_type": ticket.get("backend_type"),
+        "compute_type": ticket.get("compute_type"),
         "ticket": ticket,
         "poll_url": f"/api/ticket/{ticket_id}/" if ticket_id else "",
         "cancel_url": f"/api/ticket/{ticket_id}/cancel/" if ticket_id else "",
-        "release_url": "/api/pool/release/",
+        "release_url": "/api/compute/release/",
     }
 
-    if ticket.get("backend_pod"):
-        response["backend_pod"] = ticket.get("backend_pod")
-    if ticket.get("backend_ip"):
-        response["backend_ip"] = ticket.get("backend_ip")
+    if ticket.get("compute_pod"):
+        response["compute_pod"] = ticket.get("compute_pod")
+    if ticket.get("compute_pod_ip"):
+        response["compute_pod_ip"] = ticket.get("compute_pod_ip")
     if status in {"queued", "allocating"}:
         response["retry_after_ms"] = int(max(settings.WAIT_QUEUE_WORKER_INTERVAL_SECONDS, 0.2) * 1000)
     return response

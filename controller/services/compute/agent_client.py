@@ -1,7 +1,7 @@
 """
-Backend Agent Client
+Compute Agent Client
 
-Backend Pod 내 Agent와 HTTP 통신하는 클라이언트 클래스
+Compute Pod 내 Agent와 HTTP 통신하는 클라이언트 클래스
 """
 
 import os
@@ -11,7 +11,7 @@ from typing import Dict, Optional, Type
 import httpx
 
 
-AGENT_PORT = int(os.getenv("BACKEND_AGENT_PORT", "8080"))
+AGENT_PORT = int(os.getenv("COMPUTE_AGENT_PORT", "8080"))
 
 
 def _env_float(name: str, default: float) -> float:
@@ -21,21 +21,21 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-DEFAULT_AGENT_TIMEOUT = _env_float("BACKEND_AGENT_TIMEOUT_SECONDS", 30.0)
-MOUNT_TIMEOUT = _env_float("BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS", DEFAULT_AGENT_TIMEOUT)
-UNMOUNT_TIMEOUT = _env_float("BACKEND_AGENT_UNMOUNT_TIMEOUT_SECONDS", DEFAULT_AGENT_TIMEOUT)
+DEFAULT_AGENT_TIMEOUT = _env_float("COMPUTE_AGENT_TIMEOUT_SECONDS", 30.0)
+MOUNT_TIMEOUT = _env_float("COMPUTE_AGENT_MOUNT_TIMEOUT_SECONDS", DEFAULT_AGENT_TIMEOUT)
+UNMOUNT_TIMEOUT = _env_float("COMPUTE_AGENT_UNMOUNT_TIMEOUT_SECONDS", DEFAULT_AGENT_TIMEOUT)
 
 
-class BackendAgentError(Exception):
+class ComputeAgentError(Exception):
     """
-    Backend agent HTTP 통신 실패를 나타내는 도메인 예외.
+    Compute agent HTTP 통신 실패를 나타내는 도메인 예외.
     HTTP 구현 세부사항(httpx)은 이 모듈에 갇혀 있고,
-    상위 레이어에는 'BackendAgentError'라는 도메인 예외만 노출
+    상위 레이어에는 'ComputeAgentError'라는 도메인 예외만 노출
     """
 
 
-class BackendAgent:
-    """Backend Pod Agent HTTP 클라이언트 (/mount, /unmount)"""
+class ComputeAgent:
+    """Compute Pod Agent HTTP 클라이언트 (/mount, /unmount)"""
 
     def __init__(self, pod_ip: str) -> None:
         self.pod_ip = pod_ip
@@ -45,7 +45,7 @@ class BackendAgent:
     def close(self) -> None:
         self.client.close()
 
-    def __enter__(self) -> "BackendAgent":
+    def __enter__(self) -> "ComputeAgent":
         return self
 
     def __exit__(
@@ -58,24 +58,24 @@ class BackendAgent:
 
     def mount(
         self,
-        frontend_ip: str,
+        user_pod_ip: str,
         command: str,
-        frontend_pod: Optional[str] = None,
+        user_pod: Optional[str] = None,
         timeout: float = MOUNT_TIMEOUT,
     ) -> Dict:
         payload: Dict = {
-            "frontend_ip": frontend_ip,
+            "user_pod_ip": user_pod_ip,
             "command": command,
         }
-        if frontend_pod:
-            payload["frontend_pod"] = frontend_pod
+        if user_pod:
+            payload["user_pod"] = user_pod
 
         try:
             response = self.client.post(f"{self.base_url}/mount", json=payload, timeout=timeout)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as exc:
-            raise BackendAgentError(f"mount failed: {exc}") from exc
+            raise ComputeAgentError(f"mount failed: {exc}") from exc
 
     def unmount(self, timeout: float = UNMOUNT_TIMEOUT) -> Dict:
         try:
@@ -83,4 +83,4 @@ class BackendAgent:
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as exc:
-            raise BackendAgentError(f"unmount failed: {exc}") from exc
+            raise ComputeAgentError(f"unmount failed: {exc}") from exc

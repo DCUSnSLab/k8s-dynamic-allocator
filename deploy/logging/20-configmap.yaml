@@ -55,7 +55,7 @@ data:
         Name                 grep
         Match                kube.*
         Logical_Op           or
-        Regex                $kubernetes['labels']['app'] ^(controller|backend-pool)$
+        Regex                $kubernetes['labels']['app'] ^(controller|warm-pod-pool)$
         Regex                $kubernetes['labels']['kubessh'] ^swlabssh$
 
     [OUTPUT]

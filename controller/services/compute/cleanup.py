@@ -6,13 +6,13 @@ from ..queue import QueueUnavailableError
 logger = logging.getLogger(__name__)
 
 
-class BackendCleanup:
-    """Periodic cleanup of stale queue tickets and orphaned backend pods.
+class ComputeCleanup:
+    """Periodic cleanup of stale queue tickets and orphaned compute pods.
 
     Runs independently of the allocation path. Tolerates partial failure:
     if the Redis queue is unavailable, stale-ticket recovery is skipped
-    but pool-level orphan cleanup still proceeds so that backends bound
-    to dead frontends are released.
+    but pool-level orphan cleanup still proceeds so that compute pods bound
+    to dead users are released.
     """
 
     def __init__(self, pool, queues, sessions):
@@ -45,26 +45,26 @@ class BackendCleanup:
         errors = []
 
         for pod_info in assigned:
-            frontend_pod = pod_info.get("assigned_frontend", "")
-            backend_pod = pod_info["name"]
+            user_pod = pod_info.get("assigned_user", "")
+            compute_pod = pod_info["name"]
 
-            if not frontend_pod or frontend_pod == "unknown":
+            if not user_pod or user_pod == "unknown":
                 continue
 
-            frontend_status = self.pool.get_pod_status(frontend_pod)
+            user_status = self.pool.get_pod_status(user_pod)
 
-            if frontend_status is None or frontend_status != "Running":
+            if user_status is None or user_status != "Running":
                 logger.warning(
-                    "[Warning] operation=orphan_backend_release frontend_pod=%s frontend_status=%s backend_pod=%s",
-                    frontend_pod,
-                    frontend_status,
-                    backend_pod,
+                    "[Warning] operation=orphan_compute_release user_pod=%s user_pod_status=%s compute_pod=%s",
+                    user_pod,
+                    user_status,
+                    compute_pod,
                 )
-                result = self.sessions.release_backend(backend_pod)
+                result = self.sessions.release_compute_pod(compute_pod)
                 if result["status"] == "success":
-                    released.append(backend_pod)
+                    released.append(compute_pod)
                 else:
-                    errors.append({"pod": backend_pod, "error": result["message"]})
+                    errors.append({"pod": compute_pod, "error": result["message"]})
 
         return {
             "checked": len(assigned),

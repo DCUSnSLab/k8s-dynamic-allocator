@@ -32,9 +32,7 @@ static/
 Thumbs.db
 
 # SSH key
-deploy/secrets/backend_ssh_key
-deploy/secrets/backend_ssh_key.pub
-*.pem
-*.key
+*.pub
+*key
 
 kubeconfig.yaml

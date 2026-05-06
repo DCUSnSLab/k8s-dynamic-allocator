@@ -25,7 +25,7 @@ class ApiConfig(AppConfig):
         try:
             from services.orchestrator import Orchestrator
 
-            logger.info("Controller starting - initializing backend pool...")
+            logger.info("Controller starting - initializing warm pod pool...")
             orchestrator = Orchestrator()
             result = orchestrator.start()
             orchestrator_instance = orchestrator
