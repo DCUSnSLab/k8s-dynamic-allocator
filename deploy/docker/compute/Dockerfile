@@ -1,6 +1,6 @@
 # path : /k8s-dynamic-allocator
-# docker build -f deploy/docker/compute/Dockerfile -t harbor.cu.ac.kr/k8s_dynamic_allocator/compute:{tag} .
-# docker push harbor.cu.ac.kr/k8s_dynamic_allocator/compute:{tag}
+# docker build -f deploy/docker/compute/Dockerfile -t harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:{tag} .
+# docker push harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:{tag}
 
 FROM ubuntu:20.04
 
