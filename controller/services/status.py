@@ -23,16 +23,16 @@ class ControllerStatus:
             "pods": pool_list,
         }
 
-    def get_queue_status(self, backend_type: Optional[str] = None) -> Dict:
-        if not backend_type:
-            raise ValueError("backend_type is required")
-        backend_type_value = self.queues.validate_backend_type(
-            backend_type,
-            self.queues.known_backend_types(),
+    def get_queue_status(self, compute_type: Optional[str] = None) -> Dict:
+        if not compute_type:
+            raise ValueError("compute_type is required")
+        compute_type_value = self.queues.validate_compute_type(
+            compute_type,
+            self.queues.known_compute_types(),
         )
         now_ms = int(time.time() * 1000)
-        snapshot = self.queues.list_waiting_frontends(
-            backend_type_value,
+        snapshot = self.queues.list_waiting_users(
+            compute_type_value,
             now_ms=now_ms,
         )
         return {
@@ -49,9 +49,9 @@ class ControllerStatus:
             }
         status = str(ticket.get("status") or "queued").lower()
         default_message = {
-            "queued": "Waiting for an available backend",
-            "allocating": "Allocating backend",
-            "assigned": "Backend assigned",
+            "queued": "Waiting for an available compute pod",
+            "allocating": "Allocating compute pod",
+            "assigned": "Compute pod assigned",
             "failed": ticket.get("error") or "Allocation failed",
             "cancelled": ticket.get("error") or "Ticket cancelled",
         }.get(status, "")

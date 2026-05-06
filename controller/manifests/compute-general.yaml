@@ -1,27 +1,30 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: backend-general
+  name: compute-general
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: backend-pool
-      backend-type: general
+      app: warm-pod-pool
+      compute-type: general
       pool-status: available
   template:
     metadata:
       labels:
-        app: backend-pool
-        backend-type: general
+        app: warm-pod-pool
+        compute-type: general
         pool-status: available
-        assigned-frontend: ""
+        assigned-user: ""
     spec:
       containers:
-      - name: backend-agent
-        image: harbor.cu.ac.kr/k8s_dynamic_allocator/backend:queue
+      - name: compute-agent
+        image: harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:latest
         imagePullPolicy: Always
         args: ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
+        env:
+        - name: LOG_FORMAT
+          value: "detailed"
         ports:
         - containerPort: 8080
           name: agent
@@ -49,5 +52,5 @@ spec:
       volumes:
       - name: ssh-private-key
         secret:
-          secretName: backend-ssh-key
+          secretName: compute-ssh-key
           defaultMode: 384

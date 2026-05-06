@@ -1,10 +1,11 @@
 """
-Backend Agent - HTTP API Server
+Compute Agent - HTTP API Server
 """
 
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -12,26 +13,37 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from mount_manager import MountManager
-from tcp_terminal import tcp_terminal
+from session_handler import session_handler
+from workspace_connector import WorkspaceConnector
 
-HTTP_PORT = int(os.getenv("BACKEND_AGENT_HTTP_PORT", "8080"))
-TCP_TERMINAL_PORT = int(os.getenv("BACKEND_AGENT_TCP_PORT", "8081"))
+HTTP_PORT = int(os.getenv("COMPUTE_AGENT_HTTP_PORT", "8080"))
+TCP_TERMINAL_PORT = int(os.getenv("COMPUTE_AGENT_TCP_PORT", "8081"))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+_LOG_FORMAT = os.getenv("LOG_FORMAT", "detailed").lower()
+_handler = logging.StreamHandler()
+if _LOG_FORMAT == "json":
+    from pythonjsonlogger import jsonlogger
+    _handler.setFormatter(jsonlogger.JsonFormatter(
+        '%(asctime)s %(levelname)s %(name)s %(message)s',
+        rename_fields={'asctime': 'ts', 'levelname': 'level', 'name': 'logger'},
+        datefmt='%Y-%m-%dT%H:%M:%S%z',
+    ))
+    logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
+else:
+    _handler.setFormatter(logging.Formatter(
+        fmt='[%(asctime)s] [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S %z',
+    ))
+    logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Backend Agent",
-    description="Backend Pool Pod Agent for SSHFS mount and command execution",
+    title="Compute Agent",
+    description="Warm Pod Pool Pod Agent for SSHFS mount and command execution",
     version="1.0.0"
 )
 
-mount_manager = MountManager()
+workspace_connector = WorkspaceConnector()
 
 
 class FormattedJSONResponse(JSONResponse):
@@ -41,9 +53,9 @@ class FormattedJSONResponse(JSONResponse):
 
 
 class MountRequest(BaseModel):
-    frontend_ip: str
+    user_pod_ip: str
     command: str
-    frontend_pod: Optional[str] = None
+    user_pod: Optional[str] = None
 
 
 class AgentStatus:
@@ -59,18 +71,18 @@ class AgentState:
 
     def __init__(self):
         self.status = AgentStatus.IDLE
-        self.frontend_ip: Optional[str] = None
-        self.frontend_pod: Optional[str] = None
+        self.user_pod_ip: Optional[str] = None
+        self.user_pod: Optional[str] = None
         self.command: Optional[str] = None
         self.started_at: Optional[datetime] = None
         self.error: Optional[str] = None
         self._lock = asyncio.Lock()
 
-    async def set_mounting(self, frontend_ip: str, frontend_pod: Optional[str], command: str):
+    async def set_mounting(self, user_pod_ip: str, user_pod: Optional[str], command: str):
         async with self._lock:
             self.status = AgentStatus.MOUNTING
-            self.frontend_ip = frontend_ip
-            self.frontend_pod = frontend_pod
+            self.user_pod_ip = user_pod_ip
+            self.user_pod = user_pod
             self.command = command
             self.started_at = datetime.now()
 
@@ -86,8 +98,8 @@ class AgentState:
     async def reset(self):
         async with self._lock:
             self.status = AgentStatus.IDLE
-            self.frontend_ip = None
-            self.frontend_pod = None
+            self.user_pod_ip = None
+            self.user_pod = None
             self.command = None
             self.started_at = None
             self.error = None
@@ -96,8 +108,8 @@ class AgentState:
         async with self._lock:
             return {
                 "status": self.status,
-                "frontend_ip": self.frontend_ip,
-                "frontend_pod": self.frontend_pod,
+                "user_pod_ip": self.user_pod_ip,
+                "user_pod": self.user_pod,
                 "command": self.command,
                 "started_at": self.started_at.isoformat() if self.started_at else None,
                 "error": self.error,
@@ -114,7 +126,7 @@ state = AgentState()
 @app.get("/")
 async def root():
     return FormattedJSONResponse({
-        "service": "Backend Agent",
+        "service": "Compute Agent",
         "status": "running"
     })
 
@@ -122,7 +134,7 @@ async def root():
 @app.get("/status")
 async def get_status():
     data = await state.snapshot()
-    data["sessions"] = tcp_terminal.get_sessions()
+    data["sessions"] = session_handler.get_sessions()
     return FormattedJSONResponse(data)
 
 
@@ -134,7 +146,7 @@ async def get_ready():
         {
             "status": "ready" if ready else "not_ready",
             "agent_status": snapshot["status"],
-            "sessions": len(tcp_terminal.get_sessions()),
+            "sessions": len(session_handler.get_sessions()),
         },
         status_code=200 if ready else 503,
     )
@@ -148,54 +160,59 @@ async def mount(request: MountRequest):
             detail=f"Agent is busy (status: {state.status})"
         )
 
-    await state.set_mounting(request.frontend_ip, request.frontend_pod, request.command)
+    await state.set_mounting(request.user_pod_ip, request.user_pod, request.command)
 
     logger.info(
-        "Mount requested: frontend=%s(%s), command=%s",
-        request.frontend_pod,
-        request.frontend_ip,
-        request.command,
+        "[MountRequested] user_pod=%s user_pod_ip=%s",
+        request.user_pod or "",
+        request.user_pod_ip,
     )
 
-    mount_success = await mount_manager.mount(request.frontend_ip)
+    mount_success = await workspace_connector.mount(request.user_pod_ip)
 
     if not mount_success:
-        logger.error("SSHFS mount failed!")
+        logger.error("[MountFailed] reason=%r", "SSHFS mount failed")
         await state.set_error("SSHFS mount failed")
         return FormattedJSONResponse({
             "status": "error",
             "message": "SSHFS mount failed"
         }, status_code=500)
 
-    logger.info("Mount successful")
+    logger.info("[MountContextAccepted] tcp_port=%s", TCP_TERMINAL_PORT)
     await state.set_running()
-    await tcp_terminal.begin_session_lifecycle()
+    await session_handler.begin_session_lifecycle(
+        user_pod_ip=request.user_pod_ip,
+        user_pod=request.user_pod or "",
+    )
 
     return FormattedJSONResponse({
         "status": "success",
-        "message": "Mount completed, ready for TCP connection",
-        "frontend_ip": request.frontend_ip,
+        "message": "Mount context accepted, ready for TCP connection",
+        "user_pod_ip": request.user_pod_ip,
         "tcp_port": TCP_TERMINAL_PORT
     })
 
 
 @app.post("/unmount")
 async def unmount():
-    logger.info("Unmount requested")
+    cleanup_started = time.perf_counter()
 
-    if mount_manager.frontend_ip is None:
+    if workspace_connector.user_pod_ip is None:
+        logger.info("[Unmounted] cleanup_ms=0 status=already_unmounted")
         return FormattedJSONResponse({
             "status": "success",
             "message": "Already unmounted"
         })
 
-    await tcp_terminal.terminate_all_sessions()
+    await session_handler.terminate_all_sessions()
 
     try:
-        success = await mount_manager.unmount()
+        success = await workspace_connector.unmount()
         if success:
             await state.reset()
-            await tcp_terminal.suppress_fallback_release()
+            await session_handler.suppress_fallback_release()
+            cleanup_ms = int((time.perf_counter() - cleanup_started) * 1000)
+            logger.info("[Unmounted] cleanup_ms=%s", cleanup_ms)
             return FormattedJSONResponse({
                 "status": "success",
                 "message": "Unmounted and reset"
@@ -205,7 +222,8 @@ async def unmount():
             "message": "Unmount completed with warnings"
         })
     except Exception as e:
-        logger.error("Unmount error: %s", e)
+        cleanup_ms = int((time.perf_counter() - cleanup_started) * 1000)
+        logger.error("[UnmountFailed] cleanup_ms=%s reason=%r", cleanup_ms, str(e))
         return FormattedJSONResponse({
             "status": "error",
             "message": str(e)
@@ -214,14 +232,14 @@ async def unmount():
 
 @app.on_event("startup")
 async def startup():
-    logger.info("Backend Agent starting...")
+    logger.info("Compute Agent starting...")
 
-    if not mount_manager.setup_ssh_key():
-        logger.error("Backend Agent startup failed: SSH key setup was unsuccessful")
+    if not workspace_connector.setup_ssh_key():
+        logger.error("Compute Agent startup failed: SSH key setup was unsuccessful")
         raise RuntimeError("SSH key setup failed")
-    await tcp_terminal.start()
+    await session_handler.start()
 
-    logger.info("Backend Agent ready")
+    logger.info("Compute Agent ready")
 
     async def print_newline():
         import sys
@@ -234,8 +252,8 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    await tcp_terminal.stop()
-    logger.info("Backend Agent stopped")
+    await session_handler.stop()
+    logger.info("Compute Agent stopped")
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ class ApiConfig(AppConfig):
         try:
             from services.orchestrator import Orchestrator
 
-            logger.info("Controller starting - initializing backend pool...")
+            logger.info("Controller starting - initializing warm pod pool...")
             orchestrator = Orchestrator()
             result = orchestrator.start()
             orchestrator_instance = orchestrator
@@ -41,6 +41,6 @@ class ApiConfig(AppConfig):
                 failed,
             )
 
-        except Exception:
-            logger.exception("Controller startup failed")
+        except Exception as exc:
+            logger.exception("[Failed] operation=controller_startup reason=%r", str(exc))
             raise

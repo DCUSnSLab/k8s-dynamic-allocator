@@ -79,6 +79,13 @@ def _env_float_any(names, default):
         return float(default)
 
 
+def _env_bool_any(names, default):
+    value = _env_first(names, default)
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in ("true", "1", "yes", "on")
+
+
 class RequestLabelMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
@@ -113,7 +120,7 @@ CACHES = {
 
 REDIS_URL = _env_first(('REDIS_URL',), 'redis://localhost:6379/0')
 WAIT_QUEUE_PREFIX = _env_first(('WAIT_QUEUE_PREFIX',), 'kda:waitq')
-DEFAULT_BACKEND_TYPE = _env_first(('DEFAULT_BACKEND_TYPE',), 'general')
+DEFAULT_COMPUTE_TYPE = _env_first(('DEFAULT_COMPUTE_TYPE',), 'general')
 WAIT_QUEUE_TIMEOUT_SECONDS = _env_int_any(('WAIT_QUEUE_TIMEOUT_SECONDS',), 1800)
 WAIT_QUEUE_LOCK_TTL_SECONDS = _env_int_any(
     ('WAIT_QUEUE_LOCK_TTL_SECONDS', 'ALLOCATOR_LOCK_TIMEOUT_SECONDS'),
@@ -131,13 +138,17 @@ ASSIGNED_CONTEXT_TTL_SECONDS = _env_int_any(
     ('ASSIGNED_CONTEXT_TTL_SECONDS',),
     2592000,
 )
+COMPUTE_AVAILABLE_TTL_SECONDS = _env_int_any(
+    ('COMPUTE_AVAILABLE_TTL_SECONDS',),
+    600,
+)
 WAIT_QUEUE_MAX_RETRIES = _env_int_any(('WAIT_QUEUE_MAX_RETRIES',), 3)
 WAIT_QUEUE_WORKER_INTERVAL_SECONDS = _env_float_any(
     ('WAIT_QUEUE_WORKER_INTERVAL_SECONDS', 'QUEUE_WORKER_INTERVAL_SECONDS'),
     1.0,
 )
-WAIT_QUEUE_BACKEND_REFRESH_SECONDS = _env_float_any(
-    ('WAIT_QUEUE_BACKEND_REFRESH_SECONDS', 'BACKEND_REGISTRY_REFRESH_SECONDS'),
+WAIT_QUEUE_COMPUTE_REFRESH_SECONDS = _env_float_any(
+    ('WAIT_QUEUE_COMPUTE_REFRESH_SECONDS',),
     15.0,
 )
 WAIT_QUEUE_BATCH_LIMIT = _env_int_any(('WAIT_QUEUE_BATCH_LIMIT',), 10)
@@ -145,14 +156,26 @@ WAIT_QUEUE_MOUNT_CONCURRENCY = _env_int_any(
     ('WAIT_QUEUE_MOUNT_CONCURRENCY',),
     WAIT_QUEUE_BATCH_LIMIT,
 )
-BACKEND_AGENT_TIMEOUT_SECONDS = _env_float_any(('BACKEND_AGENT_TIMEOUT_SECONDS',), 30.0)
-BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS = _env_float_any(
-    ('BACKEND_AGENT_MOUNT_TIMEOUT_SECONDS',),
-    BACKEND_AGENT_TIMEOUT_SECONDS,
+COMPUTE_AVAILABILITY_WATCH_ENABLED = _env_bool_any(
+    ('COMPUTE_AVAILABILITY_WATCH_ENABLED',),
+    True,
 )
-BACKEND_AGENT_UNMOUNT_TIMEOUT_SECONDS = _env_float_any(
-    ('BACKEND_AGENT_UNMOUNT_TIMEOUT_SECONDS',),
-    BACKEND_AGENT_TIMEOUT_SECONDS,
+COMPUTE_AVAILABILITY_WATCH_TIMEOUT_SECONDS = _env_int_any(
+    ('COMPUTE_AVAILABILITY_WATCH_TIMEOUT_SECONDS', 'COMPUTE_AVAILABILITY_WATCH_RESYNC_SECONDS'),
+    60,
+)
+COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS = _env_float_any(
+    ('COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS',),
+    1.0,
+)
+COMPUTE_AGENT_TIMEOUT_SECONDS = _env_float_any(('COMPUTE_AGENT_TIMEOUT_SECONDS',), 30.0)
+COMPUTE_AGENT_MOUNT_TIMEOUT_SECONDS = _env_float_any(
+    ('COMPUTE_AGENT_MOUNT_TIMEOUT_SECONDS',),
+    COMPUTE_AGENT_TIMEOUT_SECONDS,
+)
+COMPUTE_AGENT_UNMOUNT_TIMEOUT_SECONDS = _env_float_any(
+    ('COMPUTE_AGENT_UNMOUNT_TIMEOUT_SECONDS',),
+    COMPUTE_AGENT_TIMEOUT_SECONDS,
 )
 
 LANGUAGE_CODE = 'ko-kr'
@@ -171,6 +194,10 @@ REST_FRAMEWORK = {
     ],
 }
 
+_LOG_FORMAT = os.getenv('LOG_FORMAT', 'detailed').lower()
+_CONSOLE_FORMATTER = 'json' if _LOG_FORMAT == 'json' else 'detailed'
+_APP_LOG_LEVEL = os.getenv('APP_LOG_LEVEL', 'INFO').upper()
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -178,7 +205,13 @@ LOGGING = {
         'detailed': {
             'format': '[{asctime}] [{levelname}] [{request_label}] {message}',
             'style': '{',
-            'datefmt': '%Y-%m-%d %H:%M:%S',
+            'datefmt': '%Y-%m-%d %H:%M:%S %z',
+        },
+        'json': {
+            '()': 'pythonjsonlogger.jsonlogger.JsonFormatter',
+            'format': '%(asctime)s %(levelname)s %(name)s %(request_label)s %(message)s',
+            'rename_fields': {'asctime': 'ts', 'levelname': 'level', 'name': 'logger'},
+            'datefmt': '%Y-%m-%dT%H:%M:%S%z',
         },
     },
     'filters': {
@@ -189,7 +222,7 @@ LOGGING = {
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
-            'formatter': 'detailed',
+            'formatter': _CONSOLE_FORMATTER,
             'filters': ['request_label'],
         },
     },
@@ -215,12 +248,12 @@ LOGGING = {
         },
         'api': {
             'handlers': ['console'],
-            'level': 'DEBUG',
+            'level': _APP_LOG_LEVEL,
             'propagate': False,
         },
         'services': {
             'handlers': ['console'],
-            'level': 'DEBUG',
+            'level': _APP_LOG_LEVEL,
             'propagate': False,
         },
         'httpx': {

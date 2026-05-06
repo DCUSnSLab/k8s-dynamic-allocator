@@ -1,0 +1,35 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: logs-rotate
+  namespace: swlabpods
+spec:
+  schedule: "0 3 * * *"        # Daily at 03:00 UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: rotate
+            image: alpine:3.20
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              cd /mnt/logs
+              # Keep all collected logs. Compress only inactive JSONL files.
+              find . -type f -name "*.jsonl" -mtime +7 -exec gzip -9 {} \;
+              echo "compress-only rotation done at $(date -Iseconds)"
+            volumeMounts:
+            - name: logs-pvc
+              mountPath: /mnt/logs
+          volumes:
+          - name: logs-pvc
+            persistentVolumeClaim:
+              claimName: logs-pvc

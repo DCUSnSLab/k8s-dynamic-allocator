@@ -1,6 +1,6 @@
 # path : /k8s-dynamic-allocator
-# docker build -f deploy/docker/backend/Dockerfile -t harbor.cu.ac.kr/k8s_dynamic_allocator/backend:{tag} .
-# docker push harbor.cu.ac.kr/k8s_dynamic_allocator/backend:{tag}
+# docker build -f deploy/docker/compute/Dockerfile -t harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:{tag} .
+# docker push harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:{tag}
 
 FROM ubuntu:20.04
 
@@ -26,12 +26,12 @@ RUN apt-get update && apt-get install -y \
 RUN echo "user_allow_other" >> /etc/fuse.conf
 
 # Python 의존성 설치
-COPY backend_agent/requirements.txt .
+COPY compute_agent/requirements.txt .
 RUN pip3 install --no-cache-dir --upgrade pip && \
     pip3 install --no-cache-dir -r requirements.txt
 
 # Agent 코드 복사
-COPY backend_agent/ .
+COPY compute_agent/ .
 
 # 마운트 포인트 생성
 RUN mkdir -p /mnt/chroot /root/.ssh

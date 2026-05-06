@@ -66,6 +66,7 @@ class LeaseLeaderElector(KubernetesClient):
         if self._thread and self._thread.is_alive():
             return
 
+        self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run,
             name="lease-leader-elector",
@@ -83,6 +84,10 @@ class LeaseLeaderElector(KubernetesClient):
         """Stop the election loop."""
         self._stop_event.set()
         self._set_leader(False)
+        if self._thread and self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout=max(2, self.retry_interval_seconds + 1))
+        if self._thread and not self._thread.is_alive():
+            self._thread = None
 
     def is_leader(self) -> bool:
         with self._lock:
@@ -95,14 +100,14 @@ class LeaseLeaderElector(KubernetesClient):
                 if currently_leader:
                     success = self._renew_lease()
                     if not success:
-                        logger.warning("Leadership lost while renewing lease")
+                        logger.warning("[Warning] operation=lease_renew status=lost_leadership identity=%s", self.identity)
                         self._set_leader(False)
                 else:
                     success = self._try_acquire_lease()
                     if success:
                         self._set_leader(True)
             except Exception as e:
-                logger.warning("Lease election loop error: %s", e)
+                logger.warning("[Warning] operation=lease_election_loop identity=%s reason=%r", self.identity, str(e))
                 self._set_leader(False)
 
             interval = (
@@ -250,7 +255,7 @@ class LeaseLeaderElector(KubernetesClient):
             try:
                 callback()
             except Exception as e:
-                logger.warning("Leader transition callback failed: %s", e)
+                logger.warning("[Warning] operation=leader_transition_callback identity=%s reason=%r", self.identity, str(e))
 
     @staticmethod
     def _holder_identity(lease) -> str:
