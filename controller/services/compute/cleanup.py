@@ -15,10 +15,10 @@ class ComputeCleanup:
     to dead users are released.
     """
 
-    def __init__(self, pool, queues, sessions):
+    def __init__(self, pool, queues, compute_manager):
         self.pool = pool
         self.queues = queues
-        self.sessions = sessions
+        self.compute_manager = compute_manager
 
     def check_stale_allocations(self) -> Dict:
         queue_recovered = []
@@ -28,7 +28,7 @@ class ComputeCleanup:
 
         try:
             for stale_ticket in self.queues.find_stale_allocating_tickets():
-                recovered = self.sessions.recover_stale_ticket(stale_ticket)
+                recovered = self.compute_manager.recover_stale_ticket(stale_ticket)
                 if recovered["status"] == "requeued":
                     queue_recovered.append(recovered["ticket_id"])
                 elif recovered["status"] == "failed":
@@ -60,7 +60,7 @@ class ComputeCleanup:
                     user_status,
                     compute_pod,
                 )
-                result = self.sessions.release_compute_pod(compute_pod)
+                result = self.compute_manager.release_compute_pod(compute_pod)
                 if result["status"] == "success":
                     released.append(compute_pod)
                 else:

@@ -56,7 +56,7 @@ class WarmPodPool(KubernetesClient):
         self.apps_v1 = client.AppsV1Api()
         self.owner_ref = self._get_owner_deployment()
 
-    def _warm_pool_selector(
+    def _warm_pod_pool_selector(
         self,
         status: Optional[str] = None,
         compute_type: Optional[str] = None,
@@ -301,7 +301,7 @@ class WarmPodPool(KubernetesClient):
         """
         pods = self.v1.list_namespaced_pod(
             namespace=self.namespace,
-            label_selector=self._warm_pool_selector(
+            label_selector=self._warm_pod_pool_selector(
                 status=self.STATUS_AVAILABLE,
                 compute_type=compute_type,
             ),
