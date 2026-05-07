@@ -294,7 +294,7 @@ class WarmPodPool(KubernetesClient):
     ) -> List[str]:
         """Return Ready warm compute pod names that are currently available.
 
-        `exclude` filters out pods already reserved in the current pass —
+        `exclude` filters out pods already reserved in the current pass because
         the apiserver watch cache can briefly report a freshly-patched pod
         as still available, so callers tracking in-flight reservations pass
         them here to avoid double-selection.

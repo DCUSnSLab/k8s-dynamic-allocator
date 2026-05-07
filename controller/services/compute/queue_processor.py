@@ -230,6 +230,12 @@ class ComputeQueueProcessor:
                             continue
                         self._queue_kick_in_flight = False
                         return
+            except Exception as exc:
+                logger.exception(
+                    "[Failed] operation=queue_kick_worker compute_type=%s reason=%r",
+                    next_compute_type or "",
+                    str(exc),
+                )
             finally:
                 with self._queue_kick_lock:
                     if self._queue_kick_in_flight:

@@ -143,7 +143,7 @@ class Orchestrator:
     def check_stale_allocations(self) -> Dict:
         return self.cleanup.check_stale_allocations()
 
-    def get_assigned_request_context(self, compute_pod: str) -> Dict:
+    def get_assigned_request_context(self, compute_pod: str) -> Optional[Dict[str, object]]:
         return self.compute_manager.get_assigned_request_context(compute_pod)
 
     def get_pool_status(self) -> Dict:
