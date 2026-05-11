@@ -56,6 +56,7 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scm
+                sh 'git submodule update --init --recursive'
             }
         }
 
@@ -119,6 +120,7 @@ pipeline {
                                 }
 
                                 if (changedAny(changedFiles, [
+                                    'dcusshk8s',
                                     'dcusshk8s/dockerbuild/',
                                     'dcusshk8s/kubessh/pod.py',
                                     'deploy/dcusshk8s-ssh-test.yaml'
