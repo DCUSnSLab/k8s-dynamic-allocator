@@ -47,6 +47,7 @@ pipeline {
     }
 
     environment {
+        DOCKER_BUILDKIT = '1'
         HARBOR_REGISTRY = 'harbor.cu.ac.kr'
         HARBOR_PROJECT = 'harbor.cu.ac.kr/k8s_dynamic_allocator'
         HARBOR_CREDENTIALS_ID = 'harbor'
