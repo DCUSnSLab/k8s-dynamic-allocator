@@ -1,8 +1,4 @@
-"""
-Compute Agent Client
-
-Compute Pod 내 Agent와 HTTP 통신하는 클라이언트 클래스
-"""
+"""HTTP client for compute-agent mount and unmount endpoints."""
 
 import os
 from types import TracebackType
@@ -27,15 +23,11 @@ UNMOUNT_TIMEOUT = _env_float("COMPUTE_AGENT_UNMOUNT_TIMEOUT_SECONDS", DEFAULT_AG
 
 
 class ComputeAgentError(Exception):
-    """
-    Compute agent HTTP 통신 실패를 나타내는 도메인 예외.
-    HTTP 구현 세부사항(httpx)은 이 모듈에 갇혀 있고,
-    상위 레이어에는 'ComputeAgentError'라는 도메인 예외만 노출
-    """
+    """Raised when compute-agent HTTP communication fails."""
 
 
 class ComputeAgent:
-    """Compute Pod Agent HTTP 클라이언트 (/mount, /unmount)"""
+    """Compute-agent HTTP client for /mount and /unmount."""
 
     def __init__(self, pod_ip: str) -> None:
         self.pod_ip = pod_ip

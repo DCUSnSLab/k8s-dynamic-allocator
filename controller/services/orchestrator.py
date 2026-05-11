@@ -5,8 +5,8 @@ from typing import Dict, Optional
 from config import settings
 from config.settings import set_request_label
 
-from .compute import ComputeAvailabilityWatcher, ComputeCleanup, WarmPodPool, ComputePodManager
-from .infra import LeaseLeaderElector
+from .compute import ComputeCleanup, WarmPodPool, ComputeManager
+from .infra import ComputeAvailabilityWatcher, LeaseLeaderElector
 from .queue import ComputeQueues
 from .status import ControllerStatus
 
@@ -18,14 +18,14 @@ class Orchestrator:
         self.pool = WarmPodPool()
         self.queues = ComputeQueues()
         self.tickets = self.queues.tickets
-        self.sessions = ComputePodManager(self.pool, self.queues, self.tickets)
+        self.compute_manager = ComputeManager(self.pool, self.queues, self.tickets)
         self.status = ControllerStatus(self.pool, self.queues, self.tickets)
-        self.cleanup = ComputeCleanup(self.pool, self.queues, self.sessions)
+        self.cleanup = ComputeCleanup(self.pool, self.queues, self.compute_manager)
         self.compute_watcher = ComputeAvailabilityWatcher(
             v1=self.pool.v1,
             namespace=self.pool.namespace,
             label_selector=f"{self.pool.LABEL_APP}={self.pool.APP_WARM_POOL}",
-            on_compute_available=self.sessions.notify_compute_available,
+            on_compute_available=self.compute_manager.notify_compute_available,
             enabled=settings.COMPUTE_AVAILABILITY_WATCH_ENABLED,
             timeout_seconds=settings.COMPUTE_AVAILABILITY_WATCH_TIMEOUT_SECONDS,
             retry_seconds=settings.COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS,
@@ -46,7 +46,7 @@ class Orchestrator:
 
     def initialize_pool(self) -> Dict:
         result = self.pool.initialize_pool()
-        self.sessions.refresh_compute_types(force=True)
+        self.compute_manager.refresh_compute_types(force=True)
         return result
 
     def start(self) -> Dict:
@@ -114,7 +114,7 @@ class Orchestrator:
         ingress_ts_ms: Optional[int] = None,
         ticket_id: Optional[str] = None,
     ) -> Dict:
-        return self.sessions.execute_command(
+        return self.compute_manager.execute_command(
             username=username,
             command=command,
             user_pod_ip=user_pod_ip,
@@ -125,26 +125,26 @@ class Orchestrator:
         )
 
     def cancel_ticket(self, ticket_id: str, reason: str = "") -> Dict:
-        return self.sessions.cancel_ticket(ticket_id, reason=reason)
+        return self.compute_manager.cancel_ticket(ticket_id, reason=reason)
 
     def release_compute_pod(
         self,
         compute_pod: str,
         request_context: Optional[Dict[str, object]] = None,
     ) -> Dict:
-        return self.sessions.release_compute_pod(
+        return self.compute_manager.release_compute_pod(
             compute_pod=compute_pod,
             request_context=request_context,
         )
 
     def process_wait_queues(self) -> Dict:
-        return self.sessions.process_wait_queues()
+        return self.compute_manager.process_wait_queues()
 
     def check_stale_allocations(self) -> Dict:
         return self.cleanup.check_stale_allocations()
 
-    def get_assigned_request_context(self, compute_pod: str) -> Dict:
-        return self.sessions.get_assigned_request_context(compute_pod)
+    def get_assigned_request_context(self, compute_pod: str) -> Optional[Dict[str, object]]:
+        return self.compute_manager.get_assigned_request_context(compute_pod)
 
     def get_pool_status(self) -> Dict:
         return self.status.get_pool_status()
