@@ -1,7 +1,7 @@
 def selectedImages = []
 
 def allImages = {
-    return ['controller', 'compute_pod', 'user_pod']
+    return ['controller', 'compute_pod', 'user_pod', 'swlabssh']
 }
 
 def changedAny = { List files, List paths ->
@@ -41,7 +41,7 @@ pipeline {
     parameters {
         choice(
             name: 'TARGET_IMAGE',
-            choices: ['auto', 'all', 'controller', 'compute_pod', 'user_pod'],
+            choices: ['auto', 'all', 'controller', 'compute_pod', 'user_pod', 'swlabssh'],
             description: 'Image target to build. auto builds only images affected by the latest Git changes.'
         )
     }
@@ -120,12 +120,15 @@ pipeline {
                                 }
 
                                 if (changedAny(changedFiles, [
-                                    'dcusshk8s',
-                                    'dcusshk8s/dockerbuild/',
-                                    'dcusshk8s/kubessh/pod.py',
-                                    'deploy/dcusshk8s-ssh-test.yaml'
+                                    'dcusshk8s/dockerbuild/'
                                 ])) {
                                     selectedImages.add('user_pod')
+                                }
+
+                                if (changedFiles.any { file ->
+                                    file.startsWith('dcusshk8s/') && !file.startsWith('dcusshk8s/dockerbuild/')
+                                }) {
+                                    selectedImages.add('swlabssh')
                                 }
                             }
                         }
@@ -182,6 +185,25 @@ pipeline {
                         docker.withRegistry("https://${env.HARBOR_REGISTRY}", env.HARBOR_CREDENTIALS_ID) {
                             dockerBuildAndPush(
                                 'user_pod',
+                                'Dockerfile',
+                                '.'
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build and Push swlabssh') {
+            when {
+                expression { imageEnabled('swlabssh') }
+            }
+            steps {
+                dir('dcusshk8s') {
+                    script {
+                        docker.withRegistry("https://${env.HARBOR_REGISTRY}", env.HARBOR_CREDENTIALS_ID) {
+                            dockerBuildAndPush(
+                                'swlabssh',
                                 'Dockerfile',
                                 '.'
                             )
