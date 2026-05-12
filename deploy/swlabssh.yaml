@@ -67,14 +67,9 @@ spec:
           image: harbor.cu.ac.kr/k8s_dynamic_allocator/swlabssh:latest
           imagePullPolicy: Always
           command: ["/bin/sh", "-c"]
-          args: ["python3 ./kubessh/app.py --KubeSSH.config_file=kubessh_dummy_config.py"]
+          args: ["python3 ./kubessh/app.py --KubeSSH.config_file=kda_config.py"]
           tty: true
           stdin: true
-          env:
-            - name: KUBESSH_DEFAULT_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
           ports:
             - name: ssh
               containerPort: 8022

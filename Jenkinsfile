@@ -106,7 +106,8 @@ pipeline {
                                 if (changedAny(changedFiles, [
                                     'controller/',
                                     'deploy/docker/controller/',
-                                    'deploy/controller.yaml'
+                                    'deploy/controller.yaml',
+                                    'kda_config.py'
                                 ])) {
                                     selectedImages.add('controller')
                                 }
@@ -114,7 +115,8 @@ pipeline {
                                 if (changedAny(changedFiles, [
                                     'compute_agent/',
                                     'deploy/docker/compute/',
-                                    'controller/manifests/compute-general.yaml'
+                                    'controller/manifests/compute-general.yaml',
+                                    'kda_config.py'
                                 ])) {
                                     selectedImages.add('compute_pod')
                                 }
@@ -126,7 +128,10 @@ pipeline {
                                 }
 
                                 if (changedFiles.any { file ->
-                                    file.startsWith('dcusshk8s/') && !file.startsWith('dcusshk8s/dockerbuild/')
+                                    (file.startsWith('dcusshk8s/') && !file.startsWith('dcusshk8s/dockerbuild/')) ||
+                                    file.startsWith('deploy/docker/swlabssh/') ||
+                                    file == 'deploy/swlabssh.yaml' ||
+                                    file == 'kda_config.py'
                                 }) {
                                     selectedImages.add('swlabssh')
                                 }
@@ -199,15 +204,13 @@ pipeline {
                 expression { imageEnabled('swlabssh') }
             }
             steps {
-                dir('dcusshk8s') {
-                    script {
-                        docker.withRegistry("https://${env.HARBOR_REGISTRY}", env.HARBOR_CREDENTIALS_ID) {
-                            dockerBuildAndPush(
-                                'swlabssh',
-                                'Dockerfile',
-                                '.'
-                            )
-                        }
+                script {
+                    docker.withRegistry("https://${env.HARBOR_REGISTRY}", env.HARBOR_CREDENTIALS_ID) {
+                        dockerBuildAndPush(
+                            'swlabssh',
+                            'deploy/docker/swlabssh/Dockerfile',
+                            '.'
+                        )
                     }
                 }
             }

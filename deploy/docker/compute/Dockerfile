@@ -32,6 +32,7 @@ RUN pip3 install --no-cache-dir --upgrade pip && \
 
 # Agent 코드 복사
 COPY compute_agent/ .
+COPY kda_config.py .
 
 # 마운트 포인트 생성
 RUN mkdir -p /mnt/chroot /root/.ssh
@@ -44,4 +45,4 @@ EXPOSE 8081
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # Agent 서버 실행
-CMD ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["python3", "agent.py", "--config-file", "kda_config.py"]

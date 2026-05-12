@@ -56,6 +56,10 @@ class SessionHandler:
         self._release_notify_cancelled = threading.Event()
         self._release_notify_http_connection_lock = threading.Lock()
         self._release_notify_http_connection = None
+        self._controller_release_host = os.getenv("CONTROLLER_SERVICE_HOST", "controller-service")
+        self._controller_release_port = int(os.getenv("CONTROLLER_SERVICE_PORT", "9001"))
+        self._controller_release_path = os.getenv("CONTROLLER_RELEASE_PATH", "/api/compute/release/")
+        self._controller_release_timeout_seconds = float(os.getenv("CONTROLLER_RELEASE_TIMEOUT_SECONDS", "10"))
         self._user_pod_ip = ""
         self._user_pod = ""
         self._mount_context_lock = threading.Lock()
@@ -390,6 +394,10 @@ class SessionHandler:
         cancelled_event = self._release_notify_cancelled
 
         http_connection_lock = self._release_notify_http_connection_lock
+        release_host = self._controller_release_host
+        release_port = self._controller_release_port
+        release_path = self._controller_release_path
+        release_timeout = self._controller_release_timeout_seconds
 
         def make_request():
             if cancelled_event.is_set():
@@ -401,7 +409,11 @@ class SessionHandler:
             }).encode("utf-8")
             release_notify_http_connection = None
             try:
-                release_notify_http_connection = http.client.HTTPConnection("controller-service", 9001, timeout=10)
+                release_notify_http_connection = http.client.HTTPConnection(
+                    release_host,
+                    release_port,
+                    timeout=release_timeout,
+                )
                 with http_connection_lock:
                     if cancelled_event.is_set():
                         return False
@@ -409,7 +421,7 @@ class SessionHandler:
                 release_notify_http_connection.connect()
                 if cancelled_event.is_set():
                     return False
-                release_notify_http_connection.request("POST", "/api/compute/release/", body=body, headers={
+                release_notify_http_connection.request("POST", release_path, body=body, headers={
                     "Content-Type": "application/json",
                     "Content-Length": str(len(body)),
                 })
