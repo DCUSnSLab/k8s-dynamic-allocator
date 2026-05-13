@@ -56,8 +56,8 @@ class SessionHandler:
         self._release_notify_cancelled = threading.Event()
         self._release_notify_http_connection_lock = threading.Lock()
         self._release_notify_http_connection = None
-        self._controller_release_host = os.getenv("CONTROLLER_SERVICE_HOST", "controller-service")
-        self._controller_release_port = int(os.getenv("CONTROLLER_SERVICE_PORT", "9001"))
+        self._controller_release_host = os.getenv("CONTROLLER_RELEASE_HOST", "controller-service")
+        self._controller_release_port = int(os.getenv("CONTROLLER_RELEASE_PORT", "9001"))
         self._controller_release_path = os.getenv("CONTROLLER_RELEASE_PATH", "/api/compute/release/")
         self._controller_release_timeout_seconds = float(os.getenv("CONTROLLER_RELEASE_TIMEOUT_SECONDS", "10"))
         self._user_pod_ip = ""

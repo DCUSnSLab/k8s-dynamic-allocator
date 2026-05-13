@@ -3,8 +3,8 @@
 DEFAULT_NAMESPACE = "swlabpods"
 
 REDIS_URL = "redis://controller-queue-redis:6379/0"
-CONTROLLER_SERVICE_HOST = "controller-service"
-CONTROLLER_SERVICE_PORT = 9001
+CONTROLLER_RELEASE_HOST = "controller-service"
+CONTROLLER_RELEASE_PORT = 9001
 CONTROLLER_RELEASE_PATH = "/api/compute/release/"
 CONTROLLER_RELEASE_TIMEOUT_SECONDS = 10
 WAIT_QUEUE_PREFIX = "kda:waitq"
