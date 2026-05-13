@@ -12,6 +12,62 @@ def changedAny = { List files, List paths ->
     }
 }
 
+def expandDcusshk8sSubmoduleChanges = { List files, String diffBase ->
+    def expandedFiles = [] as Set
+    files.each { file ->
+        expandedFiles.add(file)
+    }
+
+    if (!files.contains('dcusshk8s')) {
+        return expandedFiles as List
+    }
+
+    def oldTree = sh(
+        script: "git ls-tree ${diffBase} dcusshk8s",
+        returnStdout: true
+    ).trim()
+    def newTree = sh(
+        script: 'git ls-tree HEAD dcusshk8s',
+        returnStdout: true
+    ).trim()
+    def oldSha = oldTree ? oldTree.split(/\s+/)[2] : ''
+    def newSha = newTree ? newTree.split(/\s+/)[2] : ''
+
+    if (!oldSha || !newSha || oldSha == newSha) {
+        return expandedFiles as List
+    }
+
+    def hasSubmoduleCommits = sh(
+        script: "git -C dcusshk8s cat-file -e ${oldSha}^{commit} && git -C dcusshk8s cat-file -e ${newSha}^{commit}",
+        returnStatus: true
+    ) == 0
+
+    if (!hasSubmoduleCommits) {
+        expandedFiles.add('dcusshk8s/dockerbuild/')
+        expandedFiles.add('dcusshk8s/')
+        return expandedFiles as List
+    }
+
+    def submoduleDiffOutput = sh(
+        script: "git -C dcusshk8s diff --name-only ${oldSha} ${newSha}",
+        returnStdout: true
+    ).trim()
+
+    if (!submoduleDiffOutput) {
+        expandedFiles.add('dcusshk8s/dockerbuild/')
+        expandedFiles.add('dcusshk8s/')
+        return expandedFiles as List
+    }
+
+    submoduleDiffOutput.split('\\n').each { file ->
+        if (file?.trim()) {
+            expandedFiles.add("dcusshk8s/${file.trim()}")
+        }
+    }
+
+    return expandedFiles as List
+}
+
 def imageEnabled = { String imageName ->
     return selectedImages.contains(imageName)
 }
@@ -97,6 +153,8 @@ pipeline {
                                 returnStdout: true
                             ).trim()
                             def changedFiles = diffOutput ? diffOutput.split('\\n') as List : []
+                            changedFiles = expandDcusshk8sSubmoduleChanges(changedFiles, diffBase)
+                            echo "CHANGED_FILES=${changedFiles.join(',') ?: 'none'}"
 
                             if (changedFiles.contains('Jenkinsfile')) {
                                 selectedImages = allImages()
