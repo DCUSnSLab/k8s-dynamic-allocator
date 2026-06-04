@@ -7,7 +7,7 @@ from typing import Dict, Optional, Type
 import httpx
 
 
-AGENT_PORT = int(os.getenv("COMPUTE_AGENT_PORT", "8080"))
+AGENT_PORT = int(os.getenv("COMPUTE_AGENT_PORT") or os.getenv("COMPUTE_AGENT_HTTP_PORT", "8080"))
 
 
 def _env_float(name: str, default: float) -> float:

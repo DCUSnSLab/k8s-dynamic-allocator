@@ -10,9 +10,10 @@ COPY controller/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY controller .
+COPY kda_config.py .
 
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 9001
 
-CMD ["python", "rest_api/manage.py", "runserver", "0.0.0.0:9001"]
+CMD ["python", "rest_api/manage.py", "--config-file", "kda_config.py", "runserver", "0.0.0.0:9001"]

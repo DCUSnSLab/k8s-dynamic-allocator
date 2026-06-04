@@ -5,21 +5,81 @@ Compute Agent - HTTP API Server
 import asyncio
 import logging
 import os
+import runpy
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+def _config_value_to_env(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _extract_config_file(argv):
+    config_file = None
+    cleaned = [argv[0]]
+    index = 1
+
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--config-file":
+            if index + 1 >= len(argv):
+                raise SystemExit("--config-file requires a path")
+            config_file = argv[index + 1]
+            index += 2
+            continue
+        if arg.startswith("--config-file="):
+            config_file = arg.split("=", 1)[1]
+            index += 1
+            continue
+
+        cleaned.append(arg)
+        index += 1
+
+    argv[:] = cleaned
+    return config_file
+
+
+def _load_config_defaults(config_file):
+    if not config_file:
+        return
+
+    config_path = Path(config_file)
+    if not config_path.is_absolute():
+        config_path = Path.cwd() / config_path
+
+    values = runpy.run_path(str(config_path))
+    os.environ.setdefault("KDA_CONFIG_FILE", str(config_path))
+
+    for name, value in values.items():
+        if not name.isupper() or value is None:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            os.environ.setdefault(name, _config_value_to_env(value))
+
+    namespace = values.get("DEFAULT_NAMESPACE")
+    if namespace:
+        os.environ.setdefault("K8S_NAMESPACE", str(namespace))
+
+
+_load_config_defaults(_extract_config_file(sys.argv))
+
 from session_handler import session_handler
 from workspace_connector import WorkspaceConnector
 
-HTTP_PORT = int(os.getenv("COMPUTE_AGENT_HTTP_PORT", "8080"))
+HTTP_PORT = int(os.getenv("COMPUTE_AGENT_HTTP_PORT") or os.getenv("COMPUTE_AGENT_PORT", "8080"))
 TCP_TERMINAL_PORT = int(os.getenv("COMPUTE_AGENT_TCP_PORT", "8081"))
 
 _LOG_FORMAT = os.getenv("LOG_FORMAT", "detailed").lower()
+_APP_LOG_LEVEL = os.getenv("APP_LOG_LEVEL", "INFO").upper()
+_LOG_LEVEL = getattr(logging, _APP_LOG_LEVEL, logging.INFO)
 _handler = logging.StreamHandler()
 if _LOG_FORMAT == "json":
     from pythonjsonlogger import jsonlogger
@@ -28,13 +88,13 @@ if _LOG_FORMAT == "json":
         rename_fields={'asctime': 'ts', 'levelname': 'level', 'name': 'logger'},
         datefmt='%Y-%m-%dT%H:%M:%S%z',
     ))
-    logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
+    logging.basicConfig(level=_LOG_LEVEL, handlers=[_handler], force=True)
 else:
     _handler.setFormatter(logging.Formatter(
         fmt='[%(asctime)s] [%(levelname)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S %z',
     ))
-    logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
+    logging.basicConfig(level=_LOG_LEVEL, handlers=[_handler], force=True)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
