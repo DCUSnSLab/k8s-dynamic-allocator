@@ -4,7 +4,7 @@
 This is the one-command wrapper for the logging pipeline:
 
 1. Create a temporary pod that mounts the logs PVC.
-2. Copy /mnt/logs from that pod into this repository under tools/log_export.
+2. Copy /mnt/logs from that pod into this repository under log_analysis/log_export.
 3. Generate thin timeline CSV files from the copied JSONL files.
 4. Delete the temporary pod.
 """
@@ -26,7 +26,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUT_DIR = REPO_ROOT / "tools" / "log_export"
+DEFAULT_OUT_DIR = REPO_ROOT / "log_analysis" / "log_export"
 OUTPUT_TZ = timezone(timedelta(hours=9))
 
 TIMELINE_COLUMNS = [

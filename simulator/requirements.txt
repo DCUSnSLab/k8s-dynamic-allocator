@@ -1,0 +1,2 @@
+asyncssh>=2.14.0
+PyYAML>=6.0.0

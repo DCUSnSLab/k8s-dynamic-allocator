@@ -1,0 +1,63 @@
+# KDA simulator scenario.
+# Choice fields show available values in comments.
+
+experiment:
+  name: E1_constant_p95_pool
+  pool_policy: dynamic
+  pool_size: 5
+  controller_replicas: 3
+
+ssh:
+  host: 203.250.33.144
+  port: 30622
+
+users:
+  prefix: test
+  count: 10
+
+workload:
+  # profile choices:
+  #   avg          -> 8.7232 req/hour
+  #   p95_high     -> 41 req/hour
+  #   p99_peak     -> 150.68 req/hour
+  #   max_stress   -> 903 req/hour
+  #   nhpp_daily   -> hourly NHPP profile from OnlineJudge DB
+  #   any number   -> use that number as lambda_per_hour
+  profile: p95_high
+
+  # scope choices:
+  #   system   -> lambda is the total system arrival rate
+  #   per_user -> lambda is multiplied by users.count
+  lambda_scope: system
+
+  # null means run until Ctrl+C or max_requests is reached.
+  duration_minutes: null
+  max_requests: null
+
+  # Same seed reproduces the same request schedule. null means a different
+  # random schedule each run.
+  random_seed: 1035
+
+  # Only used when profile is nhpp_daily.
+  # 1 means real-time replay, 12 means a 24-hour pattern is replayed in 2 hours.
+  nhpp_time_compression: 1
+
+commands:
+  items:
+    - name: light
+      weight: 33
+      command: sleep 5
+    - name: cpu_loop
+      weight: 33
+      command: 'python3 -c "import math; [math.sqrt(i) for i in range(3000000)]"'
+    - name: mem_200m_10s
+      weight: 33
+      command: 'python3 -c "import time; x=bytearray(200*1024*1024); time.sleep(10); print(len(x))"'
+
+output:
+  dir: simulator/results
+
+  # -1 = do not save command stdout/stderr
+  #  0 = save full command stdout/stderr
+  # >0 = save only the last N characters
+  command_output_chars: 0

@@ -51,6 +51,7 @@ except NameError:
     c = None
 
 if c is not None:
+    # pyrefly: ignore [missing-import]
     from kubessh.authentication.dummy import DummyAuthenticator
 
     c.KubeSSH.host_key_path = "./kubessh/dummy-kubessh-host-key"
