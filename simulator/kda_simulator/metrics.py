@@ -67,9 +67,9 @@ class SummaryCollector:
             if isinstance(value, (int, float)) and math.isfinite(value):
                 target.append(float(value))
 
-        if not record.get("ticket_id"):
+        if record.get("ticket_expected", True) and not record.get("ticket_id"):
             self.ticket_missing += 1
-        if not record.get("compute_pod"):
+        if record.get("compute_allocation_expected", True) and not record.get("compute_pod"):
             self.allocation_missing += 1
 
     def to_dict(self) -> dict[str, Any]:

@@ -44,7 +44,7 @@ async def main() -> None:
     validate_config(config)
 
     rng = random.Random(config.workload.random_seed)
-    selector = WeightedCommandSelector(config.commands, rng)
+    selector = WeightedCommandSelector(config.commands, rng, config.execution.mode)
 
     if args.dry_run:
         preview_limit = config.workload.max_requests or 10
@@ -109,6 +109,7 @@ def build_request_plan(
 
 def print_dry_run(config: SimulatorConfig, plans: list[dict[str, Any]]) -> None:
     print(f"experiment_name={config.experiment.name}")
+    print(f"execution_mode={config.execution.mode}")
     print(f"mode={config.workload.mode}")
     print(f"scenario={config.workload.scenario}")
     print(f"lambda_scope={config.workload.lambda_scope}")
@@ -210,6 +211,7 @@ async def run_simulation(
             "scenario": config.workload.scenario,
             "lambda_scope": config.workload.lambda_scope,
         },
+        "execution": config.execution.__dict__,
         "summary": summary.to_dict(),
         "stopped_by_interrupt": stopped_by_interrupt,
     }
@@ -283,13 +285,16 @@ async def execute_request(
         "command_name": command.name,
         "command": command.command,
         "remote_command": command.remote_command,
+        "execution_mode": config.execution.mode,
         "status": status,
         "exit_status": result.exit_status,
         "duration_ms": result.elapsed_ms,
         "schedule_lag_ms": schedule_lag_ms,
         "client_queue_delay_ms": client_queue_delay_ms,
         "per_user_queue_delay_ms": result.per_user_queue_delay_ms,
+        "ticket_expected": config.expects_ticket(),
         "ticket_id": result.ticket_id,
+        "compute_allocation_expected": config.expects_compute_allocation(),
         "compute_pod": result.compute_pod,
         "compute_pod_ip": result.compute_pod_ip,
         "timed_out": result.timed_out,

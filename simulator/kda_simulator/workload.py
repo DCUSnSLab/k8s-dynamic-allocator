@@ -5,7 +5,14 @@ import re
 import shlex
 from dataclasses import dataclass
 
-from .config import MARKER_PREFIX, RUN_COMMAND, CommandItem, CommandsConfig
+from .config import (
+    EXECUTION_MODE_BASELINE_DIRECT,
+    EXECUTION_MODE_KDA,
+    MARKER_PREFIX,
+    RUN_COMMAND,
+    CommandItem,
+    CommandsConfig,
+)
 
 
 SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -19,9 +26,15 @@ class SelectedCommand:
 
 
 class WeightedCommandSelector:
-    def __init__(self, config: CommandsConfig, rng: random.Random) -> None:
+    def __init__(
+        self,
+        config: CommandsConfig,
+        rng: random.Random,
+        execution_mode: str = EXECUTION_MODE_KDA,
+    ) -> None:
         self._config = config
         self._rng = rng
+        self._execution_mode = execution_mode
         self._items = list(config.items)
         self._weights = [item.weight for item in self._items]
 
@@ -30,7 +43,12 @@ class WeightedCommandSelector:
         return SelectedCommand(
             name=item.name,
             command=item.command,
-            remote_command=build_remote_command(self._config, item, request_id),
+            remote_command=build_remote_command(
+                self._config,
+                item,
+                request_id,
+                self._execution_mode,
+            ),
         )
 
 
@@ -39,7 +57,12 @@ def sanitize_id(value: str) -> str:
     return value or "request"
 
 
-def build_remote_command(_config: CommandsConfig, item: CommandItem, request_id: str) -> str:
+def build_remote_command(
+    _config: CommandsConfig,
+    item: CommandItem,
+    request_id: str,
+    execution_mode: str = EXECUTION_MODE_KDA,
+) -> str:
     marker_label = sanitize_id(MARKER_PREFIX)
     safe_request_id = sanitize_id(request_id)
     safe_command_name = sanitize_id(item.name)
@@ -51,5 +74,10 @@ def build_remote_command(_config: CommandsConfig, item: CommandItem, request_id:
         "exit $exit_code"
     )
 
-    argv = [RUN_COMMAND, "bash", "-lc", script]
+    if execution_mode == EXECUTION_MODE_BASELINE_DIRECT:
+        argv = ["bash", "-lc", script]
+    elif execution_mode == EXECUTION_MODE_KDA:
+        argv = [RUN_COMMAND, "bash", "-lc", script]
+    else:
+        raise ValueError(f"Unsupported execution mode: {execution_mode}")
     return shlex.join(argv)

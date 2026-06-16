@@ -2,10 +2,10 @@
 # Choice fields show available values in comments.
 
 experiment:
-  name: NHPP_daily
-  pool_policy: dynamic
-  pool_size: 5
-  controller_replicas: 3
+  name: E1_baseline
+  pool_policy: baseline-direct
+  pool_size: null
+  controller_replicas: 0
 
 ssh:
   host: 203.250.33.144
@@ -53,6 +53,9 @@ commands:
     - name: mem_200m_10s
       weight: 33
       command: 'python3 -c "import time; x=bytearray(200*1024*1024); time.sleep(10); print(len(x))"'
+
+execution:
+  mode: baseline-direct
 
 output:
   dir: simulator/results

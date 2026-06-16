@@ -45,6 +45,9 @@ NHPP_DAILY_PROFILE = [
 
 # Internal simulator behavior. These are intentionally not YAML fields.
 RUN_COMMAND = "run"
+EXECUTION_MODE_KDA = "kda"
+EXECUTION_MODE_BASELINE_DIRECT = "baseline-direct"
+EXECUTION_MODES = {EXECUTION_MODE_KDA, EXECUTION_MODE_BASELINE_DIRECT}
 MARKER_PREFIX = "KDA_SIM"
 CLIENT_MAX_INFLIGHT = 100
 PER_USER_MAX_INFLIGHT = 1
@@ -103,6 +106,11 @@ class CommandsConfig:
 
 
 @dataclass
+class ExecutionConfig:
+    mode: str = EXECUTION_MODE_KDA
+
+
+@dataclass
 class OutputConfig:
     dir: str
     command_output_chars: int
@@ -115,6 +123,7 @@ class SimulatorConfig:
     users: UsersConfig
     workload: WorkloadConfig
     commands: CommandsConfig
+    execution: ExecutionConfig
     output: OutputConfig
 
     def user_names(self) -> list[str]:
@@ -129,6 +138,12 @@ class SimulatorConfig:
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2, sort_keys=True)
 
+    def expects_ticket(self) -> bool:
+        return self.execution.mode == EXECUTION_MODE_KDA
+
+    def expects_compute_allocation(self) -> bool:
+        return self.execution.mode == EXECUTION_MODE_KDA
+
 
 def load_config(path: str | Path) -> SimulatorConfig:
     path = Path(path)
@@ -137,7 +152,7 @@ def load_config(path: str | Path) -> SimulatorConfig:
     _ensure_allowed(
         "root",
         data,
-        {"experiment", "ssh", "users", "workload", "commands", "output"},
+        {"experiment", "ssh", "users", "workload", "commands", "execution", "output"},
     )
 
     config = SimulatorConfig(
@@ -146,6 +161,7 @@ def load_config(path: str | Path) -> SimulatorConfig:
         users=_load_users(_required_section(data, "users")),
         workload=_load_workload(_required_section(data, "workload")),
         commands=_load_commands(_required_section(data, "commands")),
+        execution=_load_execution(_optional_section(data, "execution")),
         output=_load_output(_required_section(data, "output")),
     )
     validate_config(config)
@@ -238,6 +254,11 @@ def _load_commands(data: dict[str, Any]) -> CommandsConfig:
     return CommandsConfig(items=items)
 
 
+def _load_execution(data: dict[str, Any]) -> ExecutionConfig:
+    _ensure_allowed("execution", data, {"mode"})
+    return ExecutionConfig(mode=str(data.get("mode") or EXECUTION_MODE_KDA))
+
+
 def _load_output(data: dict[str, Any]) -> OutputConfig:
     _ensure_allowed("output", data, {"dir", "command_output_chars"})
     return OutputConfig(
@@ -302,6 +323,9 @@ def validate_config(config: SimulatorConfig) -> None:
         raise ValueError("commands.items must contain at least one command")
     if any(item.weight <= 0 for item in config.commands.items):
         raise ValueError("Every command weight must be positive")
+    if config.execution.mode not in EXECUTION_MODES:
+        choices = ", ".join(sorted(EXECUTION_MODES))
+        raise ValueError(f"execution.mode must be one of: {choices}")
 
 
 def _mapping(value: Any, section: str) -> dict[str, Any]:
@@ -312,6 +336,13 @@ def _mapping(value: Any, section: str) -> dict[str, Any]:
 
 def _required_section(data: dict[str, Any], name: str) -> dict[str, Any]:
     return _mapping(_required_value(data, name, "root"), name)
+
+
+def _optional_section(data: dict[str, Any], name: str) -> dict[str, Any]:
+    value = data.get(name)
+    if value is None:
+        return {}
+    return _mapping(value, name)
 
 
 def _required_value(data: dict[str, Any], name: str, section: str) -> Any:
