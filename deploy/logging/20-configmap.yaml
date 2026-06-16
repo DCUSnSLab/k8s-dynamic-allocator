@@ -20,7 +20,9 @@ data:
     [INPUT]
         Name                 tail
         Tag                  kube.*
-        Path                 /var/log/containers/*_kda-test_*.log
+        # Watch only experiment system components. User command output is
+        # recorded by simulator/results, so user pods are intentionally omitted.
+        Path                 /var/log/containers/swlabssh-*_kda-test_swlabssh-*.log,/var/log/containers/controller-*_kda-test_controller-*.log,/var/log/containers/compute-general-*_kda-test_compute-agent-*.log,/var/log/containers/controller-queue-redis-*_kda-test_redis-*.log
         Path_Key             filename
         Parser               cri
         DB                   /buffers/fluent-bit/tail.db
@@ -49,13 +51,13 @@ data:
         Match                kube.*
         Regex                $kubernetes['namespace_name'] ^kda-test$
 
-    # Keep only allocator control-plane components. User pods, smoke checks,
-    # log-reader pods, Redis, and Fluent Bit itself are intentionally excluded.
+    # Keep only allocator experiment system components. User pods, smoke checks,
+    # log-reader pods, and Fluent Bit itself are intentionally excluded.
     [FILTER]
         Name                 grep
         Match                kube.*
         Logical_Op           or
-        Regex                $kubernetes['labels']['app'] ^(controller|warm-pod-pool)$
+        Regex                $kubernetes['labels']['app'] ^(controller|warm-pod-pool|controller-queue-redis)$
         Regex                $kubernetes['labels']['kubessh'] ^swlabssh$
 
     [OUTPUT]
