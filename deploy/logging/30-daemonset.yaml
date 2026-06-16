@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: fluent-bit
-  namespace: swlabpods
+  namespace: kda-test
   labels:
     app: fluent-bit
 spec:

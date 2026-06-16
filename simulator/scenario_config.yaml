@@ -2,7 +2,7 @@
 # Choice fields show available values in comments.
 
 experiment:
-  name: E1_constant_p95_pool
+  name: NHPP_daily
   pool_policy: dynamic
   pool_size: 5
   controller_replicas: 3
@@ -23,7 +23,7 @@ workload:
   #   max_stress   -> 903 req/hour
   #   nhpp_daily   -> hourly NHPP profile from OnlineJudge DB
   #   any number   -> use that number as lambda_per_hour
-  profile: p95_high
+  profile: nhpp_daily
 
   # scope choices:
   #   system   -> lambda is the total system arrival rate

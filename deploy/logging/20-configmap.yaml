@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: fluent-bit-config
-  namespace: swlabpods
+  namespace: kda-test
 data:
   fluent-bit.conf: |
     [SERVICE]
@@ -20,7 +20,7 @@ data:
     [INPUT]
         Name                 tail
         Tag                  kube.*
-        Path                 /var/log/containers/*_swlabpods_*.log
+        Path                 /var/log/containers/*_kda-test_*.log
         Path_Key             filename
         Parser               cri
         DB                   /buffers/fluent-bit/tail.db
@@ -47,7 +47,7 @@ data:
     [FILTER]
         Name                 grep
         Match                kube.*
-        Regex                $kubernetes['namespace_name'] ^swlabpods$
+        Regex                $kubernetes['namespace_name'] ^kda-test$
 
     # Keep only allocator control-plane components. User pods, smoke checks,
     # log-reader pods, Redis, and Fluent Bit itself are intentionally excluded.
