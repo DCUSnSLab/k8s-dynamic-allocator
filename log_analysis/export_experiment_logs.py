@@ -35,8 +35,17 @@ TIMELINE_COLUMNS = [
     "pod",
     "compute_pod",
     "module",
+    "component",
     "level",
     "event",
+    "request_label",
+    "request_id",
+    "username",
+    "command_name",
+    "exit_status",
+    "session_id",
+    "conn",
+    "chan",
     "message",
 ]
 
@@ -53,6 +62,14 @@ DETAILED_SIMPLE_RE = re.compile(
     r"\[(?P<level>[A-Z]+)\]\s+(?P<message>.*)$"
 )
 REQUEST_LABEL_RE = re.compile(r"^-?$|^[A-Za-z0-9_.]+-[A-Fa-f0-9]{6,}$")
+ASYNCSSH_LOG_RE = re.compile(r"^\[asyncssh\]\s+(?:(?P<context>\[[^\]]+\])\s+)?(?P<body>.*)$")
+KUBESSH_LOG_RE = re.compile(r"^\[KubeSSH\]\s+(?P<body>.*)$")
+SIM_COMMAND_RE = re.compile(r"\brequest_id=(?P<request_id>\S+)\s+command=(?P<command_name>[A-Za-z0-9_.-]+)")
+AUTH_USER_RE = re.compile(r"\buser\s+(?P<username>[A-Za-z0-9_.-]+)\b")
+LOGIN_ATTEMPT_RE = re.compile(r"\bLogin attempted by (?P<username>[A-Za-z0-9_.-]+)\b")
+EXIT_STATUS_RE = re.compile(r"\b(?:exit status\s+|exit_code=)(?P<exit_status>-?\d+)\b")
+PORT_RE = re.compile(r"\bport\s+(?P<port>\d+)\b")
+SESSION_ID_RE = re.compile(r"\bsession[:=]\s*(?P<session_id>[A-Za-z0-9_.-]+)\b")
 
 
 def parse_args() -> argparse.Namespace:
@@ -260,6 +277,151 @@ def parse_message_fields(message: str, level: str = "") -> Tuple[str, str, str, 
     return component, event, body.strip(), fields
 
 
+def parse_asyncssh_context(context: str) -> Dict[str, str]:
+    fields: Dict[str, str] = {}
+    if not context:
+        return fields
+    for item in KEY_VALUE_RE.finditer(context.strip("[]")):
+        fields[item.group("key")] = item.group("value").rstrip(",")
+    return fields
+
+
+def classify_asyncssh_body(body: str) -> str:
+    text = body.strip()
+    if text.startswith("Creating SSH listener"):
+        return "ssh_listener_started"
+    if text.startswith("Accepted SSH client connection"):
+        return "ssh_connection_accepted"
+    if text.startswith("Sending server host keys disabled"):
+        return "ssh_host_keys_disabled"
+    if text.startswith("Local address:"):
+        return "ssh_local_address"
+    if text.startswith("Peer address:"):
+        return "ssh_peer_address"
+    if text.startswith("Beginning auth"):
+        return "ssh_auth_started"
+    if text.startswith("Auth for user"):
+        lowered = text.lower()
+        if "succeed" in lowered:
+            return "ssh_auth_succeeded"
+        if "fail" in lowered:
+            return "ssh_auth_failed"
+        return "ssh_auth"
+    if text.startswith("New SSH session requested"):
+        return "ssh_session_requested"
+    if text.startswith("PTY created"):
+        return "ssh_pty_created"
+    if text.startswith("Line editor enabled"):
+        return "ssh_line_editor_enabled"
+    if text.startswith("Command:"):
+        return "ssh_command_started"
+    if text.startswith("Sending exit status"):
+        return "ssh_exit_status_sent"
+    if text.startswith("Closing channel"):
+        return "ssh_channel_closing"
+    if text.startswith("Received channel close"):
+        return "ssh_channel_close_received"
+    if text.startswith("Channel closed"):
+        return "ssh_channel_closed"
+    return "asyncssh"
+
+
+def classify_kubessh_body(body: str) -> str:
+    text = body.strip()
+    if text.startswith("Loaded host key"):
+        return "kubessh_host_key_loaded"
+    if text.startswith("Login attempted by"):
+        return "kubessh_login_attempted"
+    if text.startswith("PVC ") and " already exists" in text:
+        return "kubessh_pvc_exists"
+    if text.startswith("Loop exited:"):
+        return "kubessh_loop_exited"
+    if text.startswith("TTY cleanup completed"):
+        return "kubessh_tty_cleanup_completed"
+    if text.startswith("TTY shutdown"):
+        return "kubessh_tty_shutdown"
+    if text.startswith("Non-TTY cleanup completed"):
+        return "kubessh_nontty_cleanup_completed"
+    if text.startswith("SSH connection disconnected"):
+        return "kubessh_connection_disconnected"
+    return "kubessh"
+
+
+def normalize_dcusshk8s_message(
+    message: str,
+    level: str,
+    component: str,
+    event: str,
+    message_body: str,
+    fields: Dict[str, str],
+) -> Tuple[str, str, str, str, Dict[str, str]]:
+    text = (message or "").strip()
+    fields = dict(fields)
+
+    asyncssh_match = ASYNCSSH_LOG_RE.match(text)
+    if asyncssh_match:
+        component = "asyncssh"
+        context = asyncssh_match.group("context") or ""
+        body = (asyncssh_match.group("body") or "").strip()
+        fields.update(parse_asyncssh_context(context))
+        event = classify_asyncssh_body(body)
+        message_body = body
+
+        auth_match = AUTH_USER_RE.search(body)
+        if auth_match:
+            fields["username"] = auth_match.group("username")
+
+        status_match = EXIT_STATUS_RE.search(body)
+        if status_match:
+            fields["exit_status"] = status_match.group("exit_status")
+
+        port_match = PORT_RE.search(body)
+        if port_match:
+            fields["port"] = port_match.group("port")
+
+        if body.startswith("Command:"):
+            command_text = body.split("Command:", 1)[1].strip()
+            fields["remote_command"] = command_text
+            command_match = SIM_COMMAND_RE.search(command_text)
+            if command_match:
+                fields["request_id"] = command_match.group("request_id")
+                fields["request_label"] = command_match.group("request_id")
+                fields["command_name"] = command_match.group("command_name")
+            elif command_text:
+                fields.setdefault("command_name", command_text.split(maxsplit=1)[0])
+
+        return component, event, message_body, level, fields
+
+    kubessh_match = KUBESSH_LOG_RE.match(text)
+    if kubessh_match:
+        component = "KubeSSH"
+        body = (kubessh_match.group("body") or "").strip()
+        event = classify_kubessh_body(body)
+        message_body = body
+        if "user" in fields and "username" not in fields:
+            fields["username"] = fields["user"]
+        if "session" in fields and "session_id" not in fields:
+            fields["session_id"] = fields["session"]
+        login_match = LOGIN_ATTEMPT_RE.search(body)
+        if login_match:
+            fields["username"] = login_match.group("username")
+        session_match = SESSION_ID_RE.search(body)
+        if session_match:
+            fields["session_id"] = session_match.group("session_id")
+        return component, event, message_body, level, fields
+
+    if "RuntimeWarning:" in text:
+        event = "runtime_warning"
+        level = level or "WARNING"
+    elif text.startswith("Traceback ") or text.startswith("File ") or text.startswith('File "'):
+        event = "traceback"
+        level = level or "ERROR"
+    elif not event and text:
+        event = "log"
+
+    return component, event, message_body, level, fields
+
+
 def identify_module(labels: Dict[str, object], pod_name: str, container_name: str) -> str:
     app_label = str(labels.get("app") or "")
     kubessh_label = str(labels.get("kubessh") or "")
@@ -327,6 +489,15 @@ def parse_fluent_bit_record(line: str, source_file: Path, bucket_seconds: int) -
     level, message = normalize_message_level(str(app_log.get("level") or app_log.get("levelname") or ""), message)
     component, event, message_body, fields = parse_message_fields(message, level)
     module = identify_module(labels, pod_name, container_name)
+    if module == "dcusshk8s":
+        component, event, message_body, level, fields = normalize_dcusshk8s_message(
+            message,
+            level,
+            component,
+            event,
+            message_body,
+            fields,
+        )
     compute_pod = fields.get("compute_pod") or ""
     if module == "compute" and not compute_pod:
         compute_pod = pod_name
@@ -353,6 +524,46 @@ def parse_fluent_bit_record(line: str, source_file: Path, bucket_seconds: int) -
     return row
 
 
+def enrich_dcusshk8s_events(events: List[Dict[str, str]]) -> None:
+    users_by_connection: Dict[Tuple[str, str], Dict[str, str]] = {}
+    requests_by_channel: Dict[Tuple[str, str, str], Dict[str, str]] = {}
+
+    for event in events:
+        if event.get("module") != "dcusshk8s":
+            continue
+
+        pod = event.get("pod") or ""
+        conn = event.get("conn") or ""
+        chan = event.get("chan") or ""
+        if conn:
+            connection_key = (pod, conn)
+            if event.get("username"):
+                users_by_connection[connection_key] = {"username": event["username"]}
+            elif connection_key in users_by_connection:
+                event.update(users_by_connection[connection_key])
+
+        if not (conn and chan):
+            continue
+
+        channel_key = (pod, conn, chan)
+        if event.get("request_id") or event.get("command_name"):
+            stored = {
+                key: value
+                for key in ("request_id", "request_label", "command_name", "username")
+                if (value := event.get(key))
+            }
+            if stored:
+                requests_by_channel[channel_key] = stored
+            continue
+
+        stored = requests_by_channel.get(channel_key)
+        if not stored:
+            continue
+        for key, value in stored.items():
+            if not event.get(key):
+                event[key] = value
+
+
 def read_log_events(paths: List[Path], bucket_seconds: int) -> List[Dict[str, str]]:
     events: List[Dict[str, str]] = []
     for path in paths:
@@ -362,6 +573,7 @@ def read_log_events(paths: List[Path], bucket_seconds: int) -> List[Dict[str, st
                 if row:
                     events.append(row)
     events.sort(key=lambda item: (int(item.get("_ts_ms") or 0), item.get("source_file") or ""))
+    enrich_dcusshk8s_events(events)
     return events
 
 

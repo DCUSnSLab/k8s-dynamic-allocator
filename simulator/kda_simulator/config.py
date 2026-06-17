@@ -87,6 +87,7 @@ class WorkloadConfig:
     max_requests: int | None
     random_seed: int | None
     nhpp_time_compression: float
+    nhpp_start_hour: int | None
     mode: str
     scenario: str
     lambda_per_hour: float
@@ -211,6 +212,7 @@ def _load_workload(data: dict[str, Any]) -> WorkloadConfig:
             "max_requests",
             "random_seed",
             "nhpp_time_compression",
+            "nhpp_start_hour",
         },
     )
     profile = _required_value(data, "profile", "workload")
@@ -226,6 +228,7 @@ def _load_workload(data: dict[str, Any]) -> WorkloadConfig:
         max_requests=_optional_int(data.get("max_requests"), "workload.max_requests"),
         random_seed=_optional_int(data.get("random_seed"), "workload.random_seed"),
         nhpp_time_compression=float(data.get("nhpp_time_compression", 12.0)),
+        nhpp_start_hour=_optional_int(data.get("nhpp_start_hour"), "workload.nhpp_start_hour"),
         mode=mode,
         scenario=scenario,
         lambda_per_hour=lambda_per_hour,
@@ -317,6 +320,10 @@ def validate_config(config: SimulatorConfig) -> None:
             raise ValueError("nhpp_daily profile cannot contain negative rates")
         if config.workload.nhpp_time_compression <= 0:
             raise ValueError("workload.nhpp_time_compression must be positive")
+        if config.workload.nhpp_start_hour is not None and not (
+            0 <= config.workload.nhpp_start_hour <= 23
+        ):
+            raise ValueError("workload.nhpp_start_hour must be between 0 and 23 or null")
     else:
         raise ValueError("workload.profile must resolve to constant or nhpp mode")
     if not config.commands.items:

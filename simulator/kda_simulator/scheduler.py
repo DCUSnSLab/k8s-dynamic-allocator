@@ -78,7 +78,11 @@ def _iter_nhpp_schedule(config: SimulatorConfig, rng: random.Random) -> Iterator
     duration = _duration_seconds(config)
     segment_seconds = 3600.0 / config.workload.nhpp_time_compression
     profile = config.workload.nhpp_profile_per_hour
-    start_hour = datetime.now().hour
+    start_hour = (
+        config.workload.nhpp_start_hour
+        if config.workload.nhpp_start_hour is not None
+        else datetime.now().hour
+    )
     sequence = 0
     segment_index = 0
 
