@@ -13,17 +13,18 @@ ssh:
 
 users:
   prefix: test
-  count: 10
+  count: 100
 
 workload:
   # profile choices:
-  #   avg          -> 8.7232 req/hour
-  #   p95_high     -> 41 req/hour
-  #   p99_peak     -> 150.68 req/hour
-  #   max_stress   -> 903 req/hour
-  #   nhpp_daily   -> hourly NHPP profile from OnlineJudge DB
-  #   any number   -> use that number as lambda_per_hour
-  profile: nhpp_daily
+  #   avg          -> 0.170454 req/min (daily average, vacation excluded)
+  #   active_avg   -> 0.278805 req/min (10:00-21:00 average, vacation excluded)
+  #   p95_high     -> 0.8 req/min
+  #   p99_peak     -> 2.766667 req/min
+  #   max_stress   -> 15.05 req/min
+  #   nhpp_daily   -> hourly NHPP profile from OnlineJudge DB with vacation excluded, expressed as req/min
+  #   any number   -> use that number as lambda_per_minute
+  profile: 0.278805
 
   # scope choices:
   #   system   -> lambda is the total system arrival rate
@@ -37,6 +38,9 @@ workload:
   # Same seed reproduces the same request schedule. null means a different
   # random schedule each run.
   random_seed: 1035
+  # Optional CSV trace to replay. Prefer generating one trace and replaying it
+  # across baseline, warm_pool, and cold_start experiments.
+  trace_file: null
 
   # Only used when profile is nhpp_daily.
   # 1 means real-time replay, 12 means a 24-hour pattern is replayed in 2 hours.
@@ -47,15 +51,24 @@ workload:
 
 commands:
   items:
-    - name: light
+    - name: cpu
+      weight: 34
+      command: >-
+        python3 -c "import time, math; end=time.time()+60; x=0.0; i=0; exec('while time.time() < end:\n    x += math.sqrt(i % 1000000)\n    i += 1'); print(x)"
+    - name: mem
       weight: 33
-      command: sleep 5
-    - name: cpu_loop
+      command: >-
+        python3 -c "import time; x=bytearray(256*1024*1024); exec('for i in range(0, len(x), 4096):\n    x[i] = 1'); time.sleep(60); print(len(x))"
+    - name: cpu_mem
       weight: 33
-      command: 'python3 -c "import math; print(sum(math.sqrt(i) for i in range(6000000)))"'
-    - name: mem_100m_20s
-      weight: 33
-      command: 'python3 -c "import time; x=bytearray(100*1024*1024); time.sleep(20); print(len(x))"'
+      command: >-
+        python3 -c "import time, math; x=bytearray(220*1024*1024); exec('for j in range(0, len(x), 4096):\n    x[j] = 1'); end=time.time()+60; y=0.0; i=0; exec('while time.time() < end:\n    y += math.sqrt(i % 1000000)\n    i += 1'); print(len(x), y)"
+
+background_activity:
+  enabled: true
+  memory_mb: 20
+  cpu_period_seconds: 10
+  cpu_busy_seconds: 0.2
 
 execution:
   mode: baseline-direct

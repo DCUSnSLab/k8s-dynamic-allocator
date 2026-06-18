@@ -42,7 +42,7 @@ python simulator\run_simulator.py
 - `--dry-run` : 실제 SSH 접속 없이 요청 스케줄만 출력. `max_requests`가 없으면 기본 10개만 미리보기
 - `--experiment-name <name>` : 실험 이름 변경
 - `--users <N>` : 사용자 수 변경
-- `--profile <value>` : workload profile 변경. 예: `avg`, `p95_high`, `nhpp_daily`, `600`
+- `--profile <value>` : workload profile 변경. 예: `avg`, `p95_high`, `nhpp_daily`, `10`
 - `--random-seed <seed>` : 랜덤 seed 변경
 - `--duration-minutes <N>` : 실행 시간 변경
 - `--max-requests <N>` : 최대 요청 수 변경
@@ -50,7 +50,7 @@ python simulator\run_simulator.py
 예시:
 
 ```powershell
-python simulator\run_simulator.py --users 1 --profile 36000 --duration-minutes 1 --max-requests 1 --experiment-name smoke_swlabssh
+python simulator\run_simulator.py --users 1 --profile 10 --duration-minutes 1 --max-requests 1 --experiment-name smoke_swlabssh
 ```
 
 위 명령은 config 파일을 수정하지 않고, 사용자 1명으로 요청 1개만 보내는 smoke test를

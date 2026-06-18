@@ -12,6 +12,7 @@ from typing import Any, Iterator
 from .config import (
     CLIENT_MAX_INFLIGHT,
     COMMAND_TIMEOUT_SECONDS,
+    CommandItem,
     NHPP_DAILY_PROFILE,
     SimulatorConfig,
     WRITER_QUEUE_SIZE,
@@ -21,7 +22,18 @@ from .config import (
 )
 from .metrics import AsyncJsonlWriter, SummaryCollector
 from .scheduler import ScheduledRequest, generate_schedule, iter_schedule
-from .workload import SelectedCommand, WeightedCommandSelector, sanitize_id
+from .trace import (
+    TraceEntry,
+    generate_trace_entries,
+    read_trace_csv,
+    write_trace_csv,
+)
+from .workload import (
+    SelectedCommand,
+    WeightedCommandSelector,
+    build_remote_command,
+    sanitize_id,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-seed", type=int, help="Override workload.random_seed.")
     parser.add_argument("--duration-minutes", type=float, help="Override workload duration in minutes.")
     parser.add_argument("--max-requests", type=int, help="Override workload.max_requests.")
+    parser.add_argument("--trace-file", help="Replay a pre-generated request trace CSV.")
+    parser.add_argument("--export-trace", help="Generate a request trace CSV and exit.")
     return parser.parse_args()
 
 
@@ -46,14 +60,33 @@ async def main() -> None:
     rng = random.Random(config.workload.random_seed)
     selector = WeightedCommandSelector(config.commands, rng, config.execution.mode)
 
-    if args.dry_run:
-        preview_limit = config.workload.max_requests or 10
-        schedule = generate_schedule(config, rng, limit=preview_limit)
-        plans = [build_request_plan(config, item, selector) for item in schedule]
-        print_dry_run(config, plans)
+    trace_file = args.trace_file or config.workload.trace_file
+    if args.export_trace:
+        entries = generate_trace_entries(config, rng, selector)
+        count = write_trace_csv(args.export_trace, entries)
+        print(f"Trace: {args.export_trace}")
+        print(f"Generated {count} requests")
         return
 
-    await run_simulation(config, iter_schedule(config, rng), selector)
+    if args.dry_run:
+        preview_limit = config.workload.max_requests or 10
+        if trace_file:
+            entries = read_trace_csv(trace_file)
+            plans = [build_request_plan_from_trace(config, item) for item in entries[:preview_limit]]
+            print_dry_run(config, plans, trace_file=trace_file, total_trace_requests=len(entries))
+        else:
+            schedule = generate_schedule(config, rng, limit=preview_limit)
+            plans = [build_request_plan(config, item, selector) for item in schedule]
+            print_dry_run(config, plans)
+        return
+
+    if trace_file:
+        entries = read_trace_csv(trace_file)
+        plans = [build_request_plan_from_trace(config, item) for item in entries]
+    else:
+        plans = iter_request_plans(config, iter_schedule(config, rng), selector)
+
+    await run_simulation(config, plans, trace_file=trace_file)
 
 
 def apply_overrides(config: SimulatorConfig, args: argparse.Namespace) -> None:
@@ -66,8 +99,8 @@ def apply_overrides(config: SimulatorConfig, args: argparse.Namespace) -> None:
         config.workload.profile = profile
         config.workload.scenario = str(profile)
         config.workload.mode = "nhpp" if profile == "nhpp_daily" else "constant"
-        config.workload.lambda_per_hour = _lambda_for_profile(profile)
-        config.workload.nhpp_profile_per_hour = (
+        config.workload.lambda_per_minute = _lambda_for_profile(profile)
+        config.workload.nhpp_profile_per_minute = (
             list(NHPP_DAILY_PROFILE)
             if config.workload.mode == "nhpp"
             else []
@@ -81,6 +114,8 @@ def apply_overrides(config: SimulatorConfig, args: argparse.Namespace) -> None:
         config.workload.duration_minutes = args.duration_minutes
     if args.max_requests is not None:
         config.workload.max_requests = args.max_requests
+    if args.trace_file:
+        config.workload.trace_file = args.trace_file
 
 
 def parse_profile_override(value: str) -> str | float:
@@ -107,12 +142,64 @@ def build_request_plan(
     }
 
 
-def print_dry_run(config: SimulatorConfig, plans: list[dict[str, Any]]) -> None:
+def build_request_plan_from_trace(
+    config: SimulatorConfig,
+    item: TraceEntry,
+) -> dict[str, Any]:
+    experiment_id = sanitize_id(config.experiment.name)
+    request_id = f"{experiment_id}-{item.sequence:06d}"
+    command_item = CommandItem(name=item.command_name, weight=1.0, command=item.command)
+    selected = SelectedCommand(
+        name=item.command_name,
+        command=item.command,
+        remote_command=build_remote_command(
+            config.commands,
+            command_item,
+            request_id,
+            config.execution.mode,
+        ),
+    )
+    return {
+        "request_id": request_id,
+        "sequence": item.sequence,
+        "planned_offset_seconds": item.planned_offset_seconds,
+        "username": item.username,
+        "command": selected,
+    }
+
+
+def iter_request_plans(
+    config: SimulatorConfig,
+    scheduled_requests: Iterator[ScheduledRequest],
+    selector: WeightedCommandSelector,
+) -> Iterator[dict[str, Any]]:
+    for scheduled in scheduled_requests:
+        yield build_request_plan(config, scheduled, selector)
+
+
+def print_dry_run(
+    config: SimulatorConfig,
+    plans: list[dict[str, Any]],
+    *,
+    trace_file: str | None = None,
+    total_trace_requests: int | None = None,
+) -> None:
     print(f"experiment_name={config.experiment.name}")
     print(f"execution_mode={config.execution.mode}")
+    print(f"background_activity={config.background_activity.enabled}")
+    if config.background_activity.enabled:
+        print(
+            "background_activity_config="
+            f"memory_mb:{config.background_activity.memory_mb},"
+            f"cpu_busy_seconds:{config.background_activity.cpu_busy_seconds},"
+            f"cpu_period_seconds:{config.background_activity.cpu_period_seconds}"
+        )
     print(f"mode={config.workload.mode}")
     print(f"scenario={config.workload.scenario}")
     print(f"lambda_scope={config.workload.lambda_scope}")
+    if trace_file:
+        print(f"trace_file={trace_file}")
+        print(f"trace_requests={total_trace_requests}")
     print(f"users={config.users.count}")
     max_requests = (
         str(config.workload.max_requests)
@@ -136,20 +223,25 @@ def print_dry_run(config: SimulatorConfig, plans: list[dict[str, Any]]) -> None:
 
 async def run_simulation(
     config: SimulatorConfig,
-    scheduled_requests: Iterator[ScheduledRequest],
-    selector: WeightedCommandSelector,
+    request_plans: Iterator[dict[str, Any]],
+    *,
+    trace_file: str | None = None,
 ) -> None:
     from .ssh_runner import SSHSessionPool, strip_ansi
 
     output_dir = make_output_dir(config)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "config.json").write_text(config.to_json() + "\n", encoding="utf-8")
+    if trace_file:
+        trace_entries = read_trace_csv(trace_file)
+        write_trace_csv(output_dir / "trace.csv", trace_entries)
 
     writer = AsyncJsonlWriter(output_dir / "requests.jsonl", WRITER_QUEUE_SIZE)
     summary = SummaryCollector()
     pool = SSHSessionPool(config)
     tasks: list[asyncio.Task[None]] = []
     stopped_by_interrupt = False
+    background_attempted = False
 
     print(f"Output: {output_dir}")
     if config.workload.duration_minutes is None and config.workload.max_requests is None:
@@ -162,13 +254,17 @@ async def run_simulation(
     await writer.start()
     try:
         await warmup_users(config, pool)
+        if config.background_activity.enabled:
+            from .background import start_background_activity
+
+            background_attempted = True
+            await start_background_activity(config, pool)
 
         started_mono = time.monotonic()
         started_wall = now_iso()
         global_sem = asyncio.Semaphore(CLIENT_MAX_INFLIGHT)
 
-        for scheduled in scheduled_requests:
-            plan = build_request_plan(config, scheduled, selector)
+        for plan in request_plans:
             target_mono = started_mono + float(plan["planned_offset_seconds"])
             sleep_for = target_mono - time.monotonic()
             if sleep_for > 0:
@@ -199,6 +295,10 @@ async def run_simulation(
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        if background_attempted:
+            from .background import stop_background_activity
+
+            await stop_background_activity(config, pool)
         await pool.close()
         await writer.close()
 
@@ -210,8 +310,10 @@ async def run_simulation(
             "mode": config.workload.mode,
             "scenario": config.workload.scenario,
             "lambda_scope": config.workload.lambda_scope,
+            "trace_file": trace_file,
         },
         "execution": config.execution.__dict__,
+        "background_activity": config.background_activity.__dict__,
         "summary": summary.to_dict(),
         "stopped_by_interrupt": stopped_by_interrupt,
     }

@@ -58,8 +58,7 @@ metadata:
 spec:
   accessModes:
   - ReadWriteOnce
-  # storageClassName: "normal-r3"
-  storageClassName: "openebs-hostpath"
+  storageClassName: "normal-r3"
   resources:
     requests:
       storage: 1Gi

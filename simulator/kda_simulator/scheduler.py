@@ -36,10 +36,10 @@ def iter_schedule(config: SimulatorConfig, rng: random.Random) -> Iterator[Sched
     raise ValueError(f"Unsupported workload mode: {config.workload.mode}")
 
 
-def _apply_scope(config: SimulatorConfig, lambda_per_hour: float) -> float:
+def _apply_scope(config: SimulatorConfig, lambda_per_minute: float) -> float:
     if config.workload.lambda_scope == "per_user":
-        return lambda_per_hour * config.users.count
-    return lambda_per_hour
+        return lambda_per_minute * config.users.count
+    return lambda_per_minute
 
 
 def _assign_user(config: SimulatorConfig, rng: random.Random) -> str:
@@ -54,8 +54,8 @@ def _duration_seconds(config: SimulatorConfig) -> float | None:
 
 
 def _iter_constant_schedule(config: SimulatorConfig, rng: random.Random) -> Iterator[ScheduledRequest]:
-    lambda_per_hour = _apply_scope(config, config.workload.lambda_per_hour)
-    lambda_per_second = lambda_per_hour / 3600.0
+    lambda_per_minute = _apply_scope(config, config.workload.lambda_per_minute)
+    lambda_per_second = lambda_per_minute / 60.0
     duration = _duration_seconds(config)
     planned = 0.0
     sequence = 0
@@ -77,7 +77,7 @@ def _iter_constant_schedule(config: SimulatorConfig, rng: random.Random) -> Iter
 def _iter_nhpp_schedule(config: SimulatorConfig, rng: random.Random) -> Iterator[ScheduledRequest]:
     duration = _duration_seconds(config)
     segment_seconds = 3600.0 / config.workload.nhpp_time_compression
-    profile = config.workload.nhpp_profile_per_hour
+    profile = config.workload.nhpp_profile_per_minute
     start_hour = (
         config.workload.nhpp_start_hour
         if config.workload.nhpp_start_hour is not None
@@ -92,8 +92,8 @@ def _iter_nhpp_schedule(config: SimulatorConfig, rng: random.Random) -> Iterator
         if duration is not None and segment_start >= duration:
             break
 
-        lambda_per_hour = _apply_scope(config, profile[hour])
-        lambda_for_segment = lambda_per_hour
+        lambda_per_minute = _apply_scope(config, profile[hour])
+        lambda_for_segment = lambda_per_minute * 60.0
         if lambda_for_segment <= 0:
             segment_index += 1
             continue

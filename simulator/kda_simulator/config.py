@@ -10,37 +10,38 @@ import yaml
 
 
 CONSTANT_WORKLOAD_PROFILES = {
-    "avg": 8.7232,
-    "p95_high": 41.0,
-    "p99_peak": 150.68,
-    "max_stress": 903.0,
+    "avg": 0.170454,
+    "active_avg": 0.278805,
+    "p95_high": 0.8,
+    "p99_peak": 2.766667,
+    "max_stress": 15.05,
 }
 
 NHPP_DAILY_PROFILE = [
-    5.0525,
-    4.1479,
-    2.6615,
-    1.4066,
-    1.2451,
-    0.7393,
-    0.5136,
-    0.6245,
-    1.0895,
-    4.0447,
-    11.3696,
-    8.5253,
-    7.2043,
-    13.6031,
-    33.8560,
-    38.0992,
-    20.0525,
-    6.3521,
-    7.3891,
-    7.7179,
-    8.2471,
-    8.7388,
-    8.6881,
-    7.9864,
+    0.098554,
+    0.080708,
+    0.052055,
+    0.027511,
+    0.024353,
+    0.014460,
+    0.009703,
+    0.012024,
+    0.021309,
+    0.079110,
+    0.222374,
+    0.166743,
+    0.140906,
+    0.265677,
+    0.661872,
+    0.744635,
+    0.392161,
+    0.124239,
+    0.144521,
+    0.150761,
+    0.161187,
+    0.170586,
+    0.169559,
+    0.155898,
 ]
 
 # Internal simulator behavior. These are intentionally not YAML fields.
@@ -86,12 +87,13 @@ class WorkloadConfig:
     duration_minutes: float | None
     max_requests: int | None
     random_seed: int | None
+    trace_file: str | None
     nhpp_time_compression: float
     nhpp_start_hour: int | None
     mode: str
     scenario: str
-    lambda_per_hour: float
-    nhpp_profile_per_hour: list[float] = field(default_factory=list)
+    lambda_per_minute: float
+    nhpp_profile_per_minute: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -104,6 +106,14 @@ class CommandItem:
 @dataclass
 class CommandsConfig:
     items: list[CommandItem]
+
+
+@dataclass
+class BackgroundActivityConfig:
+    enabled: bool
+    memory_mb: int
+    cpu_period_seconds: float
+    cpu_busy_seconds: float
 
 
 @dataclass
@@ -124,6 +134,7 @@ class SimulatorConfig:
     users: UsersConfig
     workload: WorkloadConfig
     commands: CommandsConfig
+    background_activity: BackgroundActivityConfig
     execution: ExecutionConfig
     output: OutputConfig
 
@@ -153,7 +164,16 @@ def load_config(path: str | Path) -> SimulatorConfig:
     _ensure_allowed(
         "root",
         data,
-        {"experiment", "ssh", "users", "workload", "commands", "execution", "output"},
+        {
+            "experiment",
+            "ssh",
+            "users",
+            "workload",
+            "commands",
+            "background_activity",
+            "execution",
+            "output",
+        },
     )
 
     config = SimulatorConfig(
@@ -162,6 +182,9 @@ def load_config(path: str | Path) -> SimulatorConfig:
         users=_load_users(_required_section(data, "users")),
         workload=_load_workload(_required_section(data, "workload")),
         commands=_load_commands(_required_section(data, "commands")),
+        background_activity=_load_background_activity(
+            _optional_section(data, "background_activity")
+        ),
         execution=_load_execution(_optional_section(data, "execution")),
         output=_load_output(_required_section(data, "output")),
     )
@@ -211,6 +234,7 @@ def _load_workload(data: dict[str, Any]) -> WorkloadConfig:
             "duration_minutes",
             "max_requests",
             "random_seed",
+            "trace_file",
             "nhpp_time_compression",
             "nhpp_start_hour",
         },
@@ -218,7 +242,7 @@ def _load_workload(data: dict[str, Any]) -> WorkloadConfig:
     profile = _required_value(data, "profile", "workload")
     mode = "nhpp" if profile == "nhpp_daily" else "constant"
     scenario = str(profile)
-    lambda_per_hour = _lambda_for_profile(profile)
+    lambda_per_minute = _lambda_for_profile(profile)
     return WorkloadConfig(
         profile=profile,
         lambda_scope=str(data.get("lambda_scope") or "system"),
@@ -227,12 +251,13 @@ def _load_workload(data: dict[str, Any]) -> WorkloadConfig:
         ),
         max_requests=_optional_int(data.get("max_requests"), "workload.max_requests"),
         random_seed=_optional_int(data.get("random_seed"), "workload.random_seed"),
+        trace_file=_optional_str(data.get("trace_file"), "workload.trace_file"),
         nhpp_time_compression=float(data.get("nhpp_time_compression", 12.0)),
         nhpp_start_hour=_optional_int(data.get("nhpp_start_hour"), "workload.nhpp_start_hour"),
         mode=mode,
         scenario=scenario,
-        lambda_per_hour=lambda_per_hour,
-        nhpp_profile_per_hour=list(NHPP_DAILY_PROFILE) if mode == "nhpp" else [],
+        lambda_per_minute=lambda_per_minute,
+        nhpp_profile_per_minute=list(NHPP_DAILY_PROFILE) if mode == "nhpp" else [],
     )
 
 
@@ -255,6 +280,21 @@ def _load_commands(data: dict[str, Any]) -> CommandsConfig:
             )
         )
     return CommandsConfig(items=items)
+
+
+def _load_background_activity(data: dict[str, Any]) -> BackgroundActivityConfig:
+    _ensure_allowed(
+        "background_activity",
+        data,
+        {"enabled", "memory_mb", "cpu_period_seconds", "cpu_busy_seconds"},
+    )
+    return BackgroundActivityConfig(
+        enabled=_optional_bool(data.get("enabled"), "background_activity.enabled", False),
+        memory_mb=_optional_int(data.get("memory_mb"), "background_activity.memory_mb")
+        or 0,
+        cpu_period_seconds=float(data.get("cpu_period_seconds", 10.0)),
+        cpu_busy_seconds=float(data.get("cpu_busy_seconds", 0.0)),
+    )
 
 
 def _load_execution(data: dict[str, Any]) -> ExecutionConfig:
@@ -310,12 +350,12 @@ def validate_config(config: SimulatorConfig) -> None:
     if config.workload.max_requests is not None and config.workload.max_requests <= 0:
         raise ValueError("workload.max_requests must be positive or null")
     if config.workload.mode == "constant":
-        if config.workload.lambda_per_hour <= 0:
+        if config.workload.lambda_per_minute <= 0:
             raise ValueError("workload.profile must resolve to a positive lambda")
     elif config.workload.mode == "nhpp":
-        profile = config.workload.nhpp_profile_per_hour
+        profile = config.workload.nhpp_profile_per_minute
         if len(profile) != 24:
-            raise ValueError("nhpp_daily profile must contain 24 hourly lambdas")
+            raise ValueError("nhpp_daily profile must contain 24 minute-based lambdas")
         if any(rate < 0 for rate in profile):
             raise ValueError("nhpp_daily profile cannot contain negative rates")
         if config.workload.nhpp_time_compression <= 0:
@@ -330,6 +370,21 @@ def validate_config(config: SimulatorConfig) -> None:
         raise ValueError("commands.items must contain at least one command")
     if any(item.weight <= 0 for item in config.commands.items):
         raise ValueError("Every command weight must be positive")
+    if config.background_activity.enabled:
+        if config.background_activity.memory_mb < 0:
+            raise ValueError("background_activity.memory_mb must be non-negative")
+        if config.background_activity.cpu_period_seconds <= 0:
+            raise ValueError("background_activity.cpu_period_seconds must be positive")
+        if config.background_activity.cpu_busy_seconds < 0:
+            raise ValueError("background_activity.cpu_busy_seconds must be non-negative")
+        if (
+            config.background_activity.cpu_busy_seconds
+            > config.background_activity.cpu_period_seconds
+        ):
+            raise ValueError(
+                "background_activity.cpu_busy_seconds must be less than or equal to "
+                "background_activity.cpu_period_seconds"
+            )
     if config.execution.mode not in EXECUTION_MODES:
         choices = ", ".join(sorted(EXECUTION_MODES))
         raise ValueError(f"execution.mode must be one of: {choices}")
@@ -372,6 +427,29 @@ def _optional_int(value: Any, field_name: str) -> int | None:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must be an integer or null") from exc
+
+
+def _optional_bool(value: Any, field_name: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"{field_name} must be a boolean")
+
+
+def _optional_str(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    raise ValueError(f"{field_name} must be a string or null")
 
 
 def _optional_float(value: Any, field_name: str) -> float | None:
