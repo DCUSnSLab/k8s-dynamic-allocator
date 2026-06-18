@@ -127,6 +127,7 @@ def parse_datetime_value(value: object) -> Optional[datetime]:
     text = str(value).strip()
     if not text:
         return None
+    text = normalize_fractional_seconds(text)
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:
@@ -148,6 +149,11 @@ def parse_datetime_value(value: object) -> Optional[datetime]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def normalize_fractional_seconds(value: str) -> str:
+    """Trim nanosecond log timestamps to Python datetime microsecond precision."""
+    return re.sub(r"(\.\d{6})\d+(?=Z|[+-]\d{2}:?\d{2}$|$)", r"\1", value)
 
 
 def floor_time(dt: datetime, bucket_seconds: int) -> datetime:
