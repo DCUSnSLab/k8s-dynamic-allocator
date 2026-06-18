@@ -5,7 +5,7 @@ import base64
 import shlex
 from typing import Any
 
-from .config import CLIENT_MAX_INFLIGHT, SimulatorConfig
+from .config import SimulatorConfig
 
 
 BACKGROUND_COMMAND_TIMEOUT_SECONDS = 60.0
@@ -95,16 +95,31 @@ async def start_background_activity(config: SimulatorConfig, pool: Any) -> None:
         f"{config.background_activity.cpu_period_seconds}s)..."
     )
     command = build_start_command(config)
-    results = await _run_for_users(config, pool, command)
-    failed = [
-        (username, result.error or result.exit_status)
-        for username, result in results
-        if result.error or result.timed_out or result.exit_status not in (0, None)
-    ]
-    if failed:
+    remaining = list(config.user_names())
+    failed: list[tuple[str, str]] = []
+    for attempt in range(1, config.setup.retry_attempts + 1):
+        results = await _run_for_users(config, pool, command, usernames=remaining)
+        failed = [
+            (username, _result_error_summary(result))
+            for username, result in results
+            if result.error or result.timed_out or result.exit_status not in (0, None)
+        ]
+        if not failed:
+            print("Background activity started")
+            return
+
+        remaining = [username for username, _error in failed]
         preview = ", ".join(f"{username}={error}" for username, error in failed[:5])
-        raise RuntimeError(f"Background activity failed for {len(failed)} users: {preview}")
-    print("Background activity started")
+        if attempt < config.setup.retry_attempts:
+            print(
+                "Background activity retry "
+                f"{attempt}/{config.setup.retry_attempts}: "
+                f"{len(failed)} users not ready yet ({preview})"
+            )
+            await asyncio.sleep(config.setup.retry_delay_seconds)
+
+    preview = ", ".join(f"{username}={error}" for username, error in failed[:5])
+    raise RuntimeError(f"Background activity failed for {len(failed)} users: {preview}")
 
 
 async def stop_background_activity(config: SimulatorConfig, pool: Any) -> None:
@@ -123,9 +138,7 @@ async def stop_background_activity(config: SimulatorConfig, pool: Any) -> None:
             or getattr(result, "timed_out", False)
             or getattr(result, "exit_status", 0) not in (0, None)
         ):
-            failed.append(
-                (username, getattr(result, "error", None) or getattr(result, "exit_status", None))
-            )
+            failed.append((username, _result_error_summary(result)))
     if failed:
         preview = ", ".join(f"{username}={error}" for username, error in failed[:5])
         print(f"Background activity stop warnings: {preview}")
@@ -137,9 +150,10 @@ async def _run_for_users(
     pool: Any,
     command: str,
     *,
+    usernames: list[str] | None = None,
     return_exceptions: bool = False,
 ) -> list[tuple[str, Any]]:
-    sem = asyncio.Semaphore(CLIENT_MAX_INFLIGHT)
+    sem = asyncio.Semaphore(config.setup.max_inflight)
 
     async def _run(username: str) -> tuple[str, Any]:
         async with sem:
@@ -155,7 +169,7 @@ async def _run_for_users(
             return username, result
 
     return await asyncio.gather(
-        *(_run(username) for username in config.user_names()),
+        *(_run(username) for username in (usernames or config.user_names())),
         return_exceptions=False,
     )
 
@@ -166,14 +180,18 @@ def build_start_command(config: SimulatorConfig) -> str:
     script = f"""
 set -eu
 mkdir -p "$HOME/.kda-sim"
-python3 -c 'import base64, pathlib; pathlib.Path.home().joinpath(".kda-sim").mkdir(exist_ok=True); pathlib.Path.home().joinpath(".kda-sim/background_activity.py").write_bytes(base64.b64decode({payload!r}))'
+python3 -c "import base64, pathlib; pathlib.Path.home().joinpath('.kda-sim').mkdir(exist_ok=True); pathlib.Path.home().joinpath('.kda-sim/background_activity.py').write_bytes(base64.b64decode('{payload}'))"
 if [ -f "$HOME/.kda-sim/background_activity.pid" ]; then
   old_pid="$(cat "$HOME/.kda-sim/background_activity.pid" 2>/dev/null || true)"
   if [ -n "$old_pid" ]; then
     kill "$old_pid" 2>/dev/null || true
   fi
 fi
-nohup python3 "$HOME/.kda-sim/background_activity.py" \
+launcher="env -u KUBESSH_SESSION_ID"
+if command -v setsid >/dev/null 2>&1; then
+  launcher="setsid env -u KUBESSH_SESSION_ID"
+fi
+$launcher nohup python3 "$HOME/.kda-sim/background_activity.py" \
   --memory-mb {int(activity.memory_mb)} \
   --cpu-period-seconds {float(activity.cpu_period_seconds)} \
   --cpu-busy-seconds {float(activity.cpu_busy_seconds)} \
@@ -213,3 +231,33 @@ fi
 
 def _bash_command(script: str) -> str:
     return "bash -lc " + shlex.quote(script)
+
+
+def _result_error_summary(result: Any) -> str:
+    if isinstance(result, BaseException):
+        return str(result)
+    parts: list[str] = []
+    error = getattr(result, "error", None)
+    if error:
+        parts.append(str(error))
+    if getattr(result, "timed_out", False):
+        parts.append("timed_out")
+    exit_status = getattr(result, "exit_status", None)
+    if exit_status not in (0, None):
+        parts.append(f"exit={exit_status}")
+    stdout = _tail(getattr(result, "stdout", ""))
+    stderr = _tail(getattr(result, "stderr", ""))
+    if stdout:
+        parts.append(f"stdout={stdout!r}")
+    if stderr:
+        parts.append(f"stderr={stderr!r}")
+    return "; ".join(parts) or "unknown"
+
+
+def _tail(value: Any, limit: int = 240) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:]

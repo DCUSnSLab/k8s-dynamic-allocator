@@ -90,15 +90,14 @@ class SSHUserSession:
         return await self.run_remote("pwd", timeout=COMMAND_TIMEOUT_SECONDS)
 
     async def run_remote(self, remote_command: str, timeout: float) -> CommandResult:
-        await self.connect()
-        if self._connection is None:
-            raise RuntimeError("SSH connection was not established")
-
         lock_wait_started = time.monotonic()
         async with self._run_lock:
             per_user_queue_delay_ms = (time.monotonic() - lock_wait_started) * 1000.0
             started = time.monotonic()
             try:
+                await self.connect()
+                if self._connection is None:
+                    raise RuntimeError("SSH connection was not established")
                 result = await self._connection.run(
                     remote_command,
                     check=False,
@@ -138,6 +137,7 @@ class SSHUserSession:
                     error=f"command timed out after {timeout} seconds",
                 )
             except Exception as exc:
+                self._connection = None
                 elapsed_ms = (time.monotonic() - started) * 1000.0
                 return CommandResult(
                     exit_status=None,

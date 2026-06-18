@@ -10,6 +10,7 @@ __pycache__/
 .codex
 .agents
 log_analysis/log_export/
+data/
 
 venv/
 env/

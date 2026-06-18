@@ -4,7 +4,7 @@
 This is the one-command wrapper for the logging pipeline:
 
 1. Create a temporary pod that mounts the logs PVC.
-2. Copy /mnt/logs from that pod into this repository under log_analysis/log_export.
+2. Copy /mnt/logs from that pod into a data/log_analysis result directory.
 3. Generate thin timeline CSV files from the copied JSONL files.
 4. Delete the temporary pod.
 """
@@ -16,6 +16,7 @@ import csv
 import gzip
 import glob
 import json
+import os
 import re
 import subprocess
 from datetime import datetime
@@ -26,7 +27,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUT_DIR = REPO_ROOT / "log_analysis" / "log_export"
+RUN_DIR_ENV = "KDA_RUN_DIR"
+EXPERIMENT_NAME_ENV = "KDA_EXPERIMENT_NAME"
+DEFAULT_RESULTS_DIR = REPO_ROOT / "data" / "log_analysis"
 OUTPUT_TZ = timezone(timedelta(hours=9))
 
 TIMELINE_COLUMNS = [
@@ -82,8 +85,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kubectl", default="kubectl", help="kubectl executable name or path.")
     parser.add_argument(
         "--out-dir",
-        default=str(DEFAULT_OUT_DIR),
-        help="Directory for copied JSONL logs and generated program-log CSV files.",
+        default=None,
+        help=(
+            "Directory for copied JSONL logs and generated program-log CSV files. "
+            "Overrides --run-dir and KDA_RUN_DIR."
+        ),
+    )
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help=(
+            "Result directory name. When set, logs are written to "
+            "data/log_analysis/<run-dir>. Can also be provided with KDA_RUN_DIR."
+        ),
+    )
+    parser.add_argument(
+        "--experiment-name",
+        default=None,
+        help=(
+            "Name used when creating a new timestamped log result directory. "
+            "Can also be provided with KDA_EXPERIMENT_NAME. Defaults to logs."
+        ),
+    )
+    parser.add_argument(
+        "--results-dir",
+        default=str(DEFAULT_RESULTS_DIR),
+        help="Log analysis results root used with --run-dir or KDA_RUN_DIR.",
     )
     parser.add_argument(
         "--bucket-seconds",
@@ -729,9 +756,26 @@ def list_log_files(raw_dir: Path) -> List[Path]:
     return [path for path in files if path.is_file()]
 
 
+def resolve_output_dir(args: argparse.Namespace) -> Path:
+    if args.out_dir:
+        return Path(args.out_dir).resolve()
+
+    results_dir = Path(args.results_dir).resolve()
+    run_dir_name = str(args.run_dir or os.getenv(RUN_DIR_ENV) or "").strip()
+    if run_dir_name:
+        safe_name = safe_filename(run_dir_name)
+        if safe_name != run_dir_name or safe_name in {"", ".", ".."}:
+            raise SystemExit(f"Unsafe run directory name: {run_dir_name!r}")
+        return (results_dir / safe_name).resolve()
+
+    experiment_name = str(args.experiment_name or os.getenv(EXPERIMENT_NAME_ENV) or "logs")
+    result_name = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{safe_filename(experiment_name)}"
+    return (results_dir / result_name).resolve()
+
+
 def main() -> int:
     args = parse_args()
-    out_dir = Path(args.out_dir).resolve()
+    out_dir = resolve_output_dir(args)
     raw_dir = out_dir / "raw-jsonl"
     csv_dir = out_dir
     pod_name = f"log-export-{datetime.now().strftime('%H%M%S')}"

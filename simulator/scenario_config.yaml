@@ -70,11 +70,19 @@ background_activity:
   cpu_period_seconds: 10
   cpu_busy_seconds: 0.2
 
+setup:
+  # Existing user pods/PVCs can use a higher setup concurrency.
+  # When recreating all pods/PVCs from scratch, use max_inflight: 10 and
+  # retry_delay_seconds: 15 to reduce API server and storage pressure.
+  max_inflight: 25
+  retry_attempts: 6
+  retry_delay_seconds: 5
+
 execution:
   mode: baseline-direct
 
 output:
-  dir: simulator/results
+  dir: data/simulator
 
   # -1 = do not save command stdout/stderr
   #  0 = save full command stdout/stderr

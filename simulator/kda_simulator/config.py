@@ -51,6 +51,9 @@ EXECUTION_MODE_BASELINE_DIRECT = "baseline-direct"
 EXECUTION_MODES = {EXECUTION_MODE_KDA, EXECUTION_MODE_BASELINE_DIRECT}
 MARKER_PREFIX = "KDA_SIM"
 CLIENT_MAX_INFLIGHT = 100
+SETUP_MAX_INFLIGHT = 10
+WARMUP_MAX_ATTEMPTS = 6
+WARMUP_RETRY_DELAY_SECONDS = 15.0
 PER_USER_MAX_INFLIGHT = 1
 CONNECT_TIMEOUT_SECONDS = 30.0
 COMMAND_TIMEOUT_SECONDS = 1800.0
@@ -117,6 +120,13 @@ class BackgroundActivityConfig:
 
 
 @dataclass
+class SetupConfig:
+    max_inflight: int
+    retry_attempts: int
+    retry_delay_seconds: float
+
+
+@dataclass
 class ExecutionConfig:
     mode: str = EXECUTION_MODE_KDA
 
@@ -135,6 +145,7 @@ class SimulatorConfig:
     workload: WorkloadConfig
     commands: CommandsConfig
     background_activity: BackgroundActivityConfig
+    setup: SetupConfig
     execution: ExecutionConfig
     output: OutputConfig
 
@@ -171,6 +182,7 @@ def load_config(path: str | Path) -> SimulatorConfig:
             "workload",
             "commands",
             "background_activity",
+            "setup",
             "execution",
             "output",
         },
@@ -185,6 +197,7 @@ def load_config(path: str | Path) -> SimulatorConfig:
         background_activity=_load_background_activity(
             _optional_section(data, "background_activity")
         ),
+        setup=_load_setup(_optional_section(data, "setup")),
         execution=_load_execution(_optional_section(data, "execution")),
         output=_load_output(_required_section(data, "output")),
     )
@@ -297,6 +310,24 @@ def _load_background_activity(data: dict[str, Any]) -> BackgroundActivityConfig:
     )
 
 
+def _load_setup(data: dict[str, Any]) -> SetupConfig:
+    _ensure_allowed(
+        "setup",
+        data,
+        {"max_inflight", "retry_attempts", "retry_delay_seconds"},
+    )
+    return SetupConfig(
+        max_inflight=_optional_int(data.get("max_inflight"), "setup.max_inflight")
+        or SETUP_MAX_INFLIGHT,
+        retry_attempts=_optional_int(data.get("retry_attempts"), "setup.retry_attempts")
+        or WARMUP_MAX_ATTEMPTS,
+        retry_delay_seconds=_optional_float(
+            data.get("retry_delay_seconds"), "setup.retry_delay_seconds"
+        )
+        or WARMUP_RETRY_DELAY_SECONDS,
+    )
+
+
 def _load_execution(data: dict[str, Any]) -> ExecutionConfig:
     _ensure_allowed("execution", data, {"mode"})
     return ExecutionConfig(mode=str(data.get("mode") or EXECUTION_MODE_KDA))
@@ -305,7 +336,7 @@ def _load_execution(data: dict[str, Any]) -> ExecutionConfig:
 def _load_output(data: dict[str, Any]) -> OutputConfig:
     _ensure_allowed("output", data, {"dir", "command_output_chars"})
     return OutputConfig(
-        dir=str(data.get("dir") or "simulator/results"),
+        dir=str(data.get("dir") or "data/simulator"),
         command_output_chars=int(data.get("command_output_chars", 0)),
     )
 
@@ -385,6 +416,12 @@ def validate_config(config: SimulatorConfig) -> None:
                 "background_activity.cpu_busy_seconds must be less than or equal to "
                 "background_activity.cpu_period_seconds"
             )
+    if config.setup.max_inflight <= 0:
+        raise ValueError("setup.max_inflight must be positive")
+    if config.setup.retry_attempts <= 0:
+        raise ValueError("setup.retry_attempts must be positive")
+    if config.setup.retry_delay_seconds < 0:
+        raise ValueError("setup.retry_delay_seconds must be non-negative")
     if config.execution.mode not in EXECUTION_MODES:
         choices = ", ".join(sorted(EXECUTION_MODES))
         raise ValueError(f"execution.mode must be one of: {choices}")

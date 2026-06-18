@@ -61,7 +61,7 @@ python simulator\run_simulator.py --users 1 --profile 10 --duration-minutes 1 --
 결과는 아래 경로에 저장된다.
 
 ```text
-simulator/results/<timestamp>_<experiment.name>/
+data/simulator/<timestamp>_<experiment.name>/
 ```
 
 생성 파일:

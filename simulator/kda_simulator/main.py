@@ -229,21 +229,17 @@ async def run_simulation(
 ) -> None:
     from .ssh_runner import SSHSessionPool, strip_ansi
 
-    output_dir = make_output_dir(config)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "config.json").write_text(config.to_json() + "\n", encoding="utf-8")
-    if trace_file:
-        trace_entries = read_trace_csv(trace_file)
-        write_trace_csv(output_dir / "trace.csv", trace_entries)
-
-    writer = AsyncJsonlWriter(output_dir / "requests.jsonl", WRITER_QUEUE_SIZE)
     summary = SummaryCollector()
     pool = SSHSessionPool(config)
     tasks: list[asyncio.Task[None]] = []
     stopped_by_interrupt = False
     background_attempted = False
+    output_dir: Path | None = None
+    writer: AsyncJsonlWriter | None = None
+    setup_started_wall = now_iso()
+    setup_completed_wall: str | None = None
+    experiment_started_wall: str | None = None
 
-    print(f"Output: {output_dir}")
     if config.workload.duration_minutes is None and config.workload.max_requests is None:
         print("Running until Ctrl+C")
     elif config.workload.max_requests is not None:
@@ -251,7 +247,6 @@ async def run_simulation(
     else:
         print(f"Running for {config.workload.duration_minutes} minutes of scheduled workload")
 
-    await writer.start()
     try:
         await warmup_users(config, pool)
         if config.background_activity.enabled:
@@ -260,8 +255,24 @@ async def run_simulation(
             background_attempted = True
             await start_background_activity(config, pool)
 
+        setup_completed_wall = now_iso()
+        print(f"Warm-up complete at {setup_completed_wall}")
+
+        output_dir = make_output_dir(config)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "config.json").write_text(config.to_json() + "\n", encoding="utf-8")
+        if trace_file:
+            trace_entries = read_trace_csv(trace_file)
+            write_trace_csv(output_dir / "trace.csv", trace_entries)
+
+        writer = AsyncJsonlWriter(output_dir / "requests.jsonl", WRITER_QUEUE_SIZE)
+        await writer.start()
+
         started_mono = time.monotonic()
-        started_wall = now_iso()
+        experiment_started_wall = now_iso()
+        write_server_log_export_hint(output_dir)
+        print(f"Output: {output_dir}")
+        print_server_log_export_hint(output_dir)
         global_sem = asyncio.Semaphore(CLIENT_MAX_INFLIGHT)
 
         for plan in request_plans:
@@ -277,7 +288,7 @@ async def run_simulation(
                         writer=writer,
                         summary=summary,
                         global_sem=global_sem,
-                        experiment_started_wall=started_wall,
+                        experiment_started_wall=experiment_started_wall,
                         experiment_started_mono=started_mono,
                         plan=plan,
                         strip_output=strip_ansi,
@@ -300,12 +311,22 @@ async def run_simulation(
 
             await stop_background_activity(config, pool)
         await pool.close()
-        await writer.close()
+        if writer is not None:
+            await writer.close()
 
+    if output_dir is None:
+        return
     summary_payload = {
         "experiment": config.experiment.__dict__,
         "ssh": {"host": config.ssh.host, "port": config.ssh.port},
         "users": {"count": config.users.count, "prefix": config.users.prefix},
+        "setup": {
+            "started_at": setup_started_wall,
+            "completed_at": setup_completed_wall,
+            "background_activity_enabled": config.background_activity.enabled,
+            "background_activity_started": background_attempted,
+        },
+        "experiment_started_at": experiment_started_wall,
         "workload": {
             "mode": config.workload.mode,
             "scenario": config.workload.scenario,
@@ -327,22 +348,38 @@ async def run_simulation(
 
 async def warmup_users(config: SimulatorConfig, pool: Any) -> None:
     print(f"Warming up {config.users.count} user pods...")
-    sem = asyncio.Semaphore(CLIENT_MAX_INFLIGHT)
+    sem = asyncio.Semaphore(config.setup.max_inflight)
 
     async def _warm(username: str) -> tuple[str, Any]:
         async with sem:
             return username, await pool.get(username).warmup()
 
-    results = await asyncio.gather(*(_warm(username) for username in config.user_names()))
-    failed = [
-        (username, result.error or result.exit_status)
-        for username, result in results
-        if result.error or result.timed_out or result.exit_status not in (0, None)
-    ]
+    remaining = list(config.user_names())
+    failed: list[tuple[str, Any]] = []
+    for attempt in range(1, config.setup.retry_attempts + 1):
+        results = await asyncio.gather(*(_warm(username) for username in remaining))
+        failed = [
+            (username, result.error or result.exit_status)
+            for username, result in results
+            if result.error or result.timed_out or result.exit_status not in (0, None)
+        ]
+        if not failed:
+            print("User pod warm-up complete")
+            return
+
+        remaining = [username for username, _error in failed]
+        preview = ", ".join(f"{username}={error}" for username, error in failed[:5])
+        if attempt < config.setup.retry_attempts:
+            print(
+                "Warm-up retry "
+                f"{attempt}/{config.setup.retry_attempts}: "
+                f"{len(failed)} users not ready yet ({preview})"
+            )
+            await asyncio.sleep(config.setup.retry_delay_seconds)
+
     if failed:
         preview = ", ".join(f"{username}={error}" for username, error in failed[:5])
         raise RuntimeError(f"Warm-up failed for {len(failed)} users: {preview}")
-    print("Warm-up complete")
 
 
 async def execute_request(
@@ -435,6 +472,31 @@ def make_output_dir(config: SimulatorConfig) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     experiment_id = sanitize_id(config.experiment.name)
     return Path(config.output.dir) / f"{timestamp}_{experiment_id}"
+
+
+def server_log_export_command(output_dir: Path) -> str:
+    return (
+        f"KDA_RUN_DIR={output_dir.name} "
+        "python3 export_experiment_logs.py --namespace kda-test --pvc logs-pvc"
+    )
+
+
+def write_server_log_export_hint(output_dir: Path) -> None:
+    content = "\n".join(
+        [
+            "# Run this on the main server after the experiment finishes.",
+            "cd log_analysis",
+            server_log_export_command(output_dir),
+            "",
+        ]
+    )
+    (output_dir / "server_log_export_command.txt").write_text(content, encoding="utf-8")
+
+
+def print_server_log_export_hint(output_dir: Path) -> None:
+    print("Server log export after this run:")
+    print("  cd log_analysis")
+    print(f"  {server_log_export_command(output_dir)}")
 
 
 def now_iso() -> str:

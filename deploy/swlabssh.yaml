@@ -51,7 +51,7 @@ metadata:
   labels:
     app: swlabssh
 spec:
-  replicas: 1
+  replicas: 4
   selector:
     matchLabels:
       kubessh: swlabssh
