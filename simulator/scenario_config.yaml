@@ -8,7 +8,7 @@ experiment:
   controller_replicas: 2
 
 ssh:
-  host: 203.250.33.144
+  host: 203.250.35.87
   port: 30622
 
 users:

@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: fluent-bit-config
-  namespace: swlabpods
+  namespace: kda-test
 data:
   fluent-bit.conf: |
     [SERVICE]
@@ -22,7 +22,7 @@ data:
         Tag                  kube.*
         # Watch only experiment system components. User command output is
         # recorded by simulator/results, so user pods are intentionally omitted.
-        Path                 /var/log/containers/swlabssh-*_swlabpods_swlabssh-*.log,/var/log/containers/controller-*_swlabpods_controller-*.log,/var/log/containers/compute-*_swlabpods_compute-agent-*.log,/var/log/containers/controller-queue-redis-*_swlabpods_redis-*.log
+        Path                 /var/log/containers/swlabssh-*_kda-test_swlabssh-*.log,/var/log/containers/controller-*_kda-test_controller-*.log,/var/log/containers/compute-*_kda-test_compute-agent-*.log,/var/log/containers/controller-queue-redis-*_kda-test_redis-*.log
         Path_Key             filename
         Parser               cri
         DB                   /buffers/fluent-bit/kda-system-tail.db
@@ -49,7 +49,7 @@ data:
     [FILTER]
         Name                 grep
         Match                kube.*
-        Regex                $kubernetes['namespace_name'] ^swlabpods$
+        Regex                $kubernetes['namespace_name'] ^kda-test$
 
     # Keep only allocator experiment system components. User pods, smoke checks,
     # log-reader pods, and Fluent Bit itself are intentionally excluded.

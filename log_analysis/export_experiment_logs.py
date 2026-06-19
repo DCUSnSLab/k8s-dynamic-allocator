@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Copy JSONL logs from logs-pvc into this repo and generate CSV analysis outputs."
     )
-    parser.add_argument("--namespace", default="swlabpods", help="Kubernetes namespace containing logs-pvc.")
+    parser.add_argument("--namespace", default="kda-test", help="Kubernetes namespace containing logs-pvc.")
     parser.add_argument("--pvc", default="logs-pvc", help="PVC name that stores Fluent Bit JSONL logs.")
     parser.add_argument("--reader-image", default="alpine:3.20", help="Temporary pod image. Must include tar.")
     parser.add_argument("--kubectl", default="kubectl", help="kubectl executable name or path.")
