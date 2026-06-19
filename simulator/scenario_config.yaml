@@ -5,7 +5,7 @@ experiment:
   name: E1_warm_pool
   pool_policy: warm-pool
   pool_size: 2
-  controller_replicas: 5
+  controller_replicas: 2
 
 ssh:
   host: 203.250.35.87
