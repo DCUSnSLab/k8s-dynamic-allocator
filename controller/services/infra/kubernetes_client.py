@@ -42,7 +42,7 @@ class KubernetesClient(ABC):
             _config_loaded = True
         
         self.v1 = client.CoreV1Api()
-        self.namespace = namespace or os.getenv("K8S_NAMESPACE") or os.getenv("DEFAULT_NAMESPACE", "swlabpods")
+        self.namespace = namespace or os.getenv("K8S_NAMESPACE") or os.getenv("DEFAULT_NAMESPACE", "kda-test")
     
     def get_pod_ip(self, pod_name: str) -> Optional[str]:
         """

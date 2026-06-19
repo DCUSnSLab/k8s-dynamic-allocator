@@ -2,7 +2,7 @@ apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: logs-rotate
-  namespace: swlabpods
+  namespace: kda-test
 spec:
   schedule: "0 3 * * *"        # Daily at 03:00 UTC
   concurrencyPolicy: Forbid

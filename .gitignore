@@ -9,7 +9,8 @@ __pycache__/
 .claude
 .codex
 .agents
-tools/log_export/
+log_analysis/log_export/
+data/
 
 venv/
 env/
@@ -36,3 +37,6 @@ Thumbs.db
 *key
 
 kubeconfig.yaml
+
+simulator/results/
+simulator/traces/

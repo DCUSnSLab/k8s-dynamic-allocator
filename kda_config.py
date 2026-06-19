@@ -1,6 +1,6 @@
 """Shared runtime settings for the k8s-dynamic-allocator deployment."""
 
-DEFAULT_NAMESPACE = "swlabpods"
+DEFAULT_NAMESPACE = "kda-test"
 
 REDIS_URL = "redis://controller-queue-redis:6379/0"
 CONTROLLER_RELEASE_HOST = "controller-service"
@@ -51,6 +51,7 @@ except NameError:
     c = None
 
 if c is not None:
+    # pyrefly: ignore [missing-import]
     from kubessh.authentication.dummy import DummyAuthenticator
 
     c.KubeSSH.host_key_path = "./kubessh/dummy-kubessh-host-key"

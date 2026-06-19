@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: swlabssh
-  namespace: swlabpods
+  namespace: kda-test
   labels:
     app: swlabssh
 ---
@@ -10,7 +10,7 @@ kind: Role
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: swlabssh-role
-  namespace: swlabpods
+  namespace: kda-test
   labels:
     app: swlabssh
 rules:
@@ -31,13 +31,13 @@ kind: RoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: swlabssh-rolebinding
-  namespace: swlabpods
+  namespace: kda-test
   labels:
     app: swlabssh
 subjects:
   - kind: ServiceAccount
     name: swlabssh
-    namespace: swlabpods
+    namespace: kda-test
 roleRef:
   kind: Role
   name: swlabssh-role
@@ -47,11 +47,11 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: swlabssh
-  namespace: swlabpods
+  namespace: kda-test
   labels:
     app: swlabssh
 spec:
-  replicas: 1
+  replicas: 4
   selector:
     matchLabels:
       kubessh: swlabssh
@@ -88,7 +88,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: swlabssh
-  namespace: swlabpods
+  namespace: kda-test
   labels:
     app: swlabssh
 spec:

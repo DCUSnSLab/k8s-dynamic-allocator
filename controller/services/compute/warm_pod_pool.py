@@ -353,7 +353,6 @@ class WarmPodPool(KubernetesClient):
                 path_params={"namespace": self.namespace, "name": pod_name},
                 body=patch,
                 header_params={"Content-Type": "application/json-patch+json"},
-                response_type="V1Pod",
                 auth_settings=["BearerToken"],
                 _return_http_data_only=True,
                 _preload_content=True,

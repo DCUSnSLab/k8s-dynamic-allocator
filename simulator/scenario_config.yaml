@@ -1,0 +1,90 @@
+# KDA simulator scenario.
+# Choice fields show available values in comments.
+
+experiment:
+  name: E1_warm_pool
+  pool_policy: warm-pool
+  pool_size: 2
+  controller_replicas: 2
+
+ssh:
+  host: 203.250.35.87
+  port: 30622
+
+users:
+  prefix: test
+  count: 100
+
+workload:
+  # profile choices:
+  #   avg          -> 0.170454 req/min (daily average, vacation excluded)
+  #   active_avg   -> 0.278805 req/min (10:00-21:00 average, vacation excluded)
+  #   p95_high     -> 0.8 req/min
+  #   p99_peak     -> 2.766667 req/min
+  #   max_stress   -> 15.05 req/min
+  #   nhpp_daily   -> hourly NHPP profile from OnlineJudge DB with vacation excluded, expressed as req/min
+  #   any number   -> use that number as lambda_per_minute
+  profile: 0.278805
+
+  # scope choices:
+  #   system   -> lambda is the total system arrival rate
+  #   per_user -> lambda is multiplied by users.count
+  lambda_scope: system
+
+  # null means run until Ctrl+C or max_requests is reached.
+  duration_minutes: 720
+  max_requests: null
+
+  # Same seed reproduces the same request schedule. null means a different
+  # random schedule each run.
+  random_seed: 1035
+  # Optional CSV trace to replay. Prefer generating one trace and replaying it
+  # across baseline, warm_pool, and cold_start experiments.
+  trace_file: null
+
+  # Only used when profile is nhpp_daily.
+  # 1 means real-time replay, 12 means a 24-hour pattern is replayed in 2 hours.
+  nhpp_time_compression: 2
+  # null starts from the current local hour. Set 0-23 to make NHPP schedules
+  # reproducible across branches even when runs start at different wall times.
+  nhpp_start_hour: 0
+
+commands:
+  items:
+    - name: cpu
+      weight: 34
+      command: >-
+        python3 -c "import time, math; end=time.time()+60; x=0.0; i=0; exec('while time.time() < end:\n    x += math.sqrt(i % 1000000)\n    i += 1'); print(x)"
+    - name: mem
+      weight: 33
+      command: >-
+        python3 -c "import time; x=bytearray(256*1024*1024); exec('for i in range(0, len(x), 4096):\n    x[i] = 1'); time.sleep(60); print(len(x))"
+    - name: cpu_mem
+      weight: 33
+      command: >-
+        python3 -c "import time, math; x=bytearray(220*1024*1024); exec('for j in range(0, len(x), 4096):\n    x[j] = 1'); end=time.time()+60; y=0.0; i=0; exec('while time.time() < end:\n    y += math.sqrt(i % 1000000)\n    i += 1'); print(len(x), y)"
+
+background_activity:
+  enabled: true
+  memory_mb: 20
+  cpu_period_seconds: 10
+  cpu_busy_seconds: 0.2
+
+setup:
+  # Existing user pods/PVCs can use a higher setup concurrency.
+  # When recreating all pods/PVCs from scratch, use max_inflight: 10 and
+  # retry_delay_seconds: 15 to reduce API server and storage pressure.
+  max_inflight: 25
+  retry_attempts: 6
+  retry_delay_seconds: 5
+
+execution:
+  mode: kda
+
+output:
+  dir: data/simulator
+
+  # -1 = do not save command stdout/stderr
+  #  0 = save full command stdout/stderr
+  # >0 = save only the last N characters
+  command_output_chars: 0

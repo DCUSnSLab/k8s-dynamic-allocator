@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: fluent-bit
-  namespace: swlabpods
+  namespace: kda-test
   labels:
     app: fluent-bit
 spec:
@@ -15,6 +15,13 @@ spec:
         app: fluent-bit
     spec:
       serviceAccountName: fluent-bit
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: DoesNotExist
       tolerations:
       - operator: Exists
         effect: NoSchedule
