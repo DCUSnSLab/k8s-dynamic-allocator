@@ -477,7 +477,7 @@ def make_output_dir(config: SimulatorConfig) -> Path:
 def server_log_export_command(output_dir: Path) -> str:
     return (
         f"KDA_RUN_DIR={output_dir.name} "
-        "python3 export_experiment_logs.py --namespace kda-test --pvc logs-pvc"
+        "python3 export_experiment_logs.py --namespace swlabpods --pvc logs-pvc"
     )
 
 

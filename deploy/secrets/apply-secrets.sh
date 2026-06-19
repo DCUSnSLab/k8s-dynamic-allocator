@@ -2,7 +2,7 @@
 
 set -e
 
-NAMESPACE="kda-test"
+NAMESPACE="swlabpods"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRIVATE_KEY="${SCRIPT_DIR}/compute_ssh_key"
 PUBLIC_KEY="${SCRIPT_DIR}/compute_ssh_key.pub"

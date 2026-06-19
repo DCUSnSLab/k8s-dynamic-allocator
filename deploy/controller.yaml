@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: controller
-  namespace: kda-test
+  namespace: swlabpods
 spec:
   replicas: 2
   selector:
@@ -21,6 +21,8 @@ spec:
         ports:
         - containerPort: 9001
         env:
+        - name: K8S_NAMESPACE
+          value: swlabpods
         - name: REDIS_URL
           value: redis://controller-queue-redis:6379/0
         - name: COMPUTE_POOL_MODE
@@ -45,7 +47,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: controller-service
-  namespace: kda-test
+  namespace: swlabpods
 spec:
   selector:
     app: controller

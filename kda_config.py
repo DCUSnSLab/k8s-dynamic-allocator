@@ -1,6 +1,6 @@
 """Shared runtime settings for the k8s-dynamic-allocator deployment."""
 
-DEFAULT_NAMESPACE = "kda-test"
+DEFAULT_NAMESPACE = "swlabpods"
 
 REDIS_URL = "redis://controller-queue-redis:6379/0"
 CONTROLLER_RELEASE_HOST = "controller-service"
