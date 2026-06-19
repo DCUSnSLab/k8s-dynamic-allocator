@@ -20,6 +20,16 @@ spec:
         imagePullPolicy: Always
         ports:
         - containerPort: 9001
+        env:
+        - name: REDIS_URL
+          value: redis://controller-queue-redis:6379/0
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
 
 ---
 

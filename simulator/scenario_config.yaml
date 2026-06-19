@@ -2,10 +2,10 @@
 # Choice fields show available values in comments.
 
 experiment:
-  name: E1_baseline
-  pool_policy: baseline-direct
-  pool_size: null
-  controller_replicas: 0
+  name: E1_warm_pool
+  pool_policy: warm-pool
+  pool_size: 2
+  controller_replicas: 5
 
 ssh:
   host: 203.250.35.87
@@ -79,7 +79,7 @@ setup:
   retry_delay_seconds: 5
 
 execution:
-  mode: baseline-direct
+  mode: kda
 
 output:
   dir: data/simulator
