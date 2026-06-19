@@ -2,9 +2,9 @@
 # Choice fields show available values in comments.
 
 experiment:
-  name: E1_warm_pool
-  pool_policy: warm-pool
-  pool_size: 2
+  name: E2_cold_start
+  pool_policy: cold-start
+  pool_size: 0
   controller_replicas: 2
 
 ssh:

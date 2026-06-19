@@ -23,6 +23,14 @@ spec:
         env:
         - name: REDIS_URL
           value: redis://controller-queue-redis:6379/0
+        - name: COMPUTE_POOL_MODE
+          value: cold_start
+        - name: COMPUTE_AVAILABILITY_WATCH_ENABLED
+          value: "false"
+        - name: WAIT_QUEUE_ALLOCATING_TTL_SECONDS
+          value: "300"
+        - name: COLD_START_POD_READY_TIMEOUT_SECONDS
+          value: "300"
         resources:
           requests:
             cpu: "100m"
