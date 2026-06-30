@@ -82,7 +82,7 @@ execution:
   mode: kda
 
 output:
-  dir: data/simulator
+  dir: evaluation/data
 
   # -1 = do not save command stdout/stderr
   #  0 = save full command stdout/stderr

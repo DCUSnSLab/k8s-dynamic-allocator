@@ -336,7 +336,7 @@ def _load_execution(data: dict[str, Any]) -> ExecutionConfig:
 def _load_output(data: dict[str, Any]) -> OutputConfig:
     _ensure_allowed("output", data, {"dir", "command_output_chars"})
     return OutputConfig(
-        dir=str(data.get("dir") or "data/simulator"),
+        dir=str(data.get("dir") or "evaluation/data"),
         command_output_chars=int(data.get("command_output_chars", 0)),
     )
 

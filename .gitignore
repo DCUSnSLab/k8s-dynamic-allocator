@@ -11,6 +11,7 @@ __pycache__/
 .agents
 log_analysis/log_export/
 data/
+evaluation/data/
 
 venv/
 env/
