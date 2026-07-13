@@ -1,4 +1,5 @@
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
@@ -24,6 +25,12 @@ class ComputeAllocator:
         compute_type: str,
         recover_stale_ticket: Callable[[Dict], Dict],
     ) -> Dict:
+        if getattr(self.pool, "allocation_mode", "") == "cold_start":
+            return self._drain_wait_queue_for_type_cold_start(
+                compute_type,
+                recover_stale_ticket,
+            )
+
         compute_type_value = self.queues.normalize_compute_type(compute_type)
         result = {
             "compute_type": compute_type_value,
@@ -123,6 +130,69 @@ class ComputeAllocator:
                 result["errors"].append(execution)
         return result
 
+    def _drain_wait_queue_for_type_cold_start(
+        self,
+        compute_type: str,
+        recover_stale_ticket: Callable[[Dict], Dict],
+    ) -> Dict:
+        compute_type_value = self.queues.normalize_compute_type(compute_type)
+        result = {
+            "compute_type": compute_type_value,
+            "stale_recovered": 0,
+            "claimed": 0,
+            "assigned": 0,
+            "queued": 0,
+            "failed": 0,
+            "errors": [],
+        }
+
+        claimed_tickets: List[Dict] = []
+        effective_batch, _mount_concurrency = self._compute_wait_queue_batch_plan()
+        lock_token = None
+        try:
+            lock_token = self.queues.acquire_allocator_lock(compute_type_value)
+            if not lock_token:
+                result["queued"] += 1
+                result["lock_missed"] = True
+                return result
+
+            for stale_ticket in self.queues.find_stale_allocating_tickets(compute_type_value):
+                recovered = recover_stale_ticket(stale_ticket)
+                if recovered["status"] == "requeued":
+                    result["stale_recovered"] += 1
+                elif recovered["status"] == "failed":
+                    result["failed"] += 1
+                elif recovered["status"] == "error":
+                    result["errors"].append(recovered)
+
+            if not self.queues.has_queued_tickets(compute_type_value):
+                return result
+
+            for _ in range(effective_batch):
+                ticket = self.queues.claim_next_ticket(
+                    compute_type_value,
+                    worker_id=self.queues.worker_identity,
+                )
+                if not ticket:
+                    break
+                claimed_tickets.append(ticket)
+                result["claimed"] += 1
+        finally:
+            if lock_token:
+                self.queues.release_allocator_lock(compute_type_value, lock_token)
+
+        for ticket in claimed_tickets:
+            threading.Thread(
+                target=self._safe_execute_cold_start_ticket,
+                args=(ticket, compute_type_value),
+                name=f"cold-start-{str(ticket.get('ticket_short') or ticket.get('ticket_id') or '')[:10]}",
+                daemon=True,
+            ).start()
+
+        if not claimed_tickets:
+            result["queued"] += 1
+        return result
+
     def _compute_wait_queue_batch_plan(self) -> Tuple[int, int]:
         """Return (effective_batch, mount_concurrency) clamped against TTL."""
         configured_batch = max(1, int(getattr(settings, "WAIT_QUEUE_BATCH_LIMIT", 10)))
@@ -178,6 +248,62 @@ class ComputeAllocator:
                 "status": "error",
                 "message": str(exc),
             }
+
+    def _safe_execute_cold_start_ticket(self, ticket: Dict, compute_type_value: str) -> Dict:
+        try:
+            return self._execute_cold_start_ticket(ticket)
+        except Exception as exc:
+            logger.exception(
+                "[Failed] operation=execute_cold_start_ticket ticket_id=%s compute_type=%s reason=%r",
+                ticket.get("ticket_id"),
+                compute_type_value,
+                str(exc),
+            )
+            return self._handle_cold_start_failure(
+                ticket=ticket,
+                compute_pod="",
+                exc=exc,
+            )
+
+    def _execute_cold_start_ticket(self, ticket: Dict) -> Dict:
+        ticket_id = ticket.get("ticket_id", "")
+        claim_token = ticket.get("claim_token") or ""
+        compute_pod = ""
+
+        try:
+            compute_pod = self.pool.create_pod_for_ticket(ticket)
+            ready_pod = self.pool.wait_pod_ready(compute_pod)
+            compute_pod_ip = getattr(ready_pod.status, "pod_ip", "") or self.pool.get_pod_ip(compute_pod) or ""
+            if not compute_pod_ip:
+                raise RuntimeError("Compute IP unavailable after pod Ready")
+
+            compute_ready_at = self.pool.get_pod_ready_at(compute_pod)
+            committed = self.tickets.mark_allocating(
+                ticket_id,
+                compute_pod=compute_pod,
+                compute_pod_ip=compute_pod_ip,
+                claimed_by=ticket.get("claimed_by"),
+                claim_token=claim_token,
+                compute_ready_at=compute_ready_at,
+            )
+            if not committed or committed.get("status") != "allocating":
+                try:
+                    self.pool.release_pod(compute_pod)
+                except Exception:
+                    pass
+                current = self.tickets.get_ticket(ticket_id)
+                return ticket_format.ticket_response(
+                    current or ticket,
+                    "Ticket no longer owns the allocation",
+                )
+
+            return self._execute_allocated_ticket(committed)
+        except Exception as exc:
+            return self._handle_cold_start_failure(
+                ticket=ticket,
+                compute_pod=compute_pod,
+                exc=exc,
+            )
 
     def _reserve_compute_pod_for_ticket(
         self,
@@ -473,6 +599,77 @@ class ComputeAllocator:
                 reason=reason,
             )
         return ticket_format.ticket_response(failed_ticket, str(exc))
+
+    def _handle_cold_start_failure(
+        self,
+        *,
+        ticket: Dict,
+        compute_pod: str,
+        exc: Exception,
+    ) -> Dict:
+        ticket_id = ticket.get("ticket_id", "")
+        claim_token = ticket.get("claim_token") or ""
+        reason = f"Compute provisioning failed: {exc}"
+
+        if compute_pod:
+            try:
+                self.pool.release_pod(compute_pod)
+            except Exception as release_exc:
+                logger.warning(
+                    "[Warning] operation=release_after_cold_start_error ticket_id=%s compute_pod=%s reason=%r",
+                    ticket_id,
+                    compute_pod,
+                    str(release_exc),
+                )
+
+        current = self.tickets.get_ticket(ticket_id)
+        if not current:
+            return {
+                "ticket_id": ticket_id,
+                "compute_type": self.queues.normalize_compute_type(ticket.get("compute_type")),
+                "status": "failed",
+                "message": reason,
+            }
+
+        current_status = str(current.get("status") or "").lower()
+        if current_status in {"assigned", "failed", "cancelled"}:
+            return ticket_format.ticket_response(current, reason)
+
+        if int(current.get("retry_count") or 0) < int(current.get("max_retries") or self.queues.max_retries):
+            requeued = self.tickets.requeue_ticket(
+                ticket_id,
+                reason=reason,
+                increment_retry=True,
+                claim_token=claim_token,
+            )
+            requeued_ticket = requeued if requeued and requeued.get("status") == "queued" else self.tickets.get_ticket(ticket_id)
+            if requeued_ticket:
+                ticket_format.log_queue_event(
+                    "debug",
+                    "Requeued",
+                    requeued_ticket,
+                    include_ticket_fields=(),
+                    compute_pod=compute_pod,
+                    compute_pod_ip=requeued_ticket.get("compute_pod_ip"),
+                    retry_count=requeued_ticket.get("retry_count"),
+                    reason=reason,
+                )
+            return ticket_format.ticket_response(requeued_ticket, reason)
+
+        failed = self.tickets.mark_failed(ticket_id, reason, claim_token=claim_token)
+        failed_ticket = failed if failed and failed.get("status") == "failed" else self.tickets.get_ticket(ticket_id)
+        if failed_ticket:
+            ticket_format.log_queue_event(
+                "info",
+                "Failed",
+                failed_ticket,
+                include_ticket_fields=(),
+                compute_pod=compute_pod,
+                compute_pod_ip=failed_ticket.get("compute_pod_ip"),
+                retry_count=failed_ticket.get("retry_count"),
+                reason=reason,
+            )
+        return ticket_format.ticket_response(failed_ticket, reason)
 
     def _pop_compute_available_at(self, compute_pod: str) -> str:
         try:

@@ -7,7 +7,7 @@
 ## config 파일
 
 ```text
-simulator/scenario_config.yaml
+evaluation/src/simulator/scenario_config.yaml
 ```
 
 주요 필드 :
@@ -25,13 +25,13 @@ simulator/scenario_config.yaml
 프로젝트 루트에서 실행
 
 ```powershell
-python -m pip install -r simulator\requirements.txt
+python -m pip install -r evaluation\src\simulator\requirements.txt
 ```
 
 config 파일 기준으로 실행:
 
 ```powershell
-python simulator\run_simulator.py
+python evaluation\src\simulator\run_simulator.py
 ```
 
 실행 옵션은 `scenario_config.yaml` 값을 임시로 덮어쓸 때 사용
@@ -50,7 +50,7 @@ python simulator\run_simulator.py
 예시:
 
 ```powershell
-python simulator\run_simulator.py --users 1 --profile 10 --duration-minutes 1 --max-requests 1 --experiment-name smoke_swlabssh
+python evaluation\src\simulator\run_simulator.py --users 1 --profile 10 --duration-minutes 1 --max-requests 1 --experiment-name smoke_swlabssh
 ```
 
 위 명령은 config 파일을 수정하지 않고, 사용자 1명으로 요청 1개만 보내는 smoke test를
@@ -61,7 +61,7 @@ python simulator\run_simulator.py --users 1 --profile 10 --duration-minutes 1 --
 결과는 아래 경로에 저장된다.
 
 ```text
-data/simulator/<timestamp>_<experiment.name>/
+evaluation/data/<timestamp>_<experiment.name>/simulator/
 ```
 
 생성 파일:

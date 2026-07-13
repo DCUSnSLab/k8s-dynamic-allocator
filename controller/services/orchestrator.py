@@ -5,7 +5,7 @@ from typing import Dict, Optional
 from config import settings
 from config.settings import set_request_label
 
-from .compute import ComputeCleanup, WarmPodPool, ComputeManager
+from .compute import ColdStartComputePool, ComputeCleanup, WarmPodPool, ComputeManager
 from .infra import ComputeAvailabilityWatcher, LeaseLeaderElector
 from .queue import ComputeQueues
 from .status import ControllerStatus
@@ -15,18 +15,25 @@ logger = logging.getLogger(__name__)
 
 class Orchestrator:
     def __init__(self):
-        self.pool = WarmPodPool()
+        if settings.COMPUTE_POOL_MODE == "cold_start":
+            self.pool = ColdStartComputePool()
+        else:
+            self.pool = WarmPodPool()
         self.queues = ComputeQueues()
         self.tickets = self.queues.tickets
         self.compute_manager = ComputeManager(self.pool, self.queues, self.tickets)
         self.status = ControllerStatus(self.pool, self.queues, self.tickets)
         self.cleanup = ComputeCleanup(self.pool, self.queues, self.compute_manager)
+        watch_enabled = (
+            settings.COMPUTE_AVAILABILITY_WATCH_ENABLED
+            and getattr(self.pool, "uses_availability_watch", True)
+        )
         self.compute_watcher = ComputeAvailabilityWatcher(
             v1=self.pool.v1,
             namespace=self.pool.namespace,
             label_selector=f"{self.pool.LABEL_APP}={self.pool.APP_WARM_POOL}",
             on_compute_available=self.compute_manager.notify_compute_available,
-            enabled=settings.COMPUTE_AVAILABILITY_WATCH_ENABLED,
+            enabled=watch_enabled,
             timeout_seconds=settings.COMPUTE_AVAILABILITY_WATCH_TIMEOUT_SECONDS,
             retry_seconds=settings.COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS,
             app_label=self.pool.LABEL_APP,

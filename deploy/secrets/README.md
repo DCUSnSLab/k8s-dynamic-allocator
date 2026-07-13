@@ -3,7 +3,7 @@
 
 **경로 : `/k8s-dynamic-allocator/deploy/secrets/`**
 
-**namespaces : `kda-test`**
+**namespaces : `swlabpods`**
 
 
 -----------------

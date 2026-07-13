@@ -2,13 +2,13 @@
 # Choice fields show available values in comments.
 
 experiment:
-  name: E1_warm_pool
-  pool_policy: warm-pool
-  pool_size: 2
+  name: E2_cold_start
+  pool_policy: cold-start
+  pool_size: 0
   controller_replicas: 2
 
 ssh:
-  host: 203.250.35.87
+  host: 203.250.33.144
   port: 30622
 
 users:
@@ -82,7 +82,7 @@ execution:
   mode: kda
 
 output:
-  dir: data/simulator
+  dir: evaluation/data
 
   # -1 = do not save command stdout/stderr
   #  0 = save full command stdout/stderr

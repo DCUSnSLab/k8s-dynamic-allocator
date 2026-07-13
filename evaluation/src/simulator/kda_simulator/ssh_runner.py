@@ -24,6 +24,16 @@ TICKET_RE = re.compile(r"\[INFO\]\s+Ticket queued:\s*(?P<ticket_id>[0-9a-fA-F]{3
 ALLOC_RE = re.compile(
     r"\[INFO\]\s+Compute pod allocated:\s*(?P<compute_pod>\S+) \((?P<compute_pod_ip>[^)]+)\)"
 )
+SSH_RUN_ATTEMPTS = 2
+SSH_RETRY_MAX_ELAPSED_SECONDS = 3.0
+TRANSIENT_SSH_ERRORS = (
+    "SSH connection closed",
+    "Connection lost",
+    "Connection reset",
+    "Connection aborted",
+    "Client not responding to keepalive",
+    "Login timeout expired",
+)
 
 
 @dataclass
@@ -72,9 +82,13 @@ class SSHUserSession:
         self._run_lock = asyncio.Semaphore(PER_USER_MAX_INFLIGHT)
 
     async def connect(self) -> None:
+        if self._connection is not None and self._connection_is_closed():
+            self._connection = None
         if self._connection is not None:
             return
         async with self._connect_lock:
+            if self._connection is not None and self._connection_is_closed():
+                self._connection = None
             if self._connection is not None:
                 return
             self._connection = await asyncssh.connect(
@@ -94,20 +108,37 @@ class SSHUserSession:
         async with self._run_lock:
             per_user_queue_delay_ms = (time.monotonic() - lock_wait_started) * 1000.0
             started = time.monotonic()
+            last_error: str | None = None
             try:
-                await self.connect()
-                if self._connection is None:
-                    raise RuntimeError("SSH connection was not established")
-                result = await self._connection.run(
-                    remote_command,
-                    check=False,
-                    timeout=timeout,
-                    term_type=PTY_TERM_TYPE,
-                    term_size=(
-                        PTY_WIDTH,
-                        PTY_HEIGHT,
-                    ),
-                )
+                for attempt in range(1, SSH_RUN_ATTEMPTS + 1):
+                    try:
+                        await self.connect()
+                        if self._connection is None:
+                            raise RuntimeError("SSH connection was not established")
+                        result = await self._connection.run(
+                            remote_command,
+                            check=False,
+                            timeout=timeout,
+                            term_type=PTY_TERM_TYPE,
+                            term_size=(
+                                PTY_WIDTH,
+                                PTY_HEIGHT,
+                            ),
+                        )
+                        break
+                    except Exception as exc:
+                        last_error = str(exc)
+                        self._connection = None
+                        can_retry = (
+                            attempt < SSH_RUN_ATTEMPTS
+                            and _is_transient_ssh_error(exc)
+                            and (time.monotonic() - started) <= SSH_RETRY_MAX_ELAPSED_SECONDS
+                        )
+                        if not can_retry:
+                            raise
+                else:
+                    raise RuntimeError(last_error or "SSH command failed")
+
                 elapsed_ms = (time.monotonic() - started) * 1000.0
                 stdout = _to_text(result.stdout)
                 stderr = _to_text(result.stderr)
@@ -160,6 +191,14 @@ class SSHUserSession:
         finally:
             self._connection = None
 
+    def _connection_is_closed(self) -> bool:
+        if self._connection is None:
+            return True
+        is_closed = getattr(self._connection, "is_closed", None)
+        if callable(is_closed):
+            return bool(is_closed())
+        return False
+
 
 class SSHSessionPool:
     def __init__(self, config: SimulatorConfig) -> None:
@@ -170,3 +209,8 @@ class SSHSessionPool:
 
     async def close(self) -> None:
         await asyncio.gather(*(session.close() for session in self._sessions.values()), return_exceptions=True)
+
+
+def _is_transient_ssh_error(exc: Exception) -> bool:
+    message = str(exc)
+    return any(pattern in message for pattern in TRANSIENT_SSH_ERRORS)

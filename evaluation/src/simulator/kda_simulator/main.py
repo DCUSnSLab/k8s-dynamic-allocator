@@ -38,7 +38,11 @@ from .workload import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a real-cluster KDA SSH workload simulation.")
-    parser.add_argument("--config", default="simulator/scenario_config.yaml", help="Path to simulator YAML config.")
+    parser.add_argument(
+        "--config",
+        default="evaluation/src/simulator/scenario_config.yaml",
+        help="Path to simulator YAML config.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Validate config and generate schedule without SSH.")
     parser.add_argument("--experiment-name", help="Override experiment.name.")
     parser.add_argument("--users", type=int, help="Override users.count.")
@@ -270,7 +274,6 @@ async def run_simulation(
 
         started_mono = time.monotonic()
         experiment_started_wall = now_iso()
-        write_server_log_export_hint(output_dir)
         print(f"Output: {output_dir}")
         print_server_log_export_hint(output_dir)
         global_sem = asyncio.Semaphore(CLIENT_MAX_INFLIGHT)
@@ -471,31 +474,20 @@ def add_output_tails(config: SimulatorConfig, record: dict[str, Any], result: An
 def make_output_dir(config: SimulatorConfig) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     experiment_id = sanitize_id(config.experiment.name)
-    return Path(config.output.dir) / f"{timestamp}_{experiment_id}"
+    run_id = f"{timestamp}_{experiment_id}"
+    return Path(config.output.dir) / run_id / "simulator"
 
 
 def server_log_export_command(output_dir: Path) -> str:
+    run_id = output_dir.parent.name
     return (
-        f"KDA_RUN_DIR={output_dir.name} "
-        "python3 export_experiment_logs.py --namespace kda-test --pvc logs-pvc"
+        "python3 evaluation/src/log_analysis/export_experiment_logs.py "
+        f"--run-id {run_id} --namespace swlabpods --pvc logs-pvc"
     )
-
-
-def write_server_log_export_hint(output_dir: Path) -> None:
-    content = "\n".join(
-        [
-            "# Run this on the main server after the experiment finishes.",
-            "cd log_analysis",
-            server_log_export_command(output_dir),
-            "",
-        ]
-    )
-    (output_dir / "server_log_export_command.txt").write_text(content, encoding="utf-8")
 
 
 def print_server_log_export_hint(output_dir: Path) -> None:
     print("Server log export after this run:")
-    print("  cd log_analysis")
     print(f"  {server_log_export_command(output_dir)}")
 
 
