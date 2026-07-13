@@ -482,7 +482,7 @@ def server_log_export_command(output_dir: Path) -> str:
     run_id = output_dir.parent.name
     return (
         "python3 evaluation/src/log_analysis/export_experiment_logs.py "
-        f"--run-id {run_id} --namespace kda-test --pvc logs-pvc"
+        f"--run-id {run_id} --namespace swlabpods --pvc logs-pvc"
     )
 
 

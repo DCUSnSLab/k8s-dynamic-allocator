@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: controller
-  namespace: kda-test
+  namespace: swlabpods
 spec:
   replicas: 2
   selector:
@@ -24,13 +24,7 @@ spec:
         - name: REDIS_URL
           value: redis://controller-queue-redis:6379/0
         - name: COMPUTE_POOL_MODE
-          value: cold_start
-        - name: COMPUTE_AVAILABILITY_WATCH_ENABLED
-          value: "false"
-        - name: WAIT_QUEUE_ALLOCATING_TTL_SECONDS
-          value: "300"
-        - name: COLD_START_POD_READY_TIMEOUT_SECONDS
-          value: "300"
+          value: warm_pool
         resources:
           requests:
             cpu: "100m"
@@ -45,7 +39,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: controller-service
-  namespace: kda-test
+  namespace: swlabpods
 spec:
   selector:
     app: controller

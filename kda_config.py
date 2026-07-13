@@ -1,6 +1,14 @@
-"""Shared runtime settings for the k8s-dynamic-allocator deployment."""
+"""Shared runtime settings for the k8s-dynamic-allocator deployment.
 
-DEFAULT_NAMESPACE = "kda-test"
+Note:
+    This file is copied into runtime images and read by controller, compute
+    agent, and swlabssh processes. It does not template or rewrite Kubernetes
+    manifests. When changing cluster-level values such as namespace, storage
+    class, service exposure, or Fluent Bit log paths, update the YAML files
+    under deploy/ and related dcusshk8s manifests together.
+"""
+
+DEFAULT_NAMESPACE = "swlabpods"
 
 REDIS_URL = "redis://controller-queue-redis:6379/0"
 CONTROLLER_RELEASE_HOST = "controller-service"
