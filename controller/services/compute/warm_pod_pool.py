@@ -48,6 +48,11 @@ class WarmPodPool(KubernetesClient):
     STATUS_AVAILABLE = "available"
     STATUS_ASSIGNED = "assigned"
 
+    ANNOTATION_POOL_AVAILABLE_MIN = "k8s-dynamic-allocator/pool-available-min"
+    ANNOTATION_POOL_TOTAL_MAX = "k8s-dynamic-allocator/pool-total-max"
+    ANNOTATION_ALLOCATION_TICKET = "k8s-dynamic-allocator/allocation-ticket-id"
+    ANNOTATION_ALLOCATION_CLAIM = "k8s-dynamic-allocator/allocation-claim-token"
+
     _cached_owner_ref = None
     _owner_ref_resolved = False
 
@@ -97,6 +102,9 @@ class WarmPodPool(KubernetesClient):
         return None
 
     def _validate_compute_manifest(self, spec: Dict) -> str:
+        metadata = spec.get("metadata", {})
+        deployment_labels = metadata.get("labels", {})
+        annotations = metadata.get("annotations", {})
         selector_labels = (
             spec.get("spec", {})
             .get("selector", {})
@@ -115,6 +123,8 @@ class WarmPodPool(KubernetesClient):
         template_compute_type = template_labels.get(self.LABEL_COMPUTE_TYPE)
         selector_status = selector_labels.get(self.LABEL_STATUS)
         template_status = template_labels.get(self.LABEL_STATUS)
+        deployment_app = deployment_labels.get(self.LABEL_APP)
+        deployment_compute_type = deployment_labels.get(self.LABEL_COMPUTE_TYPE)
 
         if selector_app != self.APP_WARM_POOL or template_app != self.APP_WARM_POOL:
             raise ValueError(
@@ -145,13 +155,109 @@ class WarmPodPool(KubernetesClient):
                 "spec.template.metadata.labels"
             )
 
+        if deployment_app != self.APP_WARM_POOL:
+            raise ValueError(
+                "Every compute manifest must set app=warm-pod-pool in metadata.labels"
+            )
+
+        if deployment_compute_type != template_compute_type:
+            raise ValueError(
+                "compute-type must match between Deployment metadata and Pod template labels"
+            )
+
         if self.LABEL_USER not in template_labels:
             raise ValueError(
                 "Every compute manifest must define assigned-user in "
                 "spec.template.metadata.labels"
             )
 
+        self._parse_policy_values(annotations)
         return template_compute_type
+
+    @classmethod
+    def _parse_policy_values(cls, annotations: Dict) -> tuple[int, int]:
+        annotations = annotations or {}
+        raw_r = annotations.get(cls.ANNOTATION_POOL_AVAILABLE_MIN)
+        raw_n = annotations.get(cls.ANNOTATION_POOL_TOTAL_MAX)
+        if raw_r is None or raw_n is None:
+            raise ValueError(
+                "Pool policy annotations are required: "
+                f"{cls.ANNOTATION_POOL_AVAILABLE_MIN}, "
+                f"{cls.ANNOTATION_POOL_TOTAL_MAX}"
+            )
+
+        try:
+            pool_available_min = int(str(raw_r).strip())
+            pool_total_max = int(str(raw_n).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Pool policy annotations must be integers") from exc
+
+        if (
+            pool_available_min < 0
+            or pool_total_max < 0
+            or pool_available_min > pool_total_max
+        ):
+            raise ValueError("Pool policy must satisfy 0 <= R <= N")
+
+        return pool_available_min, pool_total_max
+
+    def parse_deployment_policy(self, deployment) -> Dict:
+        """Parse and validate R/N from a warm-pool Deployment."""
+        metadata = getattr(deployment, "metadata", None)
+        if metadata is None:
+            raise ValueError("Deployment metadata is missing")
+
+        labels = getattr(metadata, "labels", None) or {}
+        annotations = getattr(metadata, "annotations", None) or {}
+        deployment_name = (getattr(metadata, "name", None) or "").strip()
+        compute_type = (labels.get(self.LABEL_COMPUTE_TYPE) or "").strip().lower()
+
+        if labels.get(self.LABEL_APP) != self.APP_WARM_POOL:
+            raise ValueError("Deployment must set app=warm-pod-pool")
+        if not deployment_name:
+            raise ValueError("Deployment name is missing")
+        if not compute_type:
+            raise ValueError("Deployment metadata.labels.compute-type is missing")
+
+        spec = getattr(deployment, "spec", None)
+        selector_labels = (
+            getattr(getattr(spec, "selector", None), "match_labels", None) or {}
+        )
+        template = getattr(spec, "template", None)
+        template_labels = (
+            getattr(getattr(template, "metadata", None), "labels", None) or {}
+        )
+        if (
+            selector_labels.get(self.LABEL_APP) != self.APP_WARM_POOL
+            or selector_labels.get(self.LABEL_COMPUTE_TYPE) != compute_type
+            or selector_labels.get(self.LABEL_STATUS) != self.STATUS_AVAILABLE
+            or template_labels.get(self.LABEL_APP) != self.APP_WARM_POOL
+            or template_labels.get(self.LABEL_COMPUTE_TYPE) != compute_type
+            or template_labels.get(self.LABEL_STATUS) != self.STATUS_AVAILABLE
+            or self.LABEL_USER not in template_labels
+        ):
+            raise ValueError(
+                "Deployment selector/template labels do not match the warm-pool policy"
+            )
+
+        pool_available_min, pool_total_max = self._parse_policy_values(annotations)
+        return {
+            "compute_type": compute_type,
+            "deployment_name": deployment_name,
+            "R": pool_available_min,
+            "N": pool_total_max,
+            "resource_version": (
+                getattr(metadata, "resource_version", None) or ""
+            ),
+        }
+
+    def list_pool_deployments(self) -> List:
+        deployments = self.apps_v1.list_namespaced_deployment(
+            namespace=self.namespace,
+            label_selector=f"{self.LABEL_APP}={self.APP_WARM_POOL}",
+            _request_timeout=self.api_request_timeout,
+        )
+        return list(deployments.items)
 
     def initialize_pool(self, *, log_existing: bool = True) -> Dict:
         """
@@ -159,7 +265,7 @@ class WarmPodPool(KubernetesClient):
         Safe to call multiple times because existing Deployments are skipped.
         """
         results = {"created": [], "existing": [], "failed": []}
-        existing_deployments = set()
+        existing_deployments = {}
 
         yaml_files = glob.glob(os.path.join(MANIFESTS_DIR, "*.yaml"))
         if not yaml_files:
@@ -168,8 +274,11 @@ class WarmPodPool(KubernetesClient):
 
         try:
             existing_deployments = {
-                deployment.metadata.name
-                for deployment in self.apps_v1.list_namespaced_deployment(namespace=self.namespace).items
+                deployment.metadata.name: deployment
+                for deployment in self.apps_v1.list_namespaced_deployment(
+                    namespace=self.namespace,
+                    _request_timeout=self.api_request_timeout,
+                ).items
             }
         except Exception as exc:
             logger.debug("[DeploymentPrefetchSkipped] reason=%r", str(exc))
@@ -187,6 +296,12 @@ class WarmPodPool(KubernetesClient):
                 compute_type = self._validate_compute_manifest(spec)
 
                 if name in existing_deployments:
+                    existing = existing_deployments[name]
+                    if existing is not None:
+                        self._migrate_legacy_deployment_metadata(
+                            existing,
+                            spec,
+                        )
                     if log_existing:
                         logger.debug("Deployment exists: %s", name)
                     results["existing"].append(name)
@@ -198,10 +313,11 @@ class WarmPodPool(KubernetesClient):
                 self.apps_v1.create_namespaced_deployment(
                     namespace=self.namespace,
                     body=spec,
+                    _request_timeout=self.api_request_timeout,
                 )
                 logger.info("Deployment created: %s (compute_type=%s)", name, compute_type)
                 results["created"].append(name)
-                existing_deployments.add(name)
+                existing_deployments[name] = None
 
             except ApiException as e:
                 if e.status == 409:
@@ -225,6 +341,99 @@ class WarmPodPool(KubernetesClient):
 
         return results
 
+    def _migrate_legacy_deployment_metadata(self, deployment, manifest: Dict) -> bool:
+        """
+        Add R/N metadata once for Deployments created by the pre-policy version.
+
+        A Deployment is considered legacy only when both policy annotations and
+        both top-level identity labels are absent. Partially missing or invalid
+        administrator configuration is intentionally left untouched so the
+        fail-closed policy can report it.
+        """
+        metadata = getattr(deployment, "metadata", None)
+        labels = getattr(metadata, "labels", None) or {}
+        annotations = getattr(metadata, "annotations", None) or {}
+        legacy = (
+            self.LABEL_APP not in labels
+            and self.LABEL_COMPUTE_TYPE not in labels
+            and self.ANNOTATION_POOL_AVAILABLE_MIN not in annotations
+            and self.ANNOTATION_POOL_TOTAL_MAX not in annotations
+        )
+        if not legacy:
+            return False
+
+        manifest_metadata = manifest.get("metadata", {})
+        manifest_labels = manifest_metadata.get("labels", {})
+        manifest_annotations = manifest_metadata.get("annotations", {})
+        expected_compute_type = manifest_labels[self.LABEL_COMPUTE_TYPE]
+
+        live_spec = getattr(deployment, "spec", None)
+        live_selector = (
+            getattr(getattr(live_spec, "selector", None), "match_labels", None)
+            or {}
+        )
+        live_template = getattr(live_spec, "template", None)
+        live_template_labels = (
+            getattr(getattr(live_template, "metadata", None), "labels", None)
+            or {}
+        )
+        live_identity_matches = (
+            live_selector.get(self.LABEL_APP) == self.APP_WARM_POOL
+            and live_selector.get(self.LABEL_COMPUTE_TYPE)
+            == expected_compute_type
+            and live_selector.get(self.LABEL_STATUS) == self.STATUS_AVAILABLE
+            and live_template_labels.get(self.LABEL_APP)
+            == self.APP_WARM_POOL
+            and live_template_labels.get(self.LABEL_COMPUTE_TYPE)
+            == expected_compute_type
+            and live_template_labels.get(self.LABEL_STATUS)
+            == self.STATUS_AVAILABLE
+            and self.LABEL_USER in live_template_labels
+        )
+        if not live_identity_matches:
+            logger.error(
+                "[PoolPolicyMigrationBlocked] deployment=%s reason=%r",
+                getattr(metadata, "name", "") or "",
+                "live selector/template does not match the warm-pool manifest",
+            )
+            return False
+
+        metadata_patch = {
+            "labels": {
+                self.LABEL_APP: manifest_labels[self.LABEL_APP],
+                self.LABEL_COMPUTE_TYPE: manifest_labels[
+                    self.LABEL_COMPUTE_TYPE
+                ],
+            },
+            "annotations": {
+                self.ANNOTATION_POOL_AVAILABLE_MIN: manifest_annotations[
+                    self.ANNOTATION_POOL_AVAILABLE_MIN
+                ],
+                self.ANNOTATION_POOL_TOTAL_MAX: manifest_annotations[
+                    self.ANNOTATION_POOL_TOTAL_MAX
+                ],
+            },
+        }
+        resource_version = getattr(metadata, "resource_version", None)
+        if resource_version:
+            metadata_patch["resourceVersion"] = resource_version
+        body = {"metadata": metadata_patch}
+        self.apps_v1.patch_namespaced_deployment(
+            name=metadata.name,
+            namespace=self.namespace,
+            body=body,
+            _request_timeout=self.api_request_timeout,
+        )
+        logger.info(
+            "[PoolPolicyMigrated] deployment=%s R=%s N=%s",
+            metadata.name,
+            body["metadata"]["annotations"][
+                self.ANNOTATION_POOL_AVAILABLE_MIN
+            ],
+            body["metadata"]["annotations"][self.ANNOTATION_POOL_TOTAL_MAX],
+        )
+        return True
+
     def _get_owner_deployment(self) -> Optional[Dict]:
         """
         Resolve the controller Deployment that owns this controller pod.
@@ -240,14 +449,22 @@ class WarmPodPool(KubernetesClient):
                 WarmPodPool._owner_ref_resolved = True
                 return None
 
-            pod = self.v1.read_namespaced_pod(pod_name, self.namespace)
+            pod = self.v1.read_namespaced_pod(
+                pod_name,
+                self.namespace,
+                _request_timeout=self.api_request_timeout,
+            )
             if not pod.metadata.owner_references:
                 logger.warning("[Warning] operation=owner_ref pod=%s reason=%r", pod_name, "pod has no ownerReferences")
                 WarmPodPool._owner_ref_resolved = True
                 return None
 
             rs_ref = pod.metadata.owner_references[0]
-            rs = self.apps_v1.read_namespaced_replica_set(rs_ref.name, self.namespace)
+            rs = self.apps_v1.read_namespaced_replica_set(
+                rs_ref.name,
+                self.namespace,
+                _request_timeout=self.api_request_timeout,
+            )
             if not rs.metadata.owner_references:
                 logger.warning("[Warning] operation=owner_ref replicaset=%s reason=%r", rs_ref.name, "replicaset has no ownerReferences")
                 WarmPodPool._owner_ref_resolved = True
@@ -279,7 +496,11 @@ class WarmPodPool(KubernetesClient):
 
     def get_pod_ready_at(self, pod_name: str):
         try:
-            pod = self.v1.read_namespaced_pod(pod_name, self.namespace)
+            pod = self.v1.read_namespaced_pod(
+                pod_name,
+                self.namespace,
+                _request_timeout=self.api_request_timeout,
+            )
         except ApiException as exc:
             if exc.status == 404:
                 return None
@@ -299,20 +520,11 @@ class WarmPodPool(KubernetesClient):
         as still available, so callers tracking in-flight reservations pass
         them here to avoid double-selection.
         """
-        pods = self.v1.list_namespaced_pod(
-            namespace=self.namespace,
-            label_selector=self._warm_pod_pool_selector(
-                status=self.STATUS_AVAILABLE,
-                compute_type=compute_type,
-            ),
-        )
-
+        snapshot = self.list_pool_snapshot(compute_type=compute_type)
         exclude_set = exclude or set()
         names: List[str] = []
-        for pod in pods.items:
-            if not self._pod_is_ready(pod):
-                continue
-            name = pod.metadata.name
+        for candidate in snapshot["available_candidates"]:
+            name = candidate["name"]
             if name in exclude_set:
                 continue
             names.append(name)
@@ -320,7 +532,186 @@ class WarmPodPool(KubernetesClient):
                 break
         return names
 
-    def assign_pod(self, pod_name: str, user_pod: str) -> None:
+    @staticmethod
+    def _has_controller_owner(pod, kind: str) -> bool:
+        owner_references = (
+            getattr(getattr(pod, "metadata", None), "owner_references", None) or []
+        )
+        for owner in owner_references:
+            if getattr(owner, "kind", None) != kind:
+                continue
+            if getattr(owner, "controller", None) is False:
+                continue
+            return True
+        return False
+
+    def list_pool_snapshot(self, compute_type: Optional[str] = None) -> Dict:
+        """
+        Return one API-list based snapshot for allocation and capacity control.
+
+        Pool_Total counts non-terminating available + assigned pods. Creating
+        Pods are included even when they are Pending or NotReady.
+        """
+        pods = self.v1.list_namespaced_pod(
+            namespace=self.namespace,
+            label_selector=self._compute_selector(compute_type=compute_type),
+            _request_timeout=self.api_request_timeout,
+        )
+
+        pool_total = 0
+        pool_available = 0
+        pool_assigned = 0
+        terminating = 0
+        ready_available = 0
+        assigned_with_replicaset_owner = 0
+        available_candidates = []
+        pod_items = []
+
+        for pod in pods.items:
+            metadata = getattr(pod, "metadata", None)
+            status = getattr(pod, "status", None)
+            labels = getattr(metadata, "labels", None) or {}
+            pool_status = labels.get(self.LABEL_STATUS)
+            deletion_timestamp = getattr(metadata, "deletion_timestamp", None)
+            counted = (
+                deletion_timestamp is None
+                and pool_status in {self.STATUS_AVAILABLE, self.STATUS_ASSIGNED}
+            )
+
+            if deletion_timestamp is not None:
+                terminating += 1
+            elif pool_status == self.STATUS_AVAILABLE:
+                pool_available += 1
+                pool_total += 1
+            elif pool_status == self.STATUS_ASSIGNED:
+                pool_assigned += 1
+                pool_total += 1
+                if self._has_controller_owner(pod, "ReplicaSet"):
+                    assigned_with_replicaset_owner += 1
+
+            ready = self._pod_is_ready(pod)
+            if (
+                counted
+                and pool_status == self.STATUS_AVAILABLE
+                and ready
+                and getattr(status, "pod_ip", None)
+            ):
+                ready_available += 1
+                available_candidates.append(
+                    {
+                        "name": getattr(metadata, "name", "") or "",
+                        "ip": getattr(status, "pod_ip", "") or "",
+                        "ready_at": self._pod_ready_at(pod),
+                        "creation_timestamp": getattr(
+                            metadata, "creation_timestamp", None
+                        ),
+                        "resource_version": getattr(
+                            metadata, "resource_version", None
+                        )
+                        or "",
+                        "annotations": dict(
+                            getattr(metadata, "annotations", None) or {}
+                        ),
+                    }
+                )
+
+            annotations = getattr(metadata, "annotations", None) or {}
+            pod_items.append(
+                {
+                    "name": getattr(metadata, "name", "") or "",
+                    "phase": getattr(status, "phase", None) or "Unknown",
+                    "compute_type": labels.get(self.LABEL_COMPUTE_TYPE, "unknown"),
+                    "pool_status": pool_status or "unknown",
+                    "assigned_user": labels.get(self.LABEL_USER, ""),
+                    "ready": ready,
+                    "ip": getattr(status, "pod_ip", None),
+                    "terminating": deletion_timestamp is not None,
+                    "counted_in_pool_total": counted,
+                    "replicaset_owned": self._has_controller_owner(pod, "ReplicaSet"),
+                    "allocation_ticket_id": annotations.get(
+                        self.ANNOTATION_ALLOCATION_TICKET,
+                        "",
+                    ),
+                    "allocation_claim_token": annotations.get(
+                        self.ANNOTATION_ALLOCATION_CLAIM,
+                        "",
+                    ),
+                }
+            )
+
+        available_candidates.sort(
+            key=lambda item: (
+                str(item.get("creation_timestamp") or ""),
+                item.get("name") or "",
+            )
+        )
+        return {
+            "compute_type": (compute_type or "").strip().lower(),
+            "pool_total": pool_total,
+            "pool_available": pool_available,
+            "pool_assigned": pool_assigned,
+            "ready_available": ready_available,
+            "terminating": terminating,
+            "physical_total": len(pods.items),
+            "assigned_with_replicaset_owner": assigned_with_replicaset_owner,
+            "available_candidates": available_candidates,
+            "pods": pod_items,
+        }
+
+    def find_reserved_pod(
+        self,
+        ticket_id: str,
+        claim_token: str = "",
+        compute_type: Optional[str] = None,
+    ) -> Optional[str]:
+        """Find the Pod journaled by an allocating ticket after a crash."""
+        ticket_id_value = (ticket_id or "").strip()
+        if not ticket_id_value:
+            return None
+        for pod in self.list_pool_snapshot(compute_type)["pods"]:
+            if pod.get("terminating"):
+                continue
+            if pod.get("pool_status") != self.STATUS_ASSIGNED:
+                continue
+            if pod.get("allocation_ticket_id") != ticket_id_value:
+                continue
+            recorded_claim = pod.get("allocation_claim_token") or ""
+            if claim_token and recorded_claim != claim_token:
+                continue
+            return pod.get("name") or None
+        return None
+
+    def read_deployment_replicas(self, deployment_name: str) -> int:
+        scale = self.apps_v1.read_namespaced_deployment_scale(
+            name=deployment_name,
+            namespace=self.namespace,
+            _request_timeout=self.api_request_timeout,
+        )
+        return int(getattr(getattr(scale, "spec", None), "replicas", 0) or 0)
+
+    def patch_deployment_replicas(
+        self,
+        deployment_name: str,
+        replicas: int,
+    ) -> int:
+        desired = max(0, int(replicas))
+        scale = self.apps_v1.patch_namespaced_deployment_scale(
+            name=deployment_name,
+            namespace=self.namespace,
+            body={"spec": {"replicas": desired}},
+            _request_timeout=self.api_request_timeout,
+        )
+        return int(getattr(getattr(scale, "spec", None), "replicas", desired) or 0)
+
+    def assign_pod(
+        self,
+        pod_name: str,
+        user_pod: str,
+        expected_resource_version: Optional[str] = None,
+        ticket_id: str = "",
+        claim_token: str = "",
+        expected_annotations: Optional[Dict] = None,
+    ) -> None:
         """
         Mark an available warm pod as assigned.
 
@@ -329,7 +720,27 @@ class WarmPodPool(KubernetesClient):
         lets the Deployment backfill a new warm pod.
         """
         try:
-            patch = [
+            patch = []
+            if expected_resource_version:
+                patch.append(
+                    {
+                        "op": "test",
+                        "path": "/metadata/resourceVersion",
+                        "value": expected_resource_version,
+                    }
+                )
+            if ticket_id:
+                annotations = dict(expected_annotations or {})
+                annotations[self.ANNOTATION_ALLOCATION_TICKET] = ticket_id
+                annotations[self.ANNOTATION_ALLOCATION_CLAIM] = claim_token or ""
+                patch.append(
+                    {
+                        "op": "add",
+                        "path": "/metadata/annotations",
+                        "value": annotations,
+                    }
+                )
+            patch.extend([
                 {"op": "test", "path": "/metadata/labels/app", "value": self.APP_WARM_POOL},
                 {
                     "op": "test",
@@ -346,7 +757,7 @@ class WarmPodPool(KubernetesClient):
                     "path": "/metadata/labels/assigned-user",
                     "value": user_pod,
                 },
-            ]
+            ])
             self.v1.api_client.call_api(
                 "/api/v1/namespaces/{namespace}/pods/{name}",
                 "PATCH",
@@ -356,10 +767,13 @@ class WarmPodPool(KubernetesClient):
                 auth_settings=["BearerToken"],
                 _return_http_data_only=True,
                 _preload_content=True,
+                _request_timeout=self.api_request_timeout,
             )
         except ApiException as e:
-            if e.status == 422:
-                raise PodConflictError(f"{pod_name} already taken")
+            if e.status in (404, 409, 422):
+                raise PodConflictError(
+                    f"{pod_name} is no longer assignable"
+                ) from e
             raise
 
     def release_pod(self, pod_name: str) -> bool:
@@ -373,6 +787,7 @@ class WarmPodPool(KubernetesClient):
                 name=pod_name,
                 namespace=self.namespace,
                 grace_period_seconds=0,
+                _request_timeout=self.api_request_timeout,
             )
             logger.debug("[ComputeDeleted] compute_pod=%s", pod_name)
             return True
@@ -386,25 +801,11 @@ class WarmPodPool(KubernetesClient):
         """
         List compute pods managed by this controller.
         """
-        pods = self.v1.list_namespaced_pod(
-            namespace=self.namespace,
-            label_selector=self._compute_selector(compute_type=compute_type),
-        )
-
-        status_list = []
-        for pod in pods.items:
-            labels = pod.metadata.labels or {}
-            status_list.append(
-                {
-                    "name": pod.metadata.name,
-                    "phase": pod.status.phase,
-                    "app": labels.get(self.LABEL_APP, "unknown"),
-                    "compute_type": labels.get(self.LABEL_COMPUTE_TYPE, "unknown"),
-                    "pool_status": labels.get(self.LABEL_STATUS, "unknown"),
-                    "assigned_user": labels.get(self.LABEL_USER, ""),
-                    "ready": self._pod_is_ready(pod),
-                    "ip": pod.status.pod_ip,
-                }
-            )
-
-        return status_list
+        snapshot = self.list_pool_snapshot(compute_type=compute_type)
+        return [
+            {
+                **pod,
+                "app": self.APP_WARM_POOL,
+            }
+            for pod in snapshot["pods"]
+        ]

@@ -5,8 +5,18 @@ from typing import Dict, Optional
 from config import settings
 from config.settings import set_request_label
 
-from .compute import ColdStartComputePool, ComputeCleanup, WarmPodPool, ComputeManager
-from .infra import ComputeAvailabilityWatcher, LeaseLeaderElector
+from .compute import (
+    ColdStartComputePool,
+    ComputeCleanup,
+    ComputeManager,
+    PoolCapacityReconciler,
+    WarmPodPool,
+)
+from .infra import (
+    ComputeAvailabilityWatcher,
+    DeploymentPolicyWatcher,
+    LeaseLeaderElector,
+)
 from .queue import ComputeQueues
 from .status import ControllerStatus
 
@@ -22,18 +32,51 @@ class Orchestrator:
         self.queues = ComputeQueues()
         self.tickets = self.queues.tickets
         self.compute_manager = ComputeManager(self.pool, self.queues, self.tickets)
-        self.status = ControllerStatus(self.pool, self.queues, self.tickets)
         self.cleanup = ComputeCleanup(self.pool, self.queues, self.compute_manager)
-        watch_enabled = (
+        self.capacity_reconciler = None
+        self.deployment_watcher = None
+        if isinstance(self.pool, WarmPodPool):
+            self.capacity_reconciler = PoolCapacityReconciler(
+                self.pool,
+                self.queues,
+                on_capacity_available=self.compute_manager.kick_wait_queue_worker,
+                on_periodic_cleanup=self.cleanup.recover_journaled_orphans,
+            )
+            self.deployment_watcher = DeploymentPolicyWatcher(
+                apps_v1=self.pool.apps_v1,
+                namespace=self.pool.namespace,
+                on_policy_event=self.capacity_reconciler.on_deployment_event,
+                label_selector=(
+                    f"{self.pool.LABEL_APP}={self.pool.APP_WARM_POOL}"
+                ),
+                timeout_seconds=settings.COMPUTE_AVAILABILITY_WATCH_TIMEOUT_SECONDS,
+                retry_seconds=settings.COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS,
+            )
+        self.status = ControllerStatus(
+            self.pool,
+            self.queues,
+            self.tickets,
+            capacity_reconciler=self.capacity_reconciler,
+        )
+        pool_uses_watch = getattr(self.pool, "uses_availability_watch", True)
+        watch_enabled = pool_uses_watch and (
             settings.COMPUTE_AVAILABILITY_WATCH_ENABLED
-            and getattr(self.pool, "uses_availability_watch", True)
+            or self.capacity_reconciler is not None
         )
         self.compute_watcher = ComputeAvailabilityWatcher(
             v1=self.pool.v1,
             namespace=self.pool.namespace,
             label_selector=f"{self.pool.LABEL_APP}={self.pool.APP_WARM_POOL}",
             on_compute_available=self.compute_manager.notify_compute_available,
+            on_pool_event=(
+                self.capacity_reconciler.on_pool_event
+                if self.capacity_reconciler
+                else None
+            ),
             enabled=watch_enabled,
+            availability_notifications_enabled=(
+                settings.COMPUTE_AVAILABILITY_WATCH_ENABLED
+            ),
             timeout_seconds=settings.COMPUTE_AVAILABILITY_WATCH_TIMEOUT_SECONDS,
             retry_seconds=settings.COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS,
             app_label=self.pool.LABEL_APP,
@@ -65,9 +108,13 @@ class Orchestrator:
         self._start_queue_worker()
 
         self.leader_elector = LeaseLeaderElector(
-            on_started_leading=self._start_compute_watcher,
-            on_stopped_leading=self._stop_compute_watcher,
+            on_started_leading=self._start_leader_services,
+            on_stopped_leading=self._stop_leader_services,
         )
+        if self.capacity_reconciler:
+            self.capacity_reconciler.set_leadership_validator(
+                self.leader_elector.has_valid_leadership
+            )
         self.leader_elector.start()
         logger.info("Leader election initialized")
 
@@ -77,7 +124,7 @@ class Orchestrator:
     def stop(self) -> None:
         if self.leader_elector:
             self.leader_elector.stop()
-        self._stop_compute_watcher()
+        self._stop_leader_services()
         self.queue_worker_stop_event.set()
         if self.queue_worker_thread and self.queue_worker_thread.is_alive():
             self.queue_worker_thread.join(timeout=5)
@@ -105,11 +152,19 @@ class Orchestrator:
         self.queue_worker_thread.start()
         logger.info("Queue worker started")
 
-    def _start_compute_watcher(self) -> None:
+    def _start_leader_services(self) -> None:
+        if self.capacity_reconciler:
+            self.capacity_reconciler.start()
+        if self.deployment_watcher:
+            self.deployment_watcher.start()
         self.compute_watcher.start()
 
-    def _stop_compute_watcher(self) -> None:
+    def _stop_leader_services(self) -> None:
+        if self.deployment_watcher:
+            self.deployment_watcher.stop()
         self.compute_watcher.stop()
+        if self.capacity_reconciler:
+            self.capacity_reconciler.stop()
 
     def execute_command(
         self,

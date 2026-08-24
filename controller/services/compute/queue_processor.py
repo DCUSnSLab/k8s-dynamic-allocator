@@ -19,7 +19,7 @@ class ComputeQueueProcessor:
         queues,
         tickets,
         allocator,
-        release_pod_best_effort: Callable[[str, str], None],
+        release_pod_best_effort: Callable[[str, str], bool],
     ):
         self.pool = pool
         self.queues = queues
@@ -142,6 +142,25 @@ class ComputeQueueProcessor:
                 return skipped
             if claim_token and (current.get("claim_token") or "") != claim_token:
                 return skipped
+            compute_pod = current.get("compute_pod") or compute_pod
+            if (
+                not compute_pod
+                and hasattr(self.pool, "find_reserved_pod")
+            ):
+                try:
+                    compute_pod = self.pool.find_reserved_pod(
+                        ticket_id=ticket_id,
+                        claim_token=claim_token or "",
+                        compute_type=compute_type,
+                    ) or ""
+                except Exception as exc:
+                    logger.warning(
+                        "[Warning] operation=reservation_journal_lookup "
+                        "ticket_id=%s compute_type=%s reason=%r",
+                        ticket_id,
+                        compute_type,
+                        str(exc),
+                    )
 
             if retry_count < max_retries:
                 recovered = self.tickets.requeue_ticket(

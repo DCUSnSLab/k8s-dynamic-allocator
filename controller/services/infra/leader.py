@@ -53,10 +53,15 @@ class LeaseLeaderElector(KubernetesClient):
         self.retry_interval_seconds = int(
             os.getenv("LEASE_RETRY_INTERVAL_SECONDS", str(retry_interval_seconds))
         )
+        request_timeout = float(
+            os.getenv("K8S_API_REQUEST_TIMEOUT_SECONDS", "5")
+        )
+        self.api_request_timeout = (2.0, max(1.0, request_timeout))
         self.on_started_leading = on_started_leading
         self.on_stopped_leading = on_stopped_leading
 
         self._is_leader = False
+        self._leadership_deadline_monotonic = 0.0
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -93,19 +98,34 @@ class LeaseLeaderElector(KubernetesClient):
         with self._lock:
             return self._is_leader
 
+    def has_valid_leadership(self) -> bool:
+        """Return false when the last confirmed Lease window has expired."""
+        with self._lock:
+            return (
+                self._is_leader
+                and time.monotonic() < self._leadership_deadline_monotonic
+            )
+
     def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
                 currently_leader = self.is_leader()
                 if currently_leader:
+                    attempt_started = time.monotonic()
                     success = self._renew_lease()
                     if not success:
                         logger.warning("[Warning] operation=lease_renew status=lost_leadership identity=%s", self.identity)
                         self._set_leader(False)
+                    else:
+                        self._extend_leadership_deadline(attempt_started)
                 else:
+                    attempt_started = time.monotonic()
                     success = self._try_acquire_lease()
                     if success:
-                        self._set_leader(True)
+                        self._set_leader(
+                            True,
+                            lease_confirmed_at=attempt_started,
+                        )
             except Exception as e:
                 logger.warning("[Warning] operation=lease_election_loop identity=%s reason=%r", self.identity, str(e))
                 self._set_leader(False)
@@ -120,6 +140,7 @@ class LeaseLeaderElector(KubernetesClient):
             return self.coordination_v1.read_namespaced_lease(
                 name=self.lease_name,
                 namespace=self.namespace,
+                _request_timeout=self.api_request_timeout,
             )
         except ApiException as e:
             if e.status == 404:
@@ -147,6 +168,7 @@ class LeaseLeaderElector(KubernetesClient):
                 self.coordination_v1.create_namespaced_lease(
                     namespace=self.namespace,
                     body=body,
+                    _request_timeout=self.api_request_timeout,
                 )
                 logger.info("Leadership acquired by creating lease: %s", self.identity)
                 return True
@@ -184,6 +206,7 @@ class LeaseLeaderElector(KubernetesClient):
                 name=self.lease_name,
                 namespace=self.namespace,
                 body=body,
+                _request_timeout=self.api_request_timeout,
             )
             logger.info(
                 "Leadership acquired from expired holder: new=%s previous=%s",
@@ -230,6 +253,7 @@ class LeaseLeaderElector(KubernetesClient):
                 name=self.lease_name,
                 namespace=self.namespace,
                 body=body,
+                _request_timeout=self.api_request_timeout,
             )
             return True
         except ApiException as e:
@@ -237,13 +261,23 @@ class LeaseLeaderElector(KubernetesClient):
                 return False
             raise
 
-    def _set_leader(self, new_state: bool) -> None:
+    def _set_leader(
+        self,
+        new_state: bool,
+        lease_confirmed_at: Optional[float] = None,
+    ) -> None:
         callback = None
 
         with self._lock:
             if self._is_leader == new_state:
                 return
             self._is_leader = new_state
+            self._leadership_deadline_monotonic = (
+                (lease_confirmed_at or time.monotonic())
+                + self.lease_duration_seconds
+                if new_state
+                else 0.0
+            )
             callback = self.on_started_leading if new_state else self.on_stopped_leading
 
         if new_state:
@@ -256,6 +290,13 @@ class LeaseLeaderElector(KubernetesClient):
                 callback()
             except Exception as e:
                 logger.warning("[Warning] operation=leader_transition_callback identity=%s reason=%r", self.identity, str(e))
+
+    def _extend_leadership_deadline(self, lease_confirmed_at: float) -> None:
+        with self._lock:
+            if self._is_leader:
+                self._leadership_deadline_monotonic = (
+                    lease_confirmed_at + self.lease_duration_seconds
+                )
 
     @staticmethod
     def _holder_identity(lease) -> str:
