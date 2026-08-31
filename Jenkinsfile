@@ -1,26 +1,20 @@
+// The Docker Pipeline plugin's build/push API, matching the AIBootcamp and
+// smartfarmHMI pipelines. The second docker.build argument is appended to
+// `docker build`, so the build context has to come last.
 def dockerBuild = { String imageName, String dockerfile, String contextPath, String buildArgs ->
-    def image = "${env.HARBOR_PROJECT}/${imageName}"
-
-    sh """
-        set -eu
-
-        docker build \
-          ${buildArgs} \
-          -f ${dockerfile} \
-          -t ${image}:${env.IMAGE_TAG} \
-          ${contextPath}
-    """
+    docker.build(
+        "${env.HARBOR_PROJECT}/${imageName}:${env.IMAGE_TAG}",
+        "${buildArgs} -f ${dockerfile} ${contextPath}"
+    )
 }
 
+// Resolved by name rather than carrying the Image object across stages, so the
+// build, verify, and push stages stay independent. Must run inside
+// docker.withRegistry to be authenticated.
 def dockerPush = { String imageName ->
-    def image = "${env.HARBOR_PROJECT}/${imageName}"
-
-    sh """
-        set -eu
-        docker push ${image}:${env.IMAGE_TAG}
-        docker tag ${image}:${env.IMAGE_TAG} ${image}:latest
-        docker push ${image}:latest
-    """
+    def image = docker.image("${env.HARBOR_PROJECT}/${imageName}:${env.IMAGE_TAG}")
+    image.push()
+    image.push('latest')
 }
 
 pipeline {
