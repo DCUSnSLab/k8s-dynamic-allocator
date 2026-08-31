@@ -1,1 +1,2 @@
 *.py text eol=lf
+deploy/scripts/*.sh text eol=lf

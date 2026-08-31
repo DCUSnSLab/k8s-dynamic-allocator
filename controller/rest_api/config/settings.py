@@ -122,6 +122,10 @@ REDIS_URL = _env_first(('REDIS_URL',), 'redis://localhost:6379/0')
 WAIT_QUEUE_PREFIX = _env_first(('WAIT_QUEUE_PREFIX',), 'kda:waitq')
 DEFAULT_COMPUTE_TYPE = _env_first(('DEFAULT_COMPUTE_TYPE',), 'general')
 COMPUTE_POOL_MODE = _env_first(('COMPUTE_POOL_MODE',), 'warm_pool').strip().lower().replace("-", "_")
+COMPUTE_POD_IMAGE = _env_first(
+    ('COMPUTE_POD_IMAGE',),
+    'harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:latest',
+).strip()
 WAIT_QUEUE_TIMEOUT_SECONDS = _env_int_any(('WAIT_QUEUE_TIMEOUT_SECONDS',), 1800)
 WAIT_QUEUE_LOCK_TTL_SECONDS = _env_int_any(
     ('WAIT_QUEUE_LOCK_TTL_SECONDS', 'ALLOCATOR_LOCK_TIMEOUT_SECONDS'),

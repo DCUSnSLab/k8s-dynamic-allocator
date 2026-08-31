@@ -5,6 +5,7 @@ metadata:
   namespace: swlabpods
   labels:
     app: swlabssh
+    k8s-dynamic-allocator/deploy-stage: bootstrap
 ---
 kind: Role
 apiVersion: rbac.authorization.k8s.io/v1
@@ -13,6 +14,7 @@ metadata:
   namespace: swlabpods
   labels:
     app: swlabssh
+    k8s-dynamic-allocator/deploy-stage: bootstrap
 rules:
   - apiGroups: [""]
     resources:
@@ -34,6 +36,7 @@ metadata:
   namespace: swlabpods
   labels:
     app: swlabssh
+    k8s-dynamic-allocator/deploy-stage: bootstrap
 subjects:
   - kind: ServiceAccount
     name: swlabssh
@@ -50,8 +53,14 @@ metadata:
   namespace: swlabpods
   labels:
     app: swlabssh
+    k8s-dynamic-allocator/deploy-stage: swlabssh
 spec:
   replicas: 4
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       kubessh: swlabssh
@@ -74,6 +83,13 @@ spec:
             - name: ssh
               containerPort: 8022
               protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: ssh
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 6
           securityContext:
             privileged: true
           resources:
@@ -91,6 +107,7 @@ metadata:
   namespace: swlabpods
   labels:
     app: swlabssh
+    k8s-dynamic-allocator/deploy-stage: swlabssh
 spec:
   type: NodePort
   selector:

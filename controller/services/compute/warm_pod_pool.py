@@ -15,7 +15,10 @@ from typing import Dict, List, Optional
 from kubernetes import client
 from kubernetes.client.rest import ApiException
 
+from config import settings
+
 from ..infra.kubernetes_client import KubernetesClient
+from .manifest_images import override_compute_agent_image
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +290,8 @@ class WarmPodPool(KubernetesClient):
             try:
                 with open(yaml_file) as f:
                     spec = yaml.safe_load(f)
+
+                override_compute_agent_image(spec, settings.COMPUTE_POD_IMAGE)
 
                 if not isinstance(spec, dict) or "metadata" not in spec:
                     raise ValueError("Invalid manifest: missing metadata")

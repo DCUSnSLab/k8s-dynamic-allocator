@@ -18,6 +18,7 @@ from kubernetes.client.rest import ApiException
 from config import settings
 
 from ..infra.kubernetes_client import KubernetesClient
+from .manifest_images import override_compute_agent_image
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ class ColdStartComputePool(KubernetesClient):
             try:
                 with open(yaml_file, encoding="utf-8") as handle:
                     spec = yaml.safe_load(handle)
+                override_compute_agent_image(spec, settings.COMPUTE_POD_IMAGE)
                 compute_type = self._validate_pod_template(spec)
                 self._templates_by_type[compute_type] = spec
                 results["templates"].append({"file": os.path.basename(yaml_file), "compute_type": compute_type})

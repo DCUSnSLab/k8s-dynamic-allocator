@@ -1,87 +1,24 @@
-def selectedImages = []
-
-def allImages = {
-    return ['controller', 'compute_pod', 'user_pod', 'swlabssh']
-}
-
-def changedAny = { List files, List paths ->
-    return files.any { file ->
-        paths.any { path ->
-            file == path || file.startsWith(path)
-        }
-    }
-}
-
-def expandDcusshk8sSubmoduleChanges = { List files, String diffBase ->
-    def expandedFiles = [] as Set
-    files.each { file ->
-        expandedFiles.add(file)
-    }
-
-    if (!files.contains('dcusshk8s')) {
-        return expandedFiles as List
-    }
-
-    def oldTree = sh(
-        script: "git ls-tree ${diffBase} dcusshk8s",
-        returnStdout: true
-    ).trim()
-    def newTree = sh(
-        script: 'git ls-tree HEAD dcusshk8s',
-        returnStdout: true
-    ).trim()
-    def oldSha = oldTree ? oldTree.split(/\s+/)[2] : ''
-    def newSha = newTree ? newTree.split(/\s+/)[2] : ''
-
-    if (!oldSha || !newSha || oldSha == newSha) {
-        return expandedFiles as List
-    }
-
-    def hasSubmoduleCommits = sh(
-        script: "git -C dcusshk8s cat-file -e ${oldSha}^{commit} && git -C dcusshk8s cat-file -e ${newSha}^{commit}",
-        returnStatus: true
-    ) == 0
-
-    if (!hasSubmoduleCommits) {
-        expandedFiles.add('dcusshk8s/dockerbuild/')
-        expandedFiles.add('dcusshk8s/')
-        return expandedFiles as List
-    }
-
-    def submoduleDiffOutput = sh(
-        script: "git -C dcusshk8s diff --name-only ${oldSha} ${newSha}",
-        returnStdout: true
-    ).trim()
-
-    if (!submoduleDiffOutput) {
-        expandedFiles.add('dcusshk8s/dockerbuild/')
-        expandedFiles.add('dcusshk8s/')
-        return expandedFiles as List
-    }
-
-    submoduleDiffOutput.split('\\n').each { file ->
-        if (file?.trim()) {
-            expandedFiles.add("dcusshk8s/${file.trim()}")
-        }
-    }
-
-    return expandedFiles as List
-}
-
-def imageEnabled = { String imageName ->
-    return selectedImages.contains(imageName)
-}
-
-def dockerBuildAndPush = { String imageName, String dockerfile, String contextPath ->
+def dockerBuild = { String imageName, String dockerfile, String contextPath, String buildArgs ->
     def image = "${env.HARBOR_PROJECT}/${imageName}"
+
     sh """
+        set -eu
+
         docker build \
+          ${buildArgs} \
           -f ${dockerfile} \
           -t ${image}:${env.IMAGE_TAG} \
-          -t ${image}:latest \
           ${contextPath}
+    """
+}
 
+def dockerPush = { String imageName ->
+    def image = "${env.HARBOR_PROJECT}/${imageName}"
+
+    sh """
+        set -eu
         docker push ${image}:${env.IMAGE_TAG}
+        docker tag ${image}:${env.IMAGE_TAG} ${image}:latest
         docker push ${image}:latest
     """
 }
@@ -90,15 +27,24 @@ pipeline {
     agent any
 
     options {
+        timeout(time: 60, unit: 'MINUTES')
         disableConcurrentBuilds()
         skipDefaultCheckout(true)
     }
 
+    // Multibranch note: these appear in the UI only from the second build of a
+    // branch. The first indexing build sees params as null, so every read below
+    // falls back to the default.
     parameters {
-        choice(
-            name: 'TARGET_IMAGE',
-            choices: ['auto', 'all', 'controller', 'compute_pod', 'user_pod', 'swlabssh'],
-            description: 'Image target to build. auto builds only images affected by the latest Git changes.'
+        string(
+            name: 'POOL_AVAILABLE_MIN',
+            defaultValue: '2',
+            description: 'R - warm Compute Pods kept immediately allocatable'
+        )
+        string(
+            name: 'POOL_TOTAL_MAX',
+            defaultValue: '5',
+            description: 'N - upper bound on available + assigned Compute Pods'
         )
     }
 
@@ -106,6 +52,15 @@ pipeline {
         HARBOR_REGISTRY = 'harbor.cu.ac.kr'
         HARBOR_PROJECT = 'harbor.cu.ac.kr/k8s_dynamic_allocator'
         HARBOR_CREDENTIALS_ID = 'harbor'
+
+        PRODUCTION_NAMESPACE = 'kda-test'
+        PRODUCTION_STORAGE_CLASS = 'normal-r3'
+        PRODUCTION_OVERLAY = 'deploy/overlays/production'
+        PRODUCTION_LOCK = 'kda-deploy-production'
+        DEPLOY_STAGE_LABEL = 'k8s-dynamic-allocator/deploy-stage'
+
+        PRODUCTION_SSH_HOST = '203.250.35.87'
+        PRODUCTION_SSH_PORT = '30622'
     }
 
     stages {
@@ -123,133 +78,96 @@ pipeline {
                         script: 'git rev-parse --short=7 HEAD',
                         returnStdout: true
                     ).trim()
-                    env.IMAGE_TAG = "${env.GIT_SHA7}-${env.BUILD_NUMBER}"
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_SHA7}"
 
-                    if (params.TARGET_IMAGE == 'all') {
-                        selectedImages = allImages()
-                    } else if (params.TARGET_IMAGE != 'auto') {
-                        selectedImages = [params.TARGET_IMAGE]
-                    } else {
-                        def diffBase = env.GIT_PREVIOUS_SUCCESSFUL_COMMIT ?: env.GIT_PREVIOUS_COMMIT ?: ''
+                    env.CONTROLLER_IMAGE = "${env.HARBOR_PROJECT}/controller:${env.IMAGE_TAG}"
+                    env.COMPUTE_POD_IMAGE = "${env.HARBOR_PROJECT}/compute_pod:${env.IMAGE_TAG}"
+                    env.USER_POD_IMAGE = "${env.HARBOR_PROJECT}/user_pod:${env.IMAGE_TAG}"
+                    env.SWLABSSH_IMAGE = "${env.HARBOR_PROJECT}/swlabssh:${env.IMAGE_TAG}"
 
-                        if (!diffBase?.trim()) {
-                            def hasParent = sh(
-                                script: 'git rev-parse --verify HEAD~1 >/dev/null 2>&1',
-                                returnStatus: true
-                            ) == 0
-                            if (hasParent) {
-                                diffBase = sh(
-                                    script: 'git rev-parse HEAD~1',
-                                    returnStdout: true
-                                ).trim()
-                            }
-                        }
+                    def userCauses = currentBuild.getBuildCauses(
+                        'hudson.model.Cause$UserIdCause'
+                    )
+                    env.IS_MANUAL_BUILD = userCauses.isEmpty() ? 'false' : 'true'
+                    env.DEPLOY_STARTED = 'false'
+                    env.DEPLOY_DIAGNOSTICS_DONE = 'false'
 
-                        if (!diffBase?.trim()) {
-                            selectedImages = allImages()
-                        } else {
-                            def diffOutput = sh(
-                                script: "git diff --name-only ${diffBase} HEAD",
-                                returnStdout: true
-                            ).trim()
-                            def changedFiles = diffOutput ? diffOutput.split('\\n') as List : []
-                            changedFiles = expandDcusshk8sSubmoduleChanges(changedFiles, diffBase)
-                            echo "CHANGED_FILES=${changedFiles.join(',') ?: 'none'}"
+                    env.POOL_AVAILABLE_MIN = (params.POOL_AVAILABLE_MIN ?: '2').trim()
+                    env.POOL_TOTAL_MAX = (params.POOL_TOTAL_MAX ?: '5').trim()
 
-                            if (changedFiles.contains('Jenkinsfile')) {
-                                selectedImages = allImages()
-                            } else {
-                                selectedImages = []
-
-                                if (changedAny(changedFiles, [
-                                    'controller/',
-                                    'deploy/docker/controller/',
-                                    'deploy/controller.yaml',
-                                    'kda_config.py'
-                                ])) {
-                                    selectedImages.add('controller')
-                                }
-
-                                if (changedAny(changedFiles, [
-                                    'compute_agent/',
-                                    'deploy/docker/compute/',
-                                    'controller/manifests/compute-general.yaml',
-                                    'kda_config.py'
-                                ])) {
-                                    selectedImages.add('compute_pod')
-                                }
-
-                                if (changedAny(changedFiles, [
-                                    'dcusshk8s/dockerbuild/'
-                                ])) {
-                                    selectedImages.add('user_pod')
-                                }
-
-                                if (changedFiles.any { file ->
-                                    (file.startsWith('dcusshk8s/') && !file.startsWith('dcusshk8s/dockerbuild/')) ||
-                                    file.startsWith('deploy/docker/swlabssh/') ||
-                                    file == 'deploy/swlabssh.yaml' ||
-                                    file == 'kda_config.py'
-                                }) {
-                                    selectedImages.add('swlabssh')
-                                }
-                            }
-                        }
-                    }
-
+                    echo "BRANCH_NAME=${env.BRANCH_NAME}"
                     echo "IMAGE_TAG=${env.IMAGE_TAG}"
-                    echo "TARGET_IMAGE=${params.TARGET_IMAGE}"
-                    echo "SELECTED_IMAGES=${selectedImages.join(',') ?: 'none'}"
-                }
-            }
-        }
+                    echo "IS_MANUAL_BUILD=${env.IS_MANUAL_BUILD}"
+                    echo "POOL_POLICY R=${env.POOL_AVAILABLE_MIN} N=${env.POOL_TOTAL_MAX}"
 
-        stage('Build and Push controller') {
-            when {
-                expression { imageEnabled('controller') }
-            }
-            steps {
-                script {
-                    docker.withRegistry("https://${env.HARBOR_REGISTRY}", env.HARBOR_CREDENTIALS_ID) {
-                        dockerBuildAndPush(
-                            'controller',
-                            'deploy/docker/controller/Dockerfile',
-                            '.'
-                        )
+                    if (env.IS_MANUAL_BUILD != 'true') {
+                        echo 'Automatic Multibranch/SCM build detected: image build and production deployment are skipped.'
                     }
                 }
             }
         }
 
-        stage('Build and Push compute_pod') {
+        stage('Build Base Images') {
             when {
-                expression { imageEnabled('compute_pod') }
+                expression { env.IS_MANUAL_BUILD == 'true' }
             }
-            steps {
-                script {
-                    docker.withRegistry("https://${env.HARBOR_REGISTRY}", env.HARBOR_CREDENTIALS_ID) {
-                        dockerBuildAndPush(
-                            'compute_pod',
-                            'deploy/docker/compute/Dockerfile',
-                            '.'
-                        )
+            parallel {
+                stage('compute_pod') {
+                    steps {
+                        script {
+                            dockerBuild(
+                                'compute_pod',
+                                'deploy/docker/compute/Dockerfile',
+                                '.',
+                                ''
+                            )
+                        }
+                    }
+                }
+
+                stage('user_pod') {
+                    steps {
+                        dir('dcusshk8s/dockerbuild') {
+                            script {
+                                dockerBuild(
+                                    'user_pod',
+                                    'Dockerfile',
+                                    '.',
+                                    ''
+                                )
+                            }
+                        }
                     }
                 }
             }
         }
 
-        stage('Build and Push user_pod') {
+        stage('Build Dependent Images') {
             when {
-                expression { imageEnabled('user_pod') }
+                expression { env.IS_MANUAL_BUILD == 'true' }
             }
-            steps {
-                dir('dcusshk8s/dockerbuild') {
-                    script {
-                        docker.withRegistry("https://${env.HARBOR_REGISTRY}", env.HARBOR_CREDENTIALS_ID) {
-                            dockerBuildAndPush(
-                                'user_pod',
-                                'Dockerfile',
-                                '.'
+            parallel {
+                stage('controller') {
+                    steps {
+                        script {
+                            dockerBuild(
+                                'controller',
+                                'deploy/docker/controller/Dockerfile',
+                                '.',
+                                "--build-arg COMPUTE_POD_IMAGE=${env.COMPUTE_POD_IMAGE}"
+                            )
+                        }
+                    }
+                }
+
+                stage('swlabssh') {
+                    steps {
+                        script {
+                            dockerBuild(
+                                'swlabssh',
+                                'deploy/docker/swlabssh/Dockerfile',
+                                '.',
+                                "--build-arg USER_POD_IMAGE=${env.USER_POD_IMAGE}"
                             )
                         }
                     }
@@ -257,28 +175,75 @@ pipeline {
             }
         }
 
-        stage('Build and Push swlabssh') {
+        stage('Verify Built Images') {
             when {
-                expression { imageEnabled('swlabssh') }
+                expression { env.IS_MANUAL_BUILD == 'true' }
+            }
+            steps {
+                sh 'sh deploy/scripts/verify-built-images.sh'
+            }
+        }
+
+        stage('Push Images') {
+            when {
+                expression { env.IS_MANUAL_BUILD == 'true' }
             }
             steps {
                 script {
-                    docker.withRegistry("https://${env.HARBOR_REGISTRY}", env.HARBOR_CREDENTIALS_ID) {
-                        dockerBuildAndPush(
-                            'swlabssh',
-                            'deploy/docker/swlabssh/Dockerfile',
-                            '.'
-                        )
+                    docker.withRegistry(
+                        "https://${env.HARBOR_REGISTRY}",
+                        env.HARBOR_CREDENTIALS_ID
+                    ) {
+                        ['compute_pod', 'user_pod', 'controller', 'swlabssh'].each {
+                            dockerPush(it)
+                        }
                     }
                 }
             }
         }
 
+        stage('Deploy Production') {
+            when {
+                expression { env.IS_MANUAL_BUILD == 'true' }
+            }
+            steps {
+                script {
+                    lock(resource: env.PRODUCTION_LOCK) {
+                        env.DEPLOY_STARTED = 'true'
+                        try {
+                            sh 'sh deploy/scripts/deploy-production.sh'
+                        } catch (deploymentError) {
+                            sh 'sh deploy/scripts/deployment-diagnostics.sh'
+                            env.DEPLOY_DIAGNOSTICS_DONE = 'true'
+                            throw deploymentError
+                        }
+                    }
+                }
+            }
+        }
     }
 
     post {
         success {
-            echo "Build completed with IMAGE_TAG=${env.IMAGE_TAG}"
+            script {
+                if (env.IS_MANUAL_BUILD == 'true') {
+                    echo "Production deployment completed with IMAGE_TAG=${env.IMAGE_TAG}"
+                } else {
+                    echo 'Automatic Multibranch/SCM build completed without image build or deployment.'
+                }
+            }
+        }
+
+        failure {
+            script {
+                if (
+                    env.IS_MANUAL_BUILD == 'true' &&
+                    env.DEPLOY_STARTED == 'true' &&
+                    env.DEPLOY_DIAGNOSTICS_DONE != 'true'
+                ) {
+                    sh 'sh deploy/scripts/deployment-diagnostics.sh'
+                }
+            }
         }
     }
 }

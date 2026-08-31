@@ -1,3 +1,5 @@
+import os
+import runpy
 import sys
 import unittest
 from pathlib import Path
@@ -17,6 +19,8 @@ for import_root in (str(CONTROLLER_ROOT), str(REST_API_ROOT)):
 
 from services.compute.allocator import ComputeAllocator
 from services.compute.cleanup import ComputeCleanup
+from services.compute.cold_start_pool import ColdStartComputePool
+from services.compute.manifest_images import override_compute_agent_image
 from services.compute.pool_capacity_reconciler import PoolCapacityReconciler
 from services.compute.queue_processor import ComputeQueueProcessor
 from services.compute.warm_pod_pool import WarmPodPool
@@ -62,6 +66,79 @@ class PoolManifestTests(unittest.TestCase):
         ]
         self.assertEqual(len(scale_rules), 1)
         self.assertTrue({"get", "patch", "update"} <= set(scale_rules[0]["verbs"]))
+
+
+class RuntimeChildImageTests(unittest.TestCase):
+    image = "harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:42-a1b2c3d"
+
+    def test_warm_initializer_applies_runtime_compute_image(self):
+        create_deployment = MagicMock()
+        pool = object.__new__(WarmPodPool)
+        pool.namespace = "test"
+        pool.api_request_timeout = (2.0, 5.0)
+        pool.owner_ref = None
+        pool.apps_v1 = SimpleNamespace(
+            list_namespaced_deployment=lambda **kwargs: SimpleNamespace(items=[]),
+            create_namespaced_deployment=create_deployment,
+        )
+
+        with patch(
+            "services.compute.warm_pod_pool.settings.COMPUTE_POD_IMAGE",
+            self.image,
+        ):
+            result = pool.initialize_pool()
+
+        self.assertEqual(result["created"], ["compute-general"])
+        deployment = create_deployment.call_args.kwargs["body"]
+        compute_agent = next(
+            container
+            for container in deployment["spec"]["template"]["spec"]["containers"]
+            if container["name"] == "compute-agent"
+        )
+        self.assertEqual(compute_agent["image"], self.image)
+
+    def test_cold_start_initializer_applies_runtime_compute_image(self):
+        pool = object.__new__(ColdStartComputePool)
+
+        with patch(
+            "services.compute.cold_start_pool.settings.COMPUTE_POD_IMAGE",
+            self.image,
+        ):
+            result = pool.initialize_pool(log_existing=False)
+
+        self.assertFalse(result["failed"])
+        compute_agent = next(
+            container
+            for container in pool._templates_by_type["general"]["spec"]["containers"]
+            if container["name"] == "compute-agent"
+        )
+        self.assertEqual(compute_agent["image"], self.image)
+
+    def test_compute_image_override_fails_when_target_is_missing(self):
+        manifest = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {"name": "other", "image": "example.invalid/other:1"}
+                        ]
+                    }
+                }
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "exactly one compute-agent"):
+            override_compute_agent_image(manifest, self.image)
+
+
+class RuntimeNamespaceConfigTests(unittest.TestCase):
+    def test_k8s_namespace_environment_overrides_default(self):
+        with patch.dict(os.environ, {"K8S_NAMESPACE": "kda-test"}, clear=False):
+            values = runpy.run_path(str(REPOSITORY_ROOT / "kda_config.py"))
+
+        self.assertEqual(values["DEFAULT_NAMESPACE"], "kda-test")
 
 
 def _deployment(annotations):

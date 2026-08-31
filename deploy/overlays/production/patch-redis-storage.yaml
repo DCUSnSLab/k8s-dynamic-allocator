@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: controller-queue-redis-data
+  namespace: swlabpods
+spec:
+  storageClassName: normal-r3

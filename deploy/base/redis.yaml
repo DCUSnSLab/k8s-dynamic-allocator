@@ -3,8 +3,12 @@ kind: Deployment
 metadata:
   name: controller-queue-redis
   namespace: swlabpods
+  labels:
+    k8s-dynamic-allocator/deploy-stage: redis
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: controller-queue-redis
@@ -55,6 +59,8 @@ kind: PersistentVolumeClaim
 metadata:
   name: controller-queue-redis-data
   namespace: swlabpods
+  labels:
+    k8s-dynamic-allocator/deploy-stage: redis
 spec:
   accessModes:
   - ReadWriteOnce
@@ -70,6 +76,8 @@ kind: Service
 metadata:
   name: controller-queue-redis
   namespace: swlabpods
+  labels:
+    k8s-dynamic-allocator/deploy-stage: redis
 spec:
   selector:
     app: controller-queue-redis

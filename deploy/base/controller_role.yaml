@@ -5,6 +5,7 @@ metadata:
   namespace: swlabpods
   labels:
     app: controller
+    k8s-dynamic-allocator/deploy-stage: bootstrap
 
 ---
 
@@ -15,6 +16,7 @@ metadata:
   namespace: swlabpods
   labels:
     app: controller
+    k8s-dynamic-allocator/deploy-stage: bootstrap
 rules:
 - apiGroups: [""]
   resources: ["pods", "pods/exec", "pods/portforward", "persistentvolumeclaims"]
@@ -36,6 +38,8 @@ apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: controller-rolebinding
   namespace: swlabpods
+  labels:
+    k8s-dynamic-allocator/deploy-stage: bootstrap
 subjects:
 - kind: ServiceAccount
   name: controller-sa

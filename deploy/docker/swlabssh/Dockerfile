@@ -1,5 +1,9 @@
 FROM python:3.11-alpine
 
+ARG USER_POD_IMAGE
+RUN test -n "$USER_POD_IMAGE"
+ENV USER_POD_IMAGE=${USER_POD_IMAGE}
+
 WORKDIR /dcusshk8s
 
 COPY dcusshk8s/ /dcusshk8s/

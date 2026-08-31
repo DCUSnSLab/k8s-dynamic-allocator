@@ -4,6 +4,10 @@
 
 FROM python:3.11-slim
 
+ARG COMPUTE_POD_IMAGE
+RUN test -n "$COMPUTE_POD_IMAGE"
+ENV COMPUTE_POD_IMAGE=${COMPUTE_POD_IMAGE}
+
 WORKDIR /app
 
 COPY controller/requirements.txt .

@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+namespace: kda-test
+
+images:
+  - name: harbor.cu.ac.kr/k8s_dynamic_allocator/controller
+    newTag: latest
+  - name: harbor.cu.ac.kr/k8s_dynamic_allocator/swlabssh
+    newTag: latest
+
+patches:
+  - path: patch-controller-env.yaml
+  - path: patch-swlabssh-env.yaml
+  - path: patch-redis-storage.yaml
+  - path: patch-logging-storage.yaml
+  - path: patch-fluent-bit-env.yaml
