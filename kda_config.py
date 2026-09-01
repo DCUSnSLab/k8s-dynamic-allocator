@@ -2,13 +2,14 @@
 
 Note:
     This file is copied into runtime images and read by controller, compute
-    agent, and swlabssh processes. It does not template or rewrite Kubernetes
-    manifests. When changing cluster-level values such as namespace, storage
-    class, service exposure, or Fluent Bit log paths, update the YAML files
-    under deploy/ and related dcusshk8s manifests together.
+    agent, and swlabssh processes. Cluster-specific deployment values are
+    supplied by the Kubernetes overlay or image build arguments.
 """
 
-DEFAULT_NAMESPACE = "swlabpods"
+import os
+
+
+DEFAULT_NAMESPACE = os.getenv("K8S_NAMESPACE") or "swlabpods"
 
 REDIS_URL = "redis://controller-queue-redis:6379/0"
 CONTROLLER_RELEASE_HOST = "controller-service"
@@ -25,6 +26,7 @@ LEASE_RETRY_INTERVAL_SECONDS = 2
 WAIT_QUEUE_TIMEOUT_SECONDS = 1800
 WAIT_QUEUE_TICKET_TTL_SECONDS = 7200
 WAIT_QUEUE_LOCK_TTL_SECONDS = 60
+WAIT_QUEUE_LOCK_RENEW_SECONDS = 20
 WAIT_QUEUE_ALLOCATING_TTL_SECONDS = 60
 ASSIGNED_CONTEXT_TTL_SECONDS = 2592000
 COMPUTE_AVAILABLE_TTL_SECONDS = 600
@@ -37,6 +39,14 @@ WAIT_QUEUE_MOUNT_CONCURRENCY = 10
 COMPUTE_AVAILABILITY_WATCH_ENABLED = True
 COMPUTE_AVAILABILITY_WATCH_TIMEOUT_SECONDS = 60
 COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS = 1.0
+
+POOL_RECONCILE_DEBOUNCE_SECONDS = 0.2
+POOL_RECONCILE_RESYNC_SECONDS = 60
+POOL_POLICY_READY_TTL_SECONDS = 15
+POOL_POLICY_READY_RENEW_SECONDS = 5
+POOL_SCALE_DOWN_GATE_TTL_SECONDS = 15
+POOL_SCALE_DOWN_GATE_RENEW_SECONDS = 5
+POOL_SCALE_DOWN_WAIT_TIMEOUT_SECONDS = 10
 
 COMPUTE_AGENT_TIMEOUT_SECONDS = 30.0
 COMPUTE_AGENT_MOUNT_TIMEOUT_SECONDS = 30.0

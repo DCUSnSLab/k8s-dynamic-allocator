@@ -50,6 +50,8 @@ class ComputeQueues:
         compute_available_ttl_seconds: Optional[int] = None,
         max_retries: Optional[int] = None,
         worker_identity: Optional[str] = None,
+        scale_down_gate_ttl_seconds: Optional[int] = None,
+        pool_policy_ready_ttl_seconds: Optional[int] = None,
     ):
         self.redis_url = redis_url or settings.REDIS_URL
         self.prefix = prefix or settings.WAIT_QUEUE_PREFIX
@@ -57,6 +59,13 @@ class ComputeQueues:
             (default_compute_type or settings.DEFAULT_COMPUTE_TYPE).strip().lower() or "general"
         )
         self.lock_ttl_seconds = lock_ttl_seconds or settings.WAIT_QUEUE_LOCK_TTL_SECONDS
+        self.scale_down_gate_ttl_seconds = (
+            scale_down_gate_ttl_seconds or settings.POOL_SCALE_DOWN_GATE_TTL_SECONDS
+        )
+        self.pool_policy_ready_ttl_seconds = (
+            pool_policy_ready_ttl_seconds
+            or settings.POOL_POLICY_READY_TTL_SECONDS
+        )
         self.wait_timeout_seconds = wait_timeout_seconds or settings.WAIT_QUEUE_TIMEOUT_SECONDS
         self.ticket_ttl_seconds = ticket_ttl_seconds or settings.WAIT_QUEUE_TICKET_TTL_SECONDS
         self.allocating_ttl_seconds = allocating_ttl_seconds or settings.WAIT_QUEUE_ALLOCATING_TTL_SECONDS
@@ -129,6 +138,15 @@ class ComputeQueues:
 
     def _lock_key(self, compute_type: str) -> str:
         return f"{self.prefix}:lock:{compute_type}"
+
+    def _pool_policy_key(self, compute_type: str) -> str:
+        return f"{self.prefix}:pool-policy:{compute_type}"
+
+    def _scale_down_gate_key(self, compute_type: str) -> str:
+        return f"{self.prefix}:scale-down-gate:{compute_type}"
+
+    def _pool_policy_ready_key(self) -> str:
+        return f"{self.prefix}:pool-policy-ready"
 
     def _assigned_request_key(self, compute_pod: str) -> str:
         return f"{self.prefix}:assigned-request:{compute_pod}"
@@ -405,6 +423,182 @@ class ComputeQueues:
             "waiting_users": waiting_users,
         }
 
+    def set_pool_policy(
+        self,
+        compute_type: str,
+        deployment_name: str,
+        R: int,
+        N: int,
+        resource_version: str = "",
+    ) -> Dict[str, object]:
+        compute_type_value = self.normalize_compute_type(compute_type)
+        deployment_name_value = (deployment_name or "").strip()
+        try:
+            pool_available_min = int(R)
+            pool_total_max = int(N)
+        except (TypeError, ValueError) as exc:
+            raise QueueUnavailableError(
+                f"Invalid pool policy for {compute_type_value}: R and N must be integers"
+            ) from exc
+
+        if not deployment_name_value:
+            raise QueueUnavailableError(
+                f"Invalid pool policy for {compute_type_value}: deployment_name is required"
+            )
+        if pool_available_min < 0 or pool_total_max < 0 or pool_available_min > pool_total_max:
+            raise QueueUnavailableError(
+                f"Invalid pool policy for {compute_type_value}: require 0 <= R <= N"
+            )
+
+        policy = {
+            "compute_type": compute_type_value,
+            "deployment_name": deployment_name_value,
+            "R": pool_available_min,
+            "N": pool_total_max,
+            "resource_version": (resource_version or "").strip(),
+        }
+        payload = {
+            "deployment_name": deployment_name_value,
+            "R": str(pool_available_min),
+            "N": str(pool_total_max),
+            "resource_version": policy["resource_version"],
+        }
+        client = self._redis_client()
+        try:
+            client.hset(self._pool_policy_key(compute_type_value), mapping=payload)
+            return policy
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to store pool policy for {compute_type_value}: {exc}"
+            ) from exc
+
+    def get_pool_policy(self, compute_type: str) -> Optional[Dict[str, object]]:
+        compute_type_value = self.normalize_compute_type(compute_type)
+        client = self._redis_client()
+        try:
+            raw = client.hgetall(self._pool_policy_key(compute_type_value))
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to read pool policy for {compute_type_value}: {exc}"
+            ) from exc
+
+        if not raw:
+            return None
+
+        try:
+            pool_available_min = int(raw["R"])
+            pool_total_max = int(raw["N"])
+            deployment_name = (raw["deployment_name"] or "").strip()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise QueueUnavailableError(
+                f"Invalid stored pool policy for {compute_type_value}"
+            ) from exc
+
+        if (
+            not deployment_name
+            or pool_available_min < 0
+            or pool_total_max < 0
+            or pool_available_min > pool_total_max
+        ):
+            raise QueueUnavailableError(
+                f"Invalid stored pool policy for {compute_type_value}"
+            )
+
+        return {
+            "compute_type": compute_type_value,
+            "deployment_name": deployment_name,
+            "R": pool_available_min,
+            "N": pool_total_max,
+            "resource_version": (raw.get("resource_version") or "").strip(),
+        }
+
+    def clear_pool_policy(self, compute_type: str) -> bool:
+        compute_type_value = self.normalize_compute_type(compute_type)
+        client = self._redis_client()
+        try:
+            return bool(client.delete(self._pool_policy_key(compute_type_value)))
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to clear pool policy for {compute_type_value}: {exc}"
+            ) from exc
+
+    def publish_pool_policy_ready(self, token: str) -> bool:
+        token_value = (token or "").strip()
+        if not token_value:
+            raise QueueUnavailableError("Pool policy readiness token is required")
+        client = self._redis_client()
+        try:
+            return bool(
+                client.set(
+                    self._pool_policy_ready_key(),
+                    token_value,
+                    ex=max(1, int(self.pool_policy_ready_ttl_seconds)),
+                )
+            )
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to publish pool policy readiness: {exc}"
+            ) from exc
+
+    def renew_pool_policy_ready(self, token: str) -> bool:
+        token_value = (token or "").strip()
+        if not token_value:
+            return False
+        client = self._redis_client()
+        renew_script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("expire", KEYS[1], ARGV[2])
+        end
+        return 0
+        """
+        try:
+            return bool(
+                client.eval(
+                    renew_script,
+                    1,
+                    self._pool_policy_ready_key(),
+                    token_value,
+                    max(1, int(self.pool_policy_ready_ttl_seconds)),
+                )
+            )
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to renew pool policy readiness: {exc}"
+            ) from exc
+
+    def clear_pool_policy_ready(self, token: Optional[str] = None) -> bool:
+        client = self._redis_client()
+        try:
+            if not token:
+                return bool(client.delete(self._pool_policy_ready_key()))
+            release_script = """
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+            end
+            return 0
+            """
+            return bool(
+                client.eval(
+                    release_script,
+                    1,
+                    self._pool_policy_ready_key(),
+                    token,
+                )
+            )
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to clear pool policy readiness: {exc}"
+            ) from exc
+
+    def is_pool_policy_ready(self) -> bool:
+        client = self._redis_client()
+        try:
+            return bool(client.exists(self._pool_policy_ready_key()))
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to inspect pool policy readiness: {exc}"
+            ) from exc
+
     def acquire_allocator_lock(self, compute_type: str, owner: Optional[str] = None) -> Optional[str]:
         compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()
@@ -419,6 +613,32 @@ class ComputeQueues:
             return token if acquired else None
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to acquire lock for {compute_type_value}: {exc}") from exc
+
+    def renew_allocator_lock(self, compute_type: str, token: Optional[str]) -> bool:
+        if not token:
+            return False
+
+        compute_type_value = self.normalize_compute_type(compute_type)
+        client = self._redis_client()
+        renew_script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("expire", KEYS[1], ARGV[2])
+        end
+        return 0
+        """
+        try:
+            result = client.eval(
+                renew_script,
+                1,
+                self._lock_key(compute_type_value),
+                token,
+                self.lock_ttl_seconds,
+            )
+            return bool(result)
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to renew lock for {compute_type_value}: {exc}"
+            ) from exc
 
     def release_allocator_lock(self, compute_type: str, token: Optional[str]) -> bool:
         if not token:
@@ -437,6 +657,88 @@ class ComputeQueues:
             return bool(result)
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to release lock for {compute_type_value}: {exc}") from exc
+
+    def acquire_scale_down_gate(
+        self,
+        compute_type: str,
+        owner: Optional[str] = None,
+    ) -> Optional[str]:
+        compute_type_value = self.normalize_compute_type(compute_type)
+        client = self._redis_client()
+        token = owner or uuid.uuid4().hex
+        try:
+            acquired = client.set(
+                self._scale_down_gate_key(compute_type_value),
+                token,
+                nx=True,
+                ex=self.scale_down_gate_ttl_seconds,
+            )
+            return token if acquired else None
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to acquire scale-down gate for {compute_type_value}: {exc}"
+            ) from exc
+
+    def renew_scale_down_gate(self, compute_type: str, token: Optional[str]) -> bool:
+        if not token:
+            return False
+
+        compute_type_value = self.normalize_compute_type(compute_type)
+        client = self._redis_client()
+        renew_script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("expire", KEYS[1], ARGV[2])
+        end
+        return 0
+        """
+        try:
+            result = client.eval(
+                renew_script,
+                1,
+                self._scale_down_gate_key(compute_type_value),
+                token,
+                self.scale_down_gate_ttl_seconds,
+            )
+            return bool(result)
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to renew scale-down gate for {compute_type_value}: {exc}"
+            ) from exc
+
+    def release_scale_down_gate(self, compute_type: str, token: Optional[str]) -> bool:
+        if not token:
+            return False
+
+        compute_type_value = self.normalize_compute_type(compute_type)
+        client = self._redis_client()
+        release_script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        end
+        return 0
+        """
+        try:
+            result = client.eval(
+                release_script,
+                1,
+                self._scale_down_gate_key(compute_type_value),
+                token,
+            )
+            return bool(result)
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to release scale-down gate for {compute_type_value}: {exc}"
+            ) from exc
+
+    def is_scale_down_gated(self, compute_type: str) -> bool:
+        compute_type_value = self.normalize_compute_type(compute_type)
+        client = self._redis_client()
+        try:
+            return bool(client.exists(self._scale_down_gate_key(compute_type_value)))
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to inspect scale-down gate for {compute_type_value}: {exc}"
+            ) from exc
 
     def is_allocation_stale(self, ticket: Dict[str, object]) -> bool:
         allocation_deadline = ticket.get("allocation_deadline")

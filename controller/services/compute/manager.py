@@ -226,6 +226,9 @@ class ComputeManager:
             source=source,
         )
 
+    def kick_wait_queue_worker(self, compute_type: Optional[str] = None) -> None:
+        self.queue_processor.kick_wait_queue_worker(compute_type)
+
     def get_assigned_request_context(self, compute_pod: str) -> Optional[Dict[str, object]]:
         return self.releaser.get_assigned_request_context(compute_pod)
 

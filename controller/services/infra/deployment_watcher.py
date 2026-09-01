@@ -1,8 +1,7 @@
-"""Leader-only compute availability watch."""
+"""Leader-only compute Deployment policy watch."""
 
 import logging
 import threading
-from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from kubernetes import watch
@@ -11,43 +10,27 @@ from kubernetes.client.rest import ApiException
 logger = logging.getLogger(__name__)
 
 
-class ComputeAvailabilityWatcher:
-    """Watch compute pods and wake queue processing when a Ready compute pod appears."""
+class DeploymentPolicyWatcher:
+    """Watch warm-pool Deployments and report policy or lifecycle changes."""
 
     def __init__(
         self,
         *,
-        v1,
+        apps_v1,
         namespace: str,
-        label_selector: str,
-        on_compute_available: Callable[[str, str, str, str], None],
-        on_pool_event: Optional[Callable[[str, object, str], None]] = None,
+        on_policy_event: Optional[Callable[[str, object, str], None]] = None,
+        label_selector: str = "app=warm-pod-pool",
         enabled: bool = True,
-        availability_notifications_enabled: bool = True,
         timeout_seconds: int = 60,
         retry_seconds: float = 1.0,
-        app_label: str = "app",
-        app_value: str = "warm-pod-pool",
-        status_label: str = "pool-status",
-        available_status: str = "available",
-        compute_type_label: str = "compute-type",
     ):
-        self.v1 = v1
+        self.apps_v1 = apps_v1
         self.namespace = namespace
+        self.on_policy_event = on_policy_event
         self.label_selector = label_selector
-        self.on_compute_available = on_compute_available
-        self.on_pool_event = on_pool_event
         self.enabled = enabled
-        self.availability_notifications_enabled = (
-            availability_notifications_enabled
-        )
         self.timeout_seconds = max(1, int(timeout_seconds))
         self.retry_seconds = max(0.1, float(retry_seconds))
-        self.app_label = app_label
-        self.app_value = app_value
-        self.status_label = status_label
-        self.available_status = available_status
-        self.compute_type_label = compute_type_label
 
         self._lock = threading.Lock()
         self._stop_event: Optional[threading.Event] = None
@@ -56,7 +39,7 @@ class ComputeAvailabilityWatcher:
 
     def start(self) -> None:
         if not self.enabled:
-            logger.info("[ComputeWatchDisabled]")
+            logger.info("[DeploymentPolicyWatchDisabled]")
             return
 
         with self._lock:
@@ -68,14 +51,14 @@ class ComputeAvailabilityWatcher:
             self._thread = threading.Thread(
                 target=self._run,
                 args=(stop_event,),
-                name="compute-availability-watch",
+                name="deployment-policy-watch",
                 daemon=True,
             )
             self._stop_event = stop_event
             self._thread.start()
 
         logger.info(
-            "[ComputeWatchStarted] namespace=%s label_selector=%s",
+            "[DeploymentPolicyWatchStarted] namespace=%s label_selector=%s",
             self.namespace,
             self.label_selector,
         )
@@ -97,7 +80,7 @@ class ComputeAvailabilityWatcher:
             try:
                 active_watch.stop()
             except Exception as exc:
-                logger.debug("[ComputeWatchStopSkipped] reason=%r", str(exc))
+                logger.debug("[DeploymentPolicyWatchStopSkipped] reason=%r", str(exc))
 
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(2.0, self.retry_seconds + 1.0))
@@ -110,7 +93,7 @@ class ComputeAvailabilityWatcher:
             if self._watch is active_watch:
                 self._watch = None
 
-        logger.info("[ComputeWatchStopped]")
+        logger.info("[DeploymentPolicyWatchStopped]")
 
     def _run(self, stop_event: threading.Event) -> None:
         try:
@@ -130,7 +113,7 @@ class ComputeAvailabilityWatcher:
                     if resource_version:
                         stream_kwargs["resource_version"] = resource_version
                     for event in active_watch.stream(
-                        self.v1.list_namespaced_pod,
+                        self.apps_v1.list_namespaced_deployment,
                         **stream_kwargs,
                     ):
                         if stop_event.is_set():
@@ -139,14 +122,16 @@ class ComputeAvailabilityWatcher:
                 except ApiException as exc:
                     if not stop_event.is_set():
                         logger.warning(
-                            "[Warning] operation=compute_watch error_type=k8s_api status=%s reason=%r",
+                            "[Warning] operation=deployment_policy_watch "
+                            "error_type=k8s_api status=%s reason=%r",
                             exc.status,
                             exc.reason,
                         )
                 except Exception as exc:
                     if not stop_event.is_set():
                         logger.warning(
-                            "[Warning] operation=compute_watch error_type=unexpected reason=%r",
+                            "[Warning] operation=deployment_policy_watch "
+                            "error_type=unexpected reason=%r",
                             str(exc),
                         )
                 finally:
@@ -169,88 +154,36 @@ class ComputeAvailabilityWatcher:
                     self._stop_event = None
 
     def _process_snapshot(self) -> str:
-        pods = self.v1.list_namespaced_pod(
+        deployments = self.apps_v1.list_namespaced_deployment(
             namespace=self.namespace,
             label_selector=self.label_selector,
         )
-        for pod in pods.items:
-            self._notify_pool_event("SYNC", pod, source="snapshot")
-            self._notify_if_available(pod, source="snapshot")
-        return getattr(getattr(pods, "metadata", None), "resource_version", "") or ""
+        for deployment in deployments.items:
+            self._notify_policy_event("SYNC", deployment, source="snapshot")
+        return (
+            getattr(getattr(deployments, "metadata", None), "resource_version", "")
+            or ""
+        )
 
     def _handle_event(self, event: dict) -> None:
         event_type = event.get("type")
         if event_type not in {"ADDED", "MODIFIED", "DELETED"}:
             return
-        pod = event.get("object")
-        if pod is None:
+        deployment = event.get("object")
+        if deployment is None:
             return
-        self._notify_pool_event(event_type, pod, source="watch")
-        if event_type in {"ADDED", "MODIFIED"}:
-            self._notify_if_available(pod, source="watch")
+        self._notify_policy_event(event_type, deployment, source="watch")
 
-    def _notify_if_available(self, pod, source: str = "watch") -> None:
-        if not self.availability_notifications_enabled:
-            return
-        compute_type, compute_pod = self._available_compute_info(pod)
-        if not compute_type:
-            return
-        self._notify_compute_available(compute_type, compute_pod, source=source)
-
-    def _notify_pool_event(self, event_type: str, pod, source: str) -> None:
-        if self.on_pool_event is None:
+    def _notify_policy_event(self, event_type: str, deployment, source: str) -> None:
+        if self.on_policy_event is None:
             return
         try:
-            self.on_pool_event(event_type, pod, source)
+            self.on_policy_event(event_type, deployment, source)
         except Exception as exc:
             logger.warning(
-                "[Warning] operation=compute_pool_watch_callback event_type=%s "
-                "compute_pod=%s reason=%r",
+                "[Warning] operation=deployment_policy_watch_callback "
+                "event_type=%s deployment=%s reason=%r",
                 event_type,
-                getattr(getattr(pod, "metadata", None), "name", "") or "",
+                getattr(getattr(deployment, "metadata", None), "name", "") or "",
                 str(exc),
             )
-
-    def _notify_compute_available(self, compute_type: str, compute_pod: str, source: str) -> None:
-        observed_at = datetime.now(timezone.utc).isoformat()
-        try:
-            self.on_compute_available(compute_type, compute_pod, observed_at, source)
-        except Exception as exc:
-            logger.warning(
-                "[Warning] operation=compute_watch_callback compute_type=%s compute_pod=%s reason=%r",
-                compute_type,
-                compute_pod,
-                str(exc),
-            )
-
-    def _available_compute_info(self, pod) -> tuple[str, str]:
-        metadata = getattr(pod, "metadata", None)
-        status = getattr(pod, "status", None)
-        if not metadata or not status:
-            return "", ""
-        if getattr(metadata, "deletion_timestamp", None):
-            return "", ""
-
-        labels = getattr(metadata, "labels", None) or {}
-        if labels.get(self.app_label) != self.app_value:
-            return "", ""
-        if labels.get(self.status_label) != self.available_status:
-            return "", ""
-        compute_type = labels.get(self.compute_type_label) or ""
-        if not compute_type:
-            return "", ""
-        if getattr(status, "phase", None) != "Running":
-            return "", ""
-        if not getattr(status, "pod_ip", None):
-            return "", ""
-        if not self._pod_is_ready(pod):
-            return "", ""
-        return compute_type, getattr(metadata, "name", "") or ""
-
-    @staticmethod
-    def _pod_is_ready(pod) -> bool:
-        conditions = getattr(getattr(pod, "status", None), "conditions", None) or []
-        for condition in conditions:
-            if condition.type == "Ready":
-                return condition.status == "True"
-        return False

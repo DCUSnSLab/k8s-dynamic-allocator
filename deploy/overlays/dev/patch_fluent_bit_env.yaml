@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: swlabpods
+spec:
+  template:
+    spec:
+      containers:
+        - name: fluent-bit
+          env:
+            - name: KDA_NAMESPACE
+              value: kda-test

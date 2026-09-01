@@ -43,6 +43,10 @@ class KubernetesClient(ABC):
         
         self.v1 = client.CoreV1Api()
         self.namespace = namespace or os.getenv("K8S_NAMESPACE") or os.getenv("DEFAULT_NAMESPACE", "swlabpods")
+        request_timeout = float(
+            os.getenv("K8S_API_REQUEST_TIMEOUT_SECONDS", "5")
+        )
+        self.api_request_timeout = (2.0, max(1.0, request_timeout))
     
     def get_pod_ip(self, pod_name: str) -> Optional[str]:
         """

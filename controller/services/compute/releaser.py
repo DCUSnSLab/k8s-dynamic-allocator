@@ -188,11 +188,12 @@ class ComputeReleaser:
 
         return self._ticket_for_compute_pod(compute_pod, compute_type=compute_type)
 
-    def release_pod_best_effort(self, compute_pod: str, ticket_id: str) -> None:
+    def release_pod_best_effort(self, compute_pod: str, ticket_id: str) -> bool:
         if not compute_pod:
-            return
+            return True
         try:
             self.pool.release_pod(compute_pod)
+            return True
         except Exception as exc:
             logger.warning(
                 "[Warning] operation=release_stale_compute compute_pod=%s ticket_id=%s reason=%r",
@@ -200,6 +201,7 @@ class ComputeReleaser:
                 ticket_id,
                 str(exc),
             )
+            return False
 
     def clear_assigned_request_context_best_effort(self, compute_pod: str) -> None:
         try:

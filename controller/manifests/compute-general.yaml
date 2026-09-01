@@ -2,6 +2,12 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: compute-general
+  labels:
+    app: warm-pod-pool
+    compute-type: general
+  annotations:
+    k8s-dynamic-allocator/pool-available-min: "2"
+    k8s-dynamic-allocator/pool-total-max: "5"
 spec:
   replicas: 2
   selector:

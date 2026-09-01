@@ -5,6 +5,7 @@ metadata:
   namespace: swlabpods
   labels:
     app: fluent-bit
+    k8s-dynamic-allocator/deploy-stage: logging
 spec:
   selector:
     matchLabels:
@@ -40,6 +41,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: KDA_NAMESPACE
+          value: swlabpods
         resources:
           requests:
             cpu: "50m"

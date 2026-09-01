@@ -12,9 +12,18 @@ venv/
 .gitignore
 .idea/
 .vscode/
+.codex/
+.claude/
+.agents/
 .DS_Store
 Thumbs.db
 
+# Local cluster access and SSH material must never enter a Docker build context.
+kubeconfig.yaml
+deploy/secrets/
+
+# Docker matches these against the context root only, so nested manifests
+# such as controller/manifests/*.yaml are unaffected.
 *.yaml
 *.yml
 .dockerignore

@@ -3,6 +3,8 @@ kind: PersistentVolumeClaim
 metadata:
   name: logs-pvc
   namespace: swlabpods
+  labels:
+    k8s-dynamic-allocator/deploy-stage: logging
 spec:
   accessModes:
   - ReadWriteMany

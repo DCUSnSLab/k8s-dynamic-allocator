@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
@@ -45,37 +46,120 @@ class ComputeAllocator:
         reserved_tickets: List[Dict] = []
         effective_batch, mount_concurrency = self._compute_wait_queue_batch_plan()
         lock_token = None
+        lock_renewed_at = 0.0
         try:
+            if not self.queues.is_pool_policy_ready():
+                result["queued"] += 1
+                result["capacity_blocked"] = "policy_not_ready"
+                return result
+
+            if self.queues.is_scale_down_gated(compute_type_value):
+                result["queued"] += 1
+                result["capacity_blocked"] = "scale_down"
+                return result
+
             lock_token = self.queues.acquire_allocator_lock(compute_type_value)
             if not lock_token:
                 result["queued"] += 1
                 result["lock_missed"] = True
                 return result
+            lock_renewed_at = time.monotonic()
 
-            for stale_ticket in self.queues.find_stale_allocating_tickets(compute_type_value):
-                recovered = recover_stale_ticket(stale_ticket)
-                if recovered["status"] == "requeued":
-                    result["stale_recovered"] += 1
-                elif recovered["status"] == "failed":
-                    result["failed"] += 1
-                elif recovered["status"] == "error":
-                    result["errors"].append(recovered)
+            if not self.queues.is_pool_policy_ready():
+                result["queued"] += 1
+                result["capacity_blocked"] = "policy_not_ready"
+                return result
+
+            if self.queues.is_scale_down_gated(compute_type_value):
+                result["queued"] += 1
+                result["capacity_blocked"] = "scale_down"
+                return result
+
+            stale_tickets = self.queues.find_stale_allocating_tickets(
+                compute_type_value
+            )
+            if stale_tickets:
+                self.queues.release_allocator_lock(
+                    compute_type_value,
+                    lock_token,
+                )
+                lock_token = None
+                for stale_ticket in stale_tickets:
+                    recovered = recover_stale_ticket(stale_ticket)
+                    if recovered["status"] == "requeued":
+                        result["stale_recovered"] += 1
+                    elif recovered["status"] == "failed":
+                        result["failed"] += 1
+                    elif recovered["status"] == "error":
+                        result["errors"].append(recovered)
+
+                if (
+                    not self.queues.is_pool_policy_ready()
+                    or self.queues.is_scale_down_gated(compute_type_value)
+                ):
+                    result["queued"] += 1
+                    result["capacity_blocked"] = "policy_or_scale_down"
+                    return result
+
+                lock_token = self.queues.acquire_allocator_lock(
+                    compute_type_value
+                )
+                if not lock_token:
+                    result["queued"] += 1
+                    result["lock_missed"] = True
+                    return result
+                lock_renewed_at = time.monotonic()
+
+                if (
+                    not self.queues.is_pool_policy_ready()
+                    or self.queues.is_scale_down_gated(compute_type_value)
+                ):
+                    result["queued"] += 1
+                    result["capacity_blocked"] = "policy_or_scale_down"
+                    return result
 
             if not self.queues.has_queued_tickets(compute_type_value):
                 return result
 
-            available = self.pool.get_available_pods(
-                compute_type=compute_type_value,
-                limit=effective_batch,
-            )
+            policy = self.queues.get_pool_policy(compute_type_value)
+            if not policy:
+                result["queued"] += 1
+                result["capacity_blocked"] = "policy_unavailable"
+                return result
+
+            snapshot = self.pool.list_pool_snapshot(compute_type=compute_type_value)
+            available = snapshot["available_candidates"][:effective_batch]
             if not available:
                 self._mark_compute_unavailable_started(compute_type_value)
                 result["queued"] += 1
                 return result
 
             reserved_pods: set = set()
-            max_claims = min(effective_batch, len(available))
+            remaining_capacity = max(
+                0,
+                int(policy["N"]) - int(snapshot["pool_assigned"]),
+            )
+            max_claims = min(effective_batch, len(available), remaining_capacity)
+            if max_claims <= 0:
+                result["queued"] += 1
+                result["capacity_blocked"] = "pool_total_max"
+                return result
+
             for _ in range(max_claims):
+                renew_interval = max(
+                    1.0,
+                    float(getattr(settings, "WAIT_QUEUE_LOCK_RENEW_SECONDS", 20)),
+                )
+                if time.monotonic() - lock_renewed_at >= renew_interval:
+                    if not self.queues.renew_allocator_lock(
+                        compute_type_value,
+                        lock_token,
+                    ):
+                        result["queued"] += 1
+                        result["lock_lost"] = True
+                        break
+                    lock_renewed_at = time.monotonic()
+
                 ticket = self.queues.claim_next_ticket(
                     compute_type_value,
                     worker_id=self.queues.worker_identity,
@@ -309,7 +393,7 @@ class ComputeAllocator:
         self,
         ticket: Dict,
         compute_type_value: str,
-        candidate_pods: List[str],
+        candidate_pods: List[Dict],
         reserved_pods: set,
         result: Dict,
     ) -> Optional[Dict]:
@@ -317,27 +401,36 @@ class ComputeAllocator:
         claim_token = ticket.get("claim_token")
         user_pod_identity = ticket.get("user_pod") or "unknown"
 
-        compute_pod = ""
+        selected_candidate = None
         for candidate in candidate_pods:
-            if candidate in reserved_pods:
+            candidate_name = candidate["name"]
+            if candidate_name in reserved_pods:
                 continue
             try:
-                self.pool.assign_pod(candidate, user_pod_identity)
+                self.pool.assign_pod(
+                    candidate_name,
+                    user_pod_identity,
+                    expected_resource_version=candidate.get("resource_version"),
+                    ticket_id=ticket_id,
+                    claim_token=claim_token or "",
+                    expected_annotations=candidate.get("annotations"),
+                )
             except PodConflictError as exc:
                 ticket_format.log_queue_event(
                     "debug",
                     "ComputeContention",
                     ticket,
                     include_ticket_fields=(),
-                    compute_pod=candidate,
+                    compute_pod=candidate_name,
                     reason=f"Compute contention: {exc}",
                 )
                 continue
-            compute_pod = candidate
+            selected_candidate = candidate
+            compute_pod = candidate_name
             reserved_pods.add(compute_pod)
             break
 
-        if not compute_pod:
+        if not selected_candidate:
             self.tickets.requeue_ticket(
                 ticket_id,
                 reason="No available compute pods",
@@ -347,15 +440,27 @@ class ComputeAllocator:
             result["queued"] += 1
             return None
 
-        compute_ready_at = self.pool.get_pod_ready_at(compute_pod)
+        compute_ready_at = selected_candidate.get("ready_at")
         compute_available_at = self._pop_compute_available_at(compute_pod)
-        compute_pod_ip = self.pool.get_pod_ip(compute_pod) or ""
+        compute_pod_ip = selected_candidate.get("ip") or ""
         if not compute_pod_ip:
-            try:
-                self.pool.release_pod(compute_pod)
-            except Exception:
-                pass
             reserved_pods.discard(compute_pod)
+            if not self._release_before_ticket_transition(
+                compute_pod,
+                ticket_id,
+                "release_missing_compute_ip",
+            ):
+                result["errors"].append(
+                    {
+                        "ticket_id": ticket_id,
+                        "compute_type": compute_type_value,
+                        "error": (
+                            "Compute IP unavailable; Pod cleanup will be "
+                            "retried before the ticket is requeued"
+                        ),
+                    }
+                )
+                return None
             self.tickets.requeue_ticket(
                 ticket_id,
                 reason="Compute IP unavailable",
@@ -373,15 +478,62 @@ class ComputeAllocator:
             result["queued"] += 1
             return None
 
-        committed = self.tickets.mark_allocating(
-            ticket_id,
-            compute_pod=compute_pod,
-            compute_pod_ip=compute_pod_ip,
-            claimed_by=ticket.get("claimed_by"),
-            claim_token=claim_token,
-            compute_ready_at=compute_ready_at,
-            compute_available_at=compute_available_at,
-        )
+        try:
+            committed = self.tickets.mark_allocating(
+                ticket_id,
+                compute_pod=compute_pod,
+                compute_pod_ip=compute_pod_ip,
+                claimed_by=ticket.get("claimed_by"),
+                claim_token=claim_token,
+                compute_ready_at=compute_ready_at,
+                compute_available_at=compute_available_at,
+            )
+        except Exception as exc:
+            reserved_pods.discard(compute_pod)
+            released = self._release_before_ticket_transition(
+                compute_pod,
+                ticket_id,
+                "reservation_cleanup",
+            )
+            if released:
+                try:
+                    self.tickets.requeue_ticket(
+                        ticket_id,
+                        reason="Compute reservation commit failed",
+                        increment_retry=False,
+                        claim_token=claim_token,
+                    )
+                    result["queued"] += 1
+                except Exception:
+                    result["errors"].append(
+                        {
+                            "ticket_id": ticket_id,
+                            "compute_type": compute_type_value,
+                            "error": (
+                                "Reservation commit failed; stale recovery "
+                                "required"
+                            ),
+                        }
+                    )
+            else:
+                result["errors"].append(
+                    {
+                        "ticket_id": ticket_id,
+                        "compute_type": compute_type_value,
+                        "error": (
+                            "Reservation cleanup failed; ticket remains "
+                            "allocating for stale recovery"
+                        ),
+                    }
+                )
+            logger.warning(
+                "[Warning] operation=reservation_commit ticket_id=%s "
+                "compute_pod=%s reason=%r",
+                ticket_id,
+                compute_pod,
+                str(exc),
+            )
+            return None
         if not committed or committed.get("status") != "allocating":
             try:
                 self.pool.release_pod(compute_pod)
@@ -418,6 +570,20 @@ class ComputeAllocator:
         claim_token = ticket.get("claim_token") or ""
 
         if not compute_pod or not user_pod_ip:
+            if compute_pod and not self._release_before_ticket_transition(
+                compute_pod,
+                ticket_id,
+                "release_missing_allocation_context",
+            ):
+                return {
+                    "ticket_id": ticket_id,
+                    "compute_type": compute_type,
+                    "status": "error",
+                    "message": (
+                        "Missing allocation context and compute Pod cleanup "
+                        "is pending"
+                    ),
+                }
             failed = self.tickets.mark_failed(ticket_id, "Missing compute pod or user pod context", claim_token=claim_token)
             ticket_format.log_queue_event(
                 "info",
@@ -553,15 +719,18 @@ class ComputeAllocator:
         exc: Exception,
     ) -> Dict:
         reason = f"Mount failed: {exc}"
-        try:
-            self.pool.release_pod(compute_pod)
-        except Exception as release_exc:
-            logger.warning(
-                "[Warning] operation=release_after_mount_error ticket_id=%s compute_pod=%s reason=%r",
-                ticket_id,
-                compute_pod,
-                str(release_exc),
-            )
+        if not self._release_before_ticket_transition(
+            compute_pod,
+            ticket_id,
+            "release_after_mount_error",
+        ):
+            return {
+                "ticket_id": ticket_id,
+                "status": "error",
+                "message": (
+                    f"{reason}; compute Pod cleanup is pending before retry"
+                ),
+            }
 
         current = self.tickets.get_ticket(ticket_id)
         if current and int(current.get("retry_count") or 0) < int(current.get("max_retries") or self.queues.max_retries):
@@ -599,6 +768,27 @@ class ComputeAllocator:
                 reason=reason,
             )
         return ticket_format.ticket_response(failed_ticket, str(exc))
+
+    def _release_before_ticket_transition(
+        self,
+        compute_pod: str,
+        ticket_id: str,
+        operation: str,
+    ) -> bool:
+        if not compute_pod:
+            return True
+        try:
+            self.pool.release_pod(compute_pod)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[Warning] operation=%s ticket_id=%s compute_pod=%s reason=%r",
+                operation,
+                ticket_id,
+                compute_pod,
+                str(exc),
+            )
+            return False
 
     def _handle_cold_start_failure(
         self,

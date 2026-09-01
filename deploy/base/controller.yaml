@@ -3,8 +3,15 @@ kind: Deployment
 metadata:
   name: controller
   namespace: swlabpods
+  labels:
+    k8s-dynamic-allocator/deploy-stage: controller
 spec:
   replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: controller
@@ -20,6 +27,22 @@ spec:
         imagePullPolicy: Always
         ports:
         - containerPort: 9001
+        readinessProbe:
+          httpGet:
+            path: /api/health/
+            port: 9001
+          initialDelaySeconds: 2
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /api/health/
+            port: 9001
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
         env:
         - name: REDIS_URL
           value: redis://controller-queue-redis:6379/0
@@ -40,6 +63,8 @@ kind: Service
 metadata:
   name: controller-service
   namespace: swlabpods
+  labels:
+    k8s-dynamic-allocator/deploy-stage: controller
 spec:
   selector:
     app: controller
