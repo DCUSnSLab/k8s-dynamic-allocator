@@ -7,7 +7,7 @@ resources:
   - 00-rbac.yaml
   - 10-pvc.yaml
   - 30-daemonset.yaml
-  - 40-cronjob-rotate.yaml
+  - 40-cronjob.yaml
 
 configMapGenerator:
   - name: fluent-bit-config

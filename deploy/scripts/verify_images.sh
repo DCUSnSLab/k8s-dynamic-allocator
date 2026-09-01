@@ -59,8 +59,8 @@ PY
 
 echo '[Verify] swlabssh image and new User Pod/PVC contract'
 docker run --rm -i \
-    -e K8S_NAMESPACE="${PRODUCTION_NAMESPACE}" \
-    -e USER_POD_STORAGE_CLASS="${PRODUCTION_STORAGE_CLASS}" \
+    -e K8S_NAMESPACE="${DEPLOY_NAMESPACE}" \
+    -e USER_POD_STORAGE_CLASS="${DEPLOY_STORAGE_CLASS}" \
     -e EXPECTED_USER_POD_IMAGE="${USER_POD_IMAGE}" \
     "${SWLABSSH_IMAGE}" \
     python - <<'PY'

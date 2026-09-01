@@ -13,8 +13,8 @@ images:
     newTag: latest
 
 patches:
-  - path: patch-controller-env.yaml
-  - path: patch-swlabssh-env.yaml
-  - path: patch-redis-storage.yaml
-  - path: patch-logging-storage.yaml
-  - path: patch-fluent-bit-env.yaml
+  - path: patch_controller_env.yaml
+  - path: patch_swlabssh_env.yaml
+  - path: patch_redis_storage.yaml
+  - path: patch_logging_storage.yaml
+  - path: patch_fluent_bit_env.yaml

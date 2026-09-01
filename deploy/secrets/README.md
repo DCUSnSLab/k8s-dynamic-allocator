@@ -19,15 +19,15 @@ ssh-keygen -t rsa -b 4096 -C "compute-to-user" -f compute_ssh_key -N ""
 k8s 리소스 파일(Secret, ConfigMap)은 보안 이슈로 스크립트로 배포합니다.
 
 ```shell
-chmod +x apply-secrets.sh
-./apply-secrets.sh
+chmod +x apply_secrets.sh
+./apply_secrets.sh
 ```
 <br/>
 
 
 ## 2. 테스트용 Pod 배포
 ```shell
-k apply -f sshfs-test-pods.yaml
+k apply -f sshfs_test_pods.yaml
 ```
 
 <br/>
@@ -80,5 +80,5 @@ Hello from User!
 ## 테스트 종료
 ### 리소스 정리
 ```shell
-k delete -f sshfs-test-pods.yaml
+k delete -f sshfs_test_pods.yaml
 ```

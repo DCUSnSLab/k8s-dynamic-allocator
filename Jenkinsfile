@@ -47,14 +47,14 @@ pipeline {
         HARBOR_PROJECT = 'harbor.cu.ac.kr/k8s_dynamic_allocator'
         HARBOR_CREDENTIALS_ID = 'harbor'
 
-        PRODUCTION_NAMESPACE = 'kda-test'
-        PRODUCTION_STORAGE_CLASS = 'normal-r3'
-        PRODUCTION_OVERLAY = 'deploy/overlays/production'
-        PRODUCTION_LOCK = 'kda-deploy-production'
+        DEPLOY_NAMESPACE = 'kda-test'
+        DEPLOY_STORAGE_CLASS = 'normal-r3'
+        DEPLOY_OVERLAY = 'deploy/overlays/dev'
+        DEPLOY_LOCK = 'kda-deploy-dev'
         DEPLOY_STAGE_LABEL = 'k8s-dynamic-allocator/deploy-stage'
 
-        PRODUCTION_SSH_HOST = '203.250.35.87'
-        PRODUCTION_SSH_PORT = '30622'
+        DEPLOY_SSH_HOST = '203.250.35.87'
+        DEPLOY_SSH_PORT = '30622'
     }
 
     stages {
@@ -95,7 +95,7 @@ pipeline {
                     echo "POOL_POLICY R=${env.POOL_AVAILABLE_MIN} N=${env.POOL_TOTAL_MAX}"
 
                     if (env.IS_MANUAL_BUILD != 'true') {
-                        echo 'Automatic Multibranch/SCM build detected: image build and production deployment are skipped.'
+                        echo 'Automatic Multibranch/SCM build detected: image build and deployment are skipped.'
                     }
                 }
             }
@@ -174,7 +174,7 @@ pipeline {
                 expression { env.IS_MANUAL_BUILD == 'true' }
             }
             steps {
-                sh 'sh deploy/scripts/verify-built-images.sh'
+                sh 'sh deploy/scripts/verify_images.sh'
             }
         }
 
@@ -196,18 +196,18 @@ pipeline {
             }
         }
 
-        stage('Deploy Production') {
+        stage('Deploy') {
             when {
                 expression { env.IS_MANUAL_BUILD == 'true' }
             }
             steps {
                 script {
-                    lock(resource: env.PRODUCTION_LOCK) {
+                    lock(resource: env.DEPLOY_LOCK) {
                         env.DEPLOY_STARTED = 'true'
                         try {
-                            sh 'sh deploy/scripts/deploy-production.sh'
+                            sh 'sh deploy/scripts/deploy.sh'
                         } catch (deploymentError) {
-                            sh 'sh deploy/scripts/deployment-diagnostics.sh'
+                            sh 'sh deploy/scripts/debug.sh'
                             env.DEPLOY_DIAGNOSTICS_DONE = 'true'
                             throw deploymentError
                         }
@@ -221,7 +221,7 @@ pipeline {
         success {
             script {
                 if (env.IS_MANUAL_BUILD == 'true') {
-                    echo "Production deployment completed with IMAGE_TAG=${env.IMAGE_TAG}"
+                    echo "Deployment completed with IMAGE_TAG=${env.IMAGE_TAG}"
                 } else {
                     echo 'Automatic Multibranch/SCM build completed without image build or deployment.'
                 }
@@ -235,7 +235,7 @@ pipeline {
                     env.DEPLOY_STARTED == 'true' &&
                     env.DEPLOY_DIAGNOSTICS_DONE != 'true'
                 ) {
-                    sh 'sh deploy/scripts/deployment-diagnostics.sh'
+                    sh 'sh deploy/scripts/debug.sh'
                 }
             }
         }

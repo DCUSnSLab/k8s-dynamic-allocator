@@ -2,19 +2,19 @@
 
 set -eu
 
-namespace="${PRODUCTION_NAMESPACE}"
-storage_class="${PRODUCTION_STORAGE_CLASS}"
-overlay="${PRODUCTION_OVERLAY}"
+namespace="${DEPLOY_NAMESPACE}"
+storage_class="${DEPLOY_STORAGE_CLASS}"
+overlay="${DEPLOY_OVERLAY}"
 stage_label="${DEPLOY_STAGE_LABEL}"
 pool_available_min="${POOL_AVAILABLE_MIN}"
 pool_total_max="${POOL_TOTAL_MAX}"
 pool_annotation_r='k8s-dynamic-allocator/pool-available-min'
 pool_annotation_n='k8s-dynamic-allocator/pool-total-max'
-rendered="${WORKSPACE}/.kda-production-${BUILD_NUMBER}.yaml"
+rendered="${WORKSPACE}/.kda-deploy-${BUILD_NUMBER}.yaml"
 kustomization="${overlay}/kustomization.yaml"
-kustomization_backup="${WORKSPACE}/.kda-production-kustomization-${BUILD_NUMBER}.bak"
-all_resources="${WORKSPACE}/.kda-production-resources-${BUILD_NUMBER}.txt"
-staged_resources="${WORKSPACE}/.kda-production-staged-resources-${BUILD_NUMBER}.txt"
+kustomization_backup="${WORKSPACE}/.kda-deploy-kustomization-${BUILD_NUMBER}.bak"
+all_resources="${WORKSPACE}/.kda-deploy-resources-${BUILD_NUMBER}.txt"
+staged_resources="${WORKSPACE}/.kda-deploy-staged-resources-${BUILD_NUMBER}.txt"
 
 for required_command in kubectl sed grep sort diff wc tr; do
     if ! command -v "${required_command}" >/dev/null 2>&1; then
@@ -80,7 +80,7 @@ apply_stage() {
         -l "${stage_label}=${stage}"
 }
 
-echo '[Preflight] Verify production cluster prerequisites'
+echo '[Preflight] Verify cluster prerequisites'
 kubectl get namespace "${namespace}" >/dev/null
 kubectl get storageclass "${storage_class}" >/dev/null
 kubectl get secret compute-ssh-key -n "${namespace}" >/dev/null
@@ -124,7 +124,7 @@ cp "${kustomization}" "${kustomization_backup}"
 sed -i "s|newTag: latest|newTag: \"${IMAGE_TAG}\"|g" "${kustomization}"
 
 if grep -Eq '^[[:space:]]*newTag:[[:space:]]*"?latest"?[[:space:]]*$' "${kustomization}"; then
-    echo '[RenderFailed] production overlay still contains newTag: latest'
+    echo '[RenderFailed] overlay still contains newTag: latest'
     exit 1
 fi
 
@@ -333,7 +333,7 @@ test "${runtime_user_storage_class}" = "${storage_class}"
 ssh_node_port=$(kubectl get service/swlabssh \
     -n "${namespace}" \
     -o jsonpath='{.spec.ports[?(@.name=="ssh")].nodePort}')
-test "${ssh_node_port}" = "${PRODUCTION_SSH_PORT}"
+test "${ssh_node_port}" = "${DEPLOY_SSH_PORT}"
 
 redis_pod=$(kubectl get pods -n "${namespace}" \
     -l app=controller-queue-redis \
@@ -362,6 +362,6 @@ fluent_bit_ready=$(kubectl get daemonset/fluent-bit \
 test "${fluent_bit_desired}" -gt 0
 test "${fluent_bit_ready}" -eq "${fluent_bit_desired}"
 
-echo "[Success] production image tag=${IMAGE_TAG}"
+echo "[Success] image tag=${IMAGE_TAG}"
 echo "[Success] pool policy R=${pool_available_min} N=${pool_total_max}"
-echo "[Success] SSH endpoint=${PRODUCTION_SSH_HOST}:${PRODUCTION_SSH_PORT}"
+echo "[Success] SSH endpoint=${DEPLOY_SSH_HOST}:${DEPLOY_SSH_PORT}"
