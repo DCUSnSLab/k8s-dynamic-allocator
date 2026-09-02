@@ -194,9 +194,7 @@ def ticket_detail(request: HttpRequest, ticket_id: str) -> HttpResponse:
 
     try:
         orchestrator = _get_orchestrator()
-        # This poll is the only liveness signal a queued client emits, so record
-        # it before answering. Kept separate from the read so the query stays
-        # side-effect free.
+        # This poll is the only liveness signal a queued client emits.
         orchestrator.touch_ticket_poll(ticket_id)
         result = orchestrator.get_ticket(ticket_id)
         if result.get("status") == "error":

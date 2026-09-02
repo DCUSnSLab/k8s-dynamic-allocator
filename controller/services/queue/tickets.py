@@ -4,7 +4,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, Optional
 
 from config import settings
 
@@ -275,9 +275,7 @@ class Tickets:
     def touch_poll(self, ticket_id: str) -> None:
         """Record that the waiting client just asked about its ticket.
 
-        Called from the polling endpoint so the allocator can tell whether
-        anyone is still there to receive a Compute Pod. Best effort: a failure
-        to record liveness must never break the poll response.
+        Best effort: losing a liveness sample must not break the poll response.
         """
         client = self.queue._redis_client()
         try:
@@ -358,8 +356,6 @@ class Tickets:
                     if payload:
                         pipe.hset(ticket_key, mapping=payload)
                     if queue_should_add:
-                        # Requeue with the original arrival timestamp so a
-                        # retried ticket does not lose its place in line.
                         pipe.zadd(queue_key, {ticket_id: self.queue.queue_score(raw)})
                     if remove_from_queue:
                         pipe.zrem(queue_key, ticket_id)

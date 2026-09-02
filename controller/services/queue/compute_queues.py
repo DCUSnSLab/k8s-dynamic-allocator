@@ -70,9 +70,7 @@ class ComputeQueues:
         self.wait_timeout_seconds = wait_timeout_seconds or settings.WAIT_QUEUE_TIMEOUT_SECONDS
         self.ticket_ttl_seconds = ticket_ttl_seconds or settings.WAIT_QUEUE_TICKET_TTL_SECONDS
         self.allocating_ttl_seconds = allocating_ttl_seconds or settings.WAIT_QUEUE_ALLOCATING_TTL_SECONDS
-        self.client_timeout_seconds = int(
-            getattr(settings, "WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS", 60)
-        )
+        self.client_timeout_seconds = settings.WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS
         self.assigned_context_ttl_seconds = (
             assigned_context_ttl_seconds or settings.ASSIGNED_CONTEXT_TTL_SECONDS
         )
@@ -277,11 +275,7 @@ class ComputeQueues:
             ) from exc
 
     def get_ticket_position(self, ticket_id: str) -> Optional[int]:
-        """1-based place in the arrival-ordered queue, or None when absent.
-
-        Pure read. Queue/active reconciliation belongs to
-        _repair_queue_membership and claim_next_ticket, not here.
-        """
+        """1-based place in the arrival-ordered queue, or None when absent."""
         ticket = self.tickets.get_ticket_raw(ticket_id)
         if not ticket:
             return None
@@ -296,15 +290,15 @@ class ComputeQueues:
         return None if rank is None else int(rank) + 1
 
     def queue_score(self, raw: Optional[Dict[str, object]]) -> float:
-        """Arrival timestamp used to order the queue.
+        """Queue ordering key: arrival time, so a requeued ticket keeps its place.
 
-        A ticket that lost its ingress timestamp would otherwise sort ahead of
-        everyone forever, so it falls back to now and lands at the tail.
+        A missing timestamp falls back to now instead of 0, which would sort
+        ahead of everyone forever.
         """
         ingress_ts_ms = safe_int((raw or {}).get("ingress_ts_ms"), 0)
-        if ingress_ts_ms > 0:
-            return float(ingress_ts_ms)
-        return float(int(time.time() * 1000))
+        if ingress_ts_ms <= 0:
+            ingress_ts_ms = int(time.time() * 1000)
+        return float(ingress_ts_ms)
 
     def _queue_ids(self, compute_type: str) -> List[str]:
         client = self._redis_client()
@@ -349,8 +343,6 @@ class ComputeQueues:
 
                 if status in self.ACTIVE_STATES:
                     if not self._queue_contains(client, compute_type, ticket_id):
-                        # Re-add with the original arrival timestamp so a ticket
-                        # recovered after a controller failure keeps its place.
                         client.zadd(queue_key, {ticket_id: self.queue_score(raw)})
                     client.sadd(active_key, ticket_id)
                 else:
@@ -745,13 +737,10 @@ class ComputeQueues:
         return False
 
     def is_client_disconnected(self, ticket: Dict[str, object]) -> bool:
-        """True when the waiting client has stopped polling for its ticket.
+        """True when a queued client has stopped polling for its ticket.
 
-        The client polls its ticket about once a second while queued, so a long
-        silence means nobody is there to receive a Compute Pod. Tickets created
-        before this field existed fall back to their creation time, and the
-        ticket keeps its queue position either way: the caller skips it rather
-        than cancelling, so a client that reconnects is served in arrival order.
+        Clients poll about once a second while waiting; tickets predating the
+        field fall back to their creation time.
         """
         timeout_seconds = self.client_timeout_seconds
         if timeout_seconds <= 0:
@@ -805,10 +794,9 @@ class ComputeQueues:
                 self.tickets.mark_failed(ticket_id, "Queue wait timeout exceeded")
                 continue
             if self.is_client_disconnected(ticket):
-                # Skip without touching the queue: the ticket keeps its arrival
-                # score, so a client that comes back is served in its original
-                # place. A client that never returns expires on wait_deadline.
-                logger.info(
+                # Left in the queue on purpose: a client that reconnects keeps
+                # its place, and one that never does expires on wait_deadline.
+                logger.debug(
                     "[QueueSkipped] ticket_id=%s reason=%r",
                     ticket_id,
                     "client stopped polling",
