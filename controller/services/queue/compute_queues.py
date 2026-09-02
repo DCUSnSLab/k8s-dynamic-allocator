@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional
@@ -69,6 +70,7 @@ class ComputeQueues:
         self.wait_timeout_seconds = wait_timeout_seconds or settings.WAIT_QUEUE_TIMEOUT_SECONDS
         self.ticket_ttl_seconds = ticket_ttl_seconds or settings.WAIT_QUEUE_TICKET_TTL_SECONDS
         self.allocating_ttl_seconds = allocating_ttl_seconds or settings.WAIT_QUEUE_ALLOCATING_TTL_SECONDS
+        self.client_timeout_seconds = settings.WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS
         self.assigned_context_ttl_seconds = (
             assigned_context_ttl_seconds or settings.ASSIGNED_CONTEXT_TTL_SECONDS
         )
@@ -272,51 +274,36 @@ class ComputeQueues:
                 f"Failed to mark compute unavailable start for {compute_type_value}: {exc}"
             ) from exc
 
-    def _queue_position_snapshot(self, ticket_id: str, compute_type: str) -> Optional[int]:
-        compute_type_value = self.normalize_compute_type(compute_type)
-        position = 0
-        for current_ticket_id in self._queue_ids(compute_type_value):
-            current = self.tickets.get_ticket_raw(current_ticket_id)
-            if not current:
-                continue
-            if str(current.get("status") or "").lower() != "queued":
-                continue
-            position += 1
-            if current_ticket_id == ticket_id:
-                return position
-        return None
-
     def get_ticket_position(self, ticket_id: str) -> Optional[int]:
+        """1-based place in the arrival-ordered queue, or None when absent."""
         ticket = self.tickets.get_ticket_raw(ticket_id)
         if not ticket:
             return None
         compute_type = self.normalize_compute_type(ticket.get("compute_type"))
-        self._repair_queue_membership(compute_type)
         client = self._redis_client()
-        queue_ids = self._queue_ids(compute_type)
-        position = 0
-        for current_ticket_id in queue_ids:
-            current = self.tickets.get_ticket_raw(current_ticket_id)
-            if not current:
-                self._remove_ticket_from_queue(compute_type, current_ticket_id)
-                client.srem(self._active_key(compute_type), current_ticket_id)
-                continue
+        try:
+            rank = client.zrank(self._queue_key(compute_type), ticket_id)
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to read queue position for ticket {ticket_id}: {exc}"
+            ) from exc
+        return None if rank is None else int(rank) + 1
 
-            status = current.get("status", "")
-            if status in self.FINAL_STATES:
-                self._remove_ticket_from_queue(compute_type, current_ticket_id)
-                client.srem(self._active_key(compute_type), current_ticket_id)
-                continue
-            if status == "queued":
-                position += 1
-                if current_ticket_id == ticket_id:
-                    return position
-        return None
+    def queue_score(self, raw: Optional[Dict[str, object]]) -> float:
+        """Queue ordering key: arrival time, so a requeued ticket keeps its place.
+
+        A missing timestamp falls back to now instead of 0, which would sort
+        ahead of everyone forever.
+        """
+        ingress_ts_ms = safe_int((raw or {}).get("ingress_ts_ms"), 0)
+        if ingress_ts_ms <= 0:
+            ingress_ts_ms = int(time.time() * 1000)
+        return float(ingress_ts_ms)
 
     def _queue_ids(self, compute_type: str) -> List[str]:
         client = self._redis_client()
         try:
-            return client.lrange(self._queue_key(compute_type), 0, -1)
+            return client.zrange(self._queue_key(compute_type), 0, -1)
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to read queue {compute_type}: {exc}") from exc
 
@@ -329,14 +316,11 @@ class ComputeQueues:
 
     def _queue_contains(self, client, compute_type: str, ticket_id: str) -> bool:
         try:
-            return client.lpos(self._queue_key(compute_type), ticket_id) is not None
-        except (AttributeError, RedisError):
-            try:
-                return ticket_id in client.lrange(self._queue_key(compute_type), 0, -1)
-            except RedisError as exc:
-                raise QueueUnavailableError(
-                    f"Failed to inspect queue {compute_type} for ticket {ticket_id}: {exc}"
-                ) from exc
+            return client.zscore(self._queue_key(compute_type), ticket_id) is not None
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to inspect queue {compute_type} for ticket {ticket_id}: {exc}"
+            ) from exc
 
     def _repair_queue_membership(self, compute_type: str) -> None:
         client = self._redis_client()
@@ -348,22 +332,22 @@ class ComputeQueues:
                 raw = client.hgetall(self._ticket_key(ticket_id))
                 if not raw:
                     client.srem(active_key, ticket_id)
-                    client.lrem(queue_key, 0, ticket_id)
+                    client.zrem(queue_key, ticket_id)
                     continue
 
                 status = (raw.get("status") or "").lower()
                 if status in self.FINAL_STATES:
                     client.srem(active_key, ticket_id)
-                    client.lrem(queue_key, 0, ticket_id)
+                    client.zrem(queue_key, ticket_id)
                     continue
 
                 if status in self.ACTIVE_STATES:
                     if not self._queue_contains(client, compute_type, ticket_id):
-                        client.rpush(queue_key, ticket_id)
+                        client.zadd(queue_key, {ticket_id: self.queue_score(raw)})
                     client.sadd(active_key, ticket_id)
                 else:
                     client.srem(active_key, ticket_id)
-                    client.lrem(queue_key, 0, ticket_id)
+                    client.zrem(queue_key, ticket_id)
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to repair queue state for {compute_type}: {exc}") from exc
 
@@ -752,6 +736,27 @@ class ComputeQueues:
             return wait_deadline <= _utc_now()
         return False
 
+    def is_client_disconnected(self, ticket: Dict[str, object]) -> bool:
+        """True when a queued client has stopped polling for its ticket.
+
+        Clients poll about once a second while waiting; tickets predating the
+        field fall back to their creation time.
+        """
+        timeout_seconds = self.client_timeout_seconds
+        if timeout_seconds <= 0:
+            return False
+
+        last_poll_ms = safe_int(ticket.get("last_poll_ms"), 0)
+        if last_poll_ms <= 0:
+            created_at = ticket.get("created_at")
+            if not isinstance(created_at, datetime):
+                return False
+            silent_seconds = (_utc_now() - created_at).total_seconds()
+        else:
+            silent_seconds = (time.time() * 1000 - last_poll_ms) / 1000.0
+
+        return silent_seconds > timeout_seconds
+
     def find_stale_allocating_tickets(self, compute_type: Optional[str] = None) -> List[Dict[str, object]]:
         types = [self.normalize_compute_type(compute_type)] if compute_type else self.known_compute_types()
         stale: List[Dict[str, object]] = []
@@ -788,6 +793,15 @@ class ComputeQueues:
             if self.is_wait_timeout_expired(ticket):
                 self.tickets.mark_failed(ticket_id, "Queue wait timeout exceeded")
                 continue
+            if self.is_client_disconnected(ticket):
+                # Left in the queue on purpose: a client that reconnects keeps
+                # its place, and one that never does expires on wait_deadline.
+                logger.debug(
+                    "[QueueSkipped] ticket_id=%s reason=%r",
+                    ticket_id,
+                    "client stopped polling",
+                )
+                continue
 
             claim_token = uuid.uuid4().hex
             claimed_at = _iso_now()
@@ -816,6 +830,6 @@ class ComputeQueues:
     def _remove_ticket_from_queue(self, compute_type: str, ticket_id: str) -> None:
         client = self._redis_client()
         try:
-            client.lrem(self._queue_key(compute_type), 0, ticket_id)
+            client.zrem(self._queue_key(compute_type), ticket_id)
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to remove ticket {ticket_id} from queue {compute_type}: {exc}") from exc

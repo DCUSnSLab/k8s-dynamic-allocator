@@ -193,7 +193,10 @@ def ticket_detail(request: HttpRequest, ticket_id: str) -> HttpResponse:
         return _method_not_allowed("GET")
 
     try:
-        result = _get_orchestrator().get_ticket(ticket_id)
+        orchestrator = _get_orchestrator()
+        # This poll is the only liveness signal a queued client emits.
+        orchestrator.touch_ticket_poll(ticket_id)
+        result = orchestrator.get_ticket(ticket_id)
         if result.get("status") == "error":
             return json_response(result, status=404)
         return json_response(result)
