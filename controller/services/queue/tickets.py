@@ -58,6 +58,12 @@ class Tickets:
     ACTIVE_STATES = {"queued", "allocating"}
     TRANSIENT_STATES = ACTIVE_STATES | FINAL_STATES
 
+    # HSET has no "only if the key exists" form, so guard it in one round trip.
+    TOUCH_POLL_SCRIPT = (
+        "if redis.call('EXISTS', KEYS[1]) == 1 then "
+        "redis.call('HSET', KEYS[1], ARGV[1], ARGV[2]); return 1 end; return 0"
+    )
+
     def __init__(self, queue):
         self.queue = queue
 
@@ -275,11 +281,15 @@ class Tickets:
     def touch_poll(self, ticket_id: str) -> None:
         """Record that the waiting client just asked about its ticket.
 
-        Best effort: losing a liveness sample must not break the poll response.
+        Writes only to an existing ticket: a plain HSET would create an
+        untracked hash with no TTL for any unknown id reaching the endpoint.
+        Best effort, since losing a liveness sample must not fail the response.
         """
         client = self.queue._redis_client()
         try:
-            client.hset(
+            client.eval(
+                self.TOUCH_POLL_SCRIPT,
+                1,
                 self.queue._ticket_key(ticket_id),
                 "last_poll_ms",
                 str(int(time.time() * 1000)),
