@@ -1,0 +1,54 @@
+name: Claude Code Review
+
+# PR 댓글에 "@claude review" 를 남기면 인라인 코드 리뷰를 수행한다.
+# 자동 실행(pull_request 트리거)은 사용하지 않는다 — 푸시할 때마다 도는 것을 피하기 위함.
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  claude-review:
+    # issue 가 아닌 PR 의 댓글이면서, "@claude review" 가 포함된 경우에만 실행
+    if: >
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@claude review')
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+
+    steps:
+      # issue_comment 이벤트의 기본 checkout 은 기본 브랜치를 받아온다.
+      # PR 의 실제 코드를 리뷰해야 하므로 PR head 를 명시적으로 받아오고,
+      # base 와 diff 를 뜨기 위해 전체 히스토리(fetch-depth: 0)가 필요하다.
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/head
+          fetch-depth: 0
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'code-review@claude-code-plugins'
+          prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.issue.number }}'
+          # 지적이 0건이어도 Actions 실행 요약 페이지에 결과를 남긴다 (PR 코멘트는 아니다)
+          display_report: true
+          # Read·Grep·Glob 이 없으면 프롬프트에 실린 diff 만 보고 판단한다.
+          #
+          # Bash(gh pr ...) 는 요약 코멘트 때문에 필요하다. code-review 플러그인은 인라인
+          # 지적은 MCP 도구로 달지만, 마지막 요약은 `gh pr comment` 로 단다. 이게 막혀 있으면
+          # 지적 0건인 PR 에서 리뷰가 아무 흔적 없이 끝난다.
+          # 통짜 Bash 는 열지 않는다 — public 저장소라 외부 기여자 PR 에서 임의 명령이
+          # 도는 위험은 만들지 않는다. gh 의 읽기·코멘트 하위 명령만 연다.
+          claude_args: >-
+            --model claude-opus-5
+            --allowedTools "Read,Grep,Glob,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),mcp__github_inline_comment__create_inline_comment"
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
