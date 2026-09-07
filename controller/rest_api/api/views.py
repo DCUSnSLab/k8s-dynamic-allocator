@@ -193,9 +193,13 @@ def ticket_detail(request: HttpRequest, ticket_id: str) -> HttpResponse:
         return _method_not_allowed("GET")
 
     try:
-        result = _get_orchestrator().get_ticket(ticket_id)
+        orchestrator = _get_orchestrator()
+        result = orchestrator.get_ticket(ticket_id)
         if result.get("status") == "error":
             return json_response(result, status=404)
+        # This poll is the only liveness signal a queued client emits. Recorded
+        # after the lookup so an unknown ticket id cannot create a ticket hash.
+        orchestrator.touch_ticket_poll(ticket_id)
         return json_response(result)
     except Exception as exc:
         logger.error("[Failed] operation=ticket_detail ticket_id=%s reason=%r", ticket_id, str(exc), exc_info=True)

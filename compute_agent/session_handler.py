@@ -190,7 +190,6 @@ class SessionHandler:
         addr = writer.get_extra_info('peername')
         session_id = id(writer)
         client_ip = addr[0]
-        client_port = addr[1]
         connection_started = time.perf_counter()
         ready_at = None
         mount_context = self._mount_context_snapshot()

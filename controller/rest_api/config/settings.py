@@ -143,6 +143,13 @@ WAIT_QUEUE_ALLOCATING_TTL_SECONDS = _env_int_any(
     ('WAIT_QUEUE_ALLOCATING_TTL_SECONDS', 'ALLOCATING_STALE_TIMEOUT_SECONDS'),
     60,
 )
+# A queued client polls its ticket about once a second. After this much silence
+# the allocator skips the ticket instead of handing it a Compute Pod; the ticket
+# keeps its queue position, so a client that reconnects loses nothing. 0 disables.
+WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS = _env_int_any(
+    ('WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS',),
+    60,
+)
 ASSIGNED_CONTEXT_TTL_SECONDS = _env_int_any(
     ('ASSIGNED_CONTEXT_TTL_SECONDS',),
     2592000,

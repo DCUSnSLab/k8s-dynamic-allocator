@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, Optional
 
 from config import settings
 
@@ -57,6 +58,12 @@ class Tickets:
     ACTIVE_STATES = {"queued", "allocating"}
     TRANSIENT_STATES = ACTIVE_STATES | FINAL_STATES
 
+    # HSET has no "only if the key exists" form, so guard it in one round trip.
+    TOUCH_POLL_SCRIPT = (
+        "if redis.call('EXISTS', KEYS[1]) == 1 then "
+        "redis.call('HSET', KEYS[1], ARGV[1], ARGV[2]); return 1 end; return 0"
+    )
+
     def __init__(self, queue):
         self.queue = queue
 
@@ -72,6 +79,7 @@ class Tickets:
         ticket["retry_count"] = safe_int(ticket.get("retry_count"), 0)
         ticket["max_retries"] = safe_int(ticket.get("max_retries"), self.queue.max_retries)
         ticket["ingress_ts_ms"] = safe_int(ticket.get("ingress_ts_ms"), 0)
+        ticket["last_poll_ms"] = safe_int(ticket.get("last_poll_ms"), 0)
         for field in (
             "created_at",
             "updated_at",
@@ -108,6 +116,7 @@ class Tickets:
             "request_label": "",
             "ticket_short": "",
             "ingress_ts_ms": "0",
+            "last_poll_ms": "0",
             "wait_deadline": "",
             "claimed_by": "",
             "claim_token": "",
@@ -163,7 +172,10 @@ class Tickets:
             pipe = client.pipeline(transaction=True)
             pipe.hset(self.queue._ticket_key(ticket_id_value), mapping=ticket)
             pipe.expire(self.queue._ticket_key(ticket_id_value), self.queue.ticket_ttl_seconds)
-            pipe.rpush(self.queue._queue_key(compute_type_value), ticket_id_value)
+            pipe.zadd(
+                self.queue._queue_key(compute_type_value),
+                {ticket_id_value: self.queue.queue_score(ticket)},
+            )
             pipe.sadd(self.queue._active_key(compute_type_value), ticket_id_value)
             pipe.sadd(self.queue._types_key(), compute_type_value)
             pipe.execute()
@@ -256,16 +268,38 @@ class Tickets:
         raw = self.get_ticket_raw(ticket_id)
         if not raw:
             return None
-        compute_type = self.queue.normalize_compute_type(raw.get("compute_type"))
         status = str(raw.get("status") or "").lower()
         queue_position = None
         if status == "queued":
-            queue_position = self.queue._queue_position_snapshot(ticket_id, compute_type)
+            queue_position = self.queue.get_ticket_position(ticket_id)
         return self._raw_to_ticket_dict(
             ticket_id,
             raw,
             queue_position=queue_position,
         )
+
+    def touch_poll(self, ticket_id: str) -> None:
+        """Record that the waiting client just asked about its ticket.
+
+        Writes only to an existing ticket: a plain HSET would create an
+        untracked hash with no TTL for any unknown id reaching the endpoint.
+        Best effort, since losing a liveness sample must not fail the response.
+        """
+        client = self.queue._redis_client()
+        try:
+            client.eval(
+                self.TOUCH_POLL_SCRIPT,
+                1,
+                self.queue._ticket_key(ticket_id),
+                "last_poll_ms",
+                str(int(time.time() * 1000)),
+            )
+        except RedisError as exc:
+            logger.warning(
+                "[Warning] operation=touch_poll ticket_id=%s reason=%r",
+                ticket_id,
+                str(exc),
+            )
 
     def get_ticket_raw(self, ticket_id: str) -> Optional[Dict[str, str]]:
         client = self.queue._redis_client()
@@ -332,9 +366,9 @@ class Tickets:
                     if payload:
                         pipe.hset(ticket_key, mapping=payload)
                     if queue_should_add:
-                        pipe.rpush(queue_key, ticket_id)
+                        pipe.zadd(queue_key, {ticket_id: self.queue.queue_score(raw)})
                     if remove_from_queue:
-                        pipe.lrem(queue_key, 0, ticket_id)
+                        pipe.zrem(queue_key, ticket_id)
                     if remove_from_active:
                         pipe.srem(active_key, ticket_id)
                     if ensure_in_queue:

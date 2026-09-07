@@ -216,3 +216,6 @@ class Orchestrator:
 
     def get_ticket(self, ticket_id: str) -> Dict:
         return self.status.get_ticket(ticket_id)
+
+    def touch_ticket_poll(self, ticket_id: str) -> None:
+        self.tickets.touch_poll(ticket_id)
