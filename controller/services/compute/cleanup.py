@@ -1,5 +1,8 @@
 import logging
-from typing import Dict
+from datetime import datetime, timezone
+from typing import Dict, Optional
+
+from config import settings
 
 from ..queue import QueueUnavailableError
 
@@ -8,6 +11,11 @@ logger = logging.getLogger(__name__)
 
 class ComputeCleanup:
     """Periodic cleanup of stale queue tickets and orphaned compute pods.
+
+    An assigned Compute Pod is reclaimed when the User Pod behind it is gone. A
+    pod whose own agent stopped answering the readiness probe is only reported,
+    not reclaimed, until ASSIGNED_NOT_READY_GRACE_SECONDS is set from measured
+    durations rather than guessed.
 
     Runs independently of the allocation path. Tolerates partial failure:
     if the Redis queue is unavailable, stale-ticket recovery is skipped
@@ -19,6 +27,7 @@ class ComputeCleanup:
         self.pool = pool
         self.queues = queues
         self.compute_manager = compute_manager
+        self.not_ready_grace_seconds = settings.ASSIGNED_NOT_READY_GRACE_SECONDS
 
     def check_stale_allocations(self) -> Dict:
         queue_recovered = []
@@ -42,6 +51,7 @@ class ComputeCleanup:
         journal_cleanup = self.recover_journaled_orphans(pool_list=pool_list)
         assigned = [pod for pod in pool_list if pod["pool_status"] == "assigned"]
 
+        unready_observed = []
         released = list(journal_cleanup["released"])
         already_released = set(released)
         errors = list(journal_cleanup["errors"])
@@ -52,6 +62,44 @@ class ComputeCleanup:
 
             if compute_pod in already_released:
                 continue
+
+            # Checked before the User Pod lookup because it needs no extra API
+            # call: readiness already rode along in the pool listing.
+            not_ready_seconds = self._not_ready_seconds(pod_info)
+            if not_ready_seconds is not None:
+                unready_observed.append(
+                    {"pod": compute_pod, "not_ready_seconds": not_ready_seconds}
+                )
+                logger.warning(
+                    "[Warning] operation=unready_compute_observed compute_pod=%s "
+                    "user_pod=%s not_ready_seconds=%s grace_seconds=%s",
+                    compute_pod,
+                    user_pod or "-",
+                    not_ready_seconds,
+                    self.not_ready_grace_seconds,
+                )
+
+            if (
+                not_ready_seconds is not None
+                and 0 < self.not_ready_grace_seconds <= not_ready_seconds
+            ):
+                logger.warning(
+                    "[Warning] operation=unready_compute_release compute_pod=%s "
+                    "user_pod=%s not_ready_seconds=%s",
+                    compute_pod,
+                    user_pod or "-",
+                    not_ready_seconds,
+                )
+                result = self.compute_manager.release_compute_pod(
+                    compute_pod,
+                    skip_unmount=True,
+                )
+                if result["status"] == "success":
+                    released.append(compute_pod)
+                else:
+                    errors.append({"pod": compute_pod, "error": result["message"]})
+                continue
+
             if not user_pod or user_pod == "unknown":
                 continue
 
@@ -77,10 +125,28 @@ class ComputeCleanup:
             "queue_failed": queue_failed,
             "queue_recovery_skipped": queue_recovery_skipped,
             "queue_recovery_error": queue_recovery_error,
+            "unready_observed": unready_observed,
             "journal_checked": journal_cleanup["checked"],
             "journal_cleanup_skipped": journal_cleanup["skipped"],
             "errors": errors,
         }
+
+    @staticmethod
+    def _not_ready_seconds(pod_info: Dict) -> Optional[int]:
+        """How long a Pod has been NotReady, or None when it is healthy.
+
+        None also covers a pod already on its way out, or a Ready condition with
+        no transition time. No threshold here: the caller decides what counts as
+        long enough.
+        """
+        if pod_info.get("ready") or pod_info.get("terminating"):
+            return None
+
+        not_ready_since = pod_info.get("not_ready_since")
+        if not isinstance(not_ready_since, datetime):
+            return None
+
+        return int((datetime.now(timezone.utc) - not_ready_since).total_seconds())
 
     def recover_journaled_orphans(self, pool_list=None) -> Dict:
         """

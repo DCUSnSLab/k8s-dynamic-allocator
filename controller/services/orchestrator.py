@@ -40,7 +40,10 @@ class Orchestrator:
                 self.pool,
                 self.queues,
                 on_capacity_available=self.compute_manager.kick_wait_queue_worker,
-                on_periodic_cleanup=self.cleanup.recover_journaled_orphans,
+                # Full sweep, not just the journal one: check_stale_allocations
+                # calls recover_journaled_orphans itself and adds stale-ticket
+                # recovery plus orphaned-pod release, which nothing else drove.
+                on_periodic_cleanup=self.cleanup.check_stale_allocations,
             )
             self.deployment_watcher = DeploymentPolicyWatcher(
                 apps_v1=self.pool.apps_v1,

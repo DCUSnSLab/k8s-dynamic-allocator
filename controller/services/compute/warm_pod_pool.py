@@ -629,6 +629,7 @@ class WarmPodPool(KubernetesClient):
                     "pool_status": pool_status or "unknown",
                     "assigned_user": labels.get(self.LABEL_USER, ""),
                     "ready": ready,
+                    "not_ready_since": self._pod_not_ready_since(pod),
                     "ip": getattr(status, "pod_ip", None),
                     "terminating": deletion_timestamp is not None,
                     "counted_in_pool_total": counted,

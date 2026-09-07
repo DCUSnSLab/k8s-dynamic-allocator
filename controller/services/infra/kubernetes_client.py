@@ -77,3 +77,17 @@ class KubernetesClient(ABC):
             if e.status == 404:
                 return None
             raise
+
+    @staticmethod
+    def _pod_not_ready_since(pod):
+        """Ready 조건이 False로 바뀐 시각 (Ready면 None).
+
+        readinessProbe가 컴퓨트 에이전트 /ready 를 보고 있으므로, 이 값은
+        "에이전트가 응답을 멈춘 시각"과 같다. Pod 오브젝트가 이미 들고 있는
+        값이라 별도 조회나 저장 없이 지속 시간을 계산할 수 있다.
+        """
+        conditions = getattr(getattr(pod, "status", None), "conditions", None) or []
+        for condition in conditions:
+            if condition.type == "Ready" and condition.status != "True":
+                return getattr(condition, "last_transition_time", None)
+        return None

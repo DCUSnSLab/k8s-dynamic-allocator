@@ -150,6 +150,15 @@ WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS = _env_int_any(
     ('WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS',),
     60,
 )
+# An assigned Compute Pod whose agent stopped answering its readiness probe is
+# unusable: the session runs through that same process. Once NotReady this long,
+# it is released. Off by default (0) because no measured NotReady durations exist
+# yet to pick a threshold from; the sweep logs unready_compute_observed either
+# way, so turn this on once that log says what a real reading looks like.
+ASSIGNED_NOT_READY_GRACE_SECONDS = _env_int_any(
+    ('ASSIGNED_NOT_READY_GRACE_SECONDS',),
+    0,
+)
 ASSIGNED_CONTEXT_TTL_SECONDS = _env_int_any(
     ('ASSIGNED_CONTEXT_TTL_SECONDS',),
     2592000,

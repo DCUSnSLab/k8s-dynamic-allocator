@@ -189,6 +189,7 @@ class ColdStartComputePool(KubernetesClient):
                     "pool_status": labels.get(self.LABEL_STATUS, "unknown"),
                     "assigned_user": labels.get(self.LABEL_USER, ""),
                     "ready": self._pod_is_ready(pod),
+                    "not_ready_since": self._pod_not_ready_since(pod),
                     "ip": pod.status.pod_ip,
                 }
             )

@@ -203,10 +203,12 @@ class ComputeManager:
         self,
         compute_pod: str,
         request_context: Optional[Dict[str, object]] = None,
+        skip_unmount: bool = False,
     ) -> Dict:
         return self.releaser.release_compute_pod(
             compute_pod=compute_pod,
             request_context=request_context,
+            skip_unmount=skip_unmount,
         )
 
     def process_wait_queues(self, compute_type: Optional[str] = None) -> Dict:

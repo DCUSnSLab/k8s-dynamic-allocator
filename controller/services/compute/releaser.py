@@ -31,12 +31,23 @@ class ComputeReleaser:
     def set_release_callback(self, on_released: Callable[[Optional[str]], None]) -> None:
         self._on_released = on_released
 
-    def release_compute_pod(self, compute_pod: str, request_context: Optional[Dict[str, object]] = None) -> Dict:
+    def release_compute_pod(
+        self,
+        compute_pod: str,
+        request_context: Optional[Dict[str, object]] = None,
+        skip_unmount: bool = False,
+    ) -> Dict:
+        """Release a Compute Pod back to the pool.
+
+        skip_unmount is for a pod whose agent is known to be unreachable: the
+        unmount call would burn its full timeout on every attempt and fail the
+        release outright, and the mount dies with the pod anyway.
+        """
         release_started_ms = int(time.time() * 1000)
         request_context_value = dict(request_context or {})
 
         cleanup_context = False
-        compute_unmounted = False
+        compute_unmounted = skip_unmount
         released_compute_type: Optional[str] = None
 
         def _release_once() -> Dict:
