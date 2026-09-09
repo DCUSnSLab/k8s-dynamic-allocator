@@ -31,23 +31,12 @@ class ComputeReleaser:
     def set_release_callback(self, on_released: Callable[[Optional[str]], None]) -> None:
         self._on_released = on_released
 
-    def release_compute_pod(
-        self,
-        compute_pod: str,
-        request_context: Optional[Dict[str, object]] = None,
-        skip_unmount: bool = False,
-    ) -> Dict:
-        """Release a Compute Pod back to the pool.
-
-        skip_unmount is for a pod whose agent is known to be unreachable: the
-        unmount call would burn its full timeout on every attempt and fail the
-        release outright, and the mount dies with the pod anyway.
-        """
+    def release_compute_pod(self, compute_pod: str, request_context: Optional[Dict[str, object]] = None) -> Dict:
         release_started_ms = int(time.time() * 1000)
         request_context_value = dict(request_context or {})
 
         cleanup_context = False
-        compute_unmounted = skip_unmount
+        compute_unmounted = False
         released_compute_type: Optional[str] = None
 
         def _release_once() -> Dict:
@@ -94,9 +83,19 @@ class ComputeReleaser:
 
             compute_pod_ip = self.pool.get_pod_ip(compute_pod)
             if compute_pod_ip and not compute_unmounted:
-                with ComputeAgent(compute_pod_ip) as agent:
-                    agent.unmount()
-                    compute_unmounted = True
+                # Best effort: unmount tidies up the agent, but the Pod is deleted
+                # right after and takes the mount namespace with it. An agent that
+                # cannot answer must not keep the Pod assigned forever.
+                try:
+                    with ComputeAgent(compute_pod_ip) as agent:
+                        agent.unmount()
+                        compute_unmounted = True
+                except Exception as exc:
+                    logger.warning(
+                        "[Warning] operation=compute_unmount compute_pod=%s reason=%r",
+                        compute_pod,
+                        str(exc),
+                    )
 
             released_now = self.pool.release_pod(compute_pod)
             if not released_now:

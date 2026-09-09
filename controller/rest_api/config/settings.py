@@ -150,14 +150,15 @@ WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS = _env_int_any(
     ('WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS',),
     60,
 )
-# An assigned Compute Pod whose agent stopped answering its readiness probe is
-# unusable: the session runs through that same process. Once NotReady this long,
-# it is released. Off by default (0) because no measured NotReady durations exist
-# yet to pick a threshold from; the sweep logs unready_compute_observed either
-# way, so turn this on once that log says what a real reading looks like.
-ASSIGNED_NOT_READY_GRACE_SECONDS = _env_int_any(
-    ('ASSIGNED_NOT_READY_GRACE_SECONDS',),
-    0,
+# How long a Compute Pod may stay NotReady before the cleanup deletes it so the
+# Deployment can backfill a usable one. 30s is what Kubernetes itself would take
+# to restart a container under default livenessProbe timings
+# (periodSeconds 10 x failureThreshold 3), and by that point an assigned Pod has
+# lost its session anyway: the agent serves both the probe and the session.
+# 0 disables.
+COMPUTE_NOT_READY_GRACE_SECONDS = _env_int_any(
+    ('COMPUTE_NOT_READY_GRACE_SECONDS',),
+    30,
 )
 ASSIGNED_CONTEXT_TTL_SECONDS = _env_int_any(
     ('ASSIGNED_CONTEXT_TTL_SECONDS',),
