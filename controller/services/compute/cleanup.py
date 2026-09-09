@@ -12,9 +12,9 @@ logger = logging.getLogger(__name__)
 class ComputeCleanup:
     """Periodic cleanup of stale queue tickets and orphaned compute pods.
 
-    A Compute Pod is reclaimed when the User Pod behind it is gone, and any Pod
-    is deleted once its agent has been NotReady past the grace period, since
-    nothing in Kubernetes replaces one on its own.
+    A Compute Pod goes back to the pool when the User Pod behind it is gone, or
+    when its agent has been NotReady past the grace period -- nothing in
+    Kubernetes replaces a NotReady Pod on its own.
 
     Runs independently of the allocation path. Tolerates partial failure:
     if the Redis queue is unavailable, stale-ticket recovery is skipped
@@ -31,8 +31,6 @@ class ComputeCleanup:
     def check_stale_allocations(self) -> Dict:
         queue_recovered = []
         queue_failed = []
-        queue_recovery_skipped = False
-        queue_recovery_error = ""
 
         try:
             for stale_ticket in self.queues.find_stale_allocating_tickets():
@@ -43,118 +41,77 @@ class ComputeCleanup:
                     queue_failed.append(recovered["ticket_id"])
         except QueueUnavailableError as exc:
             logger.warning("[Warning] operation=stale_recovery status=skipped reason=%r", str(exc))
-            queue_recovery_skipped = True
-            queue_recovery_error = str(exc)
 
         pool_list = self.pool.list_pool_status()
         journal_cleanup = self.recover_journaled_orphans(pool_list=pool_list)
-        assigned = [pod for pod in pool_list if pod["pool_status"] == "assigned"]
 
         released = list(journal_cleanup["released"])
-        already_released = set(released)
         errors = list(journal_cleanup["errors"])
-
-        unready_released = self._release_unready_pods(
-            pool_list,
-            already_released,
-            released,
-            errors,
-        )
-
-        for pod_info in assigned:
-            user_pod = pod_info.get("assigned_user", "")
-            compute_pod = pod_info["name"]
-
-            if compute_pod in already_released:
-                continue
-            if not user_pod or user_pod == "unknown":
-                continue
-
-            user_status = self.pool.get_pod_status(user_pod)
-
-            if user_status is None or user_status != "Running":
-                logger.warning(
-                    "[Warning] operation=orphan_compute_release user_pod=%s user_pod_status=%s compute_pod=%s",
-                    user_pod,
-                    user_status,
-                    compute_pod,
-                )
-                result = self.compute_manager.release_compute_pod(compute_pod)
-                if result["status"] == "success":
-                    released.append(compute_pod)
-                else:
-                    errors.append({"pod": compute_pod, "error": result["message"]})
-
-        return {
-            "checked": len(assigned),
-            "released": released,
-            "queue_recovered": queue_recovered,
-            "queue_failed": queue_failed,
-            "queue_recovery_skipped": queue_recovery_skipped,
-            "queue_recovery_error": queue_recovery_error,
-            "unready_released": unready_released,
-            "journal_checked": journal_cleanup["checked"],
-            "journal_cleanup_skipped": journal_cleanup["skipped"],
-            "errors": errors,
-        }
-
-    def _release_unready_pods(
-        self,
-        pool_list,
-        already_released: set,
-        released: list,
-        errors: list,
-    ) -> list:
-        """Delete Compute Pods whose agent has stopped answering the probe.
-
-        Nothing else reclaims these: a failing readinessProbe never restarts a
-        container, and a NotReady Pod still counts as a Deployment replica, so it
-        is neither replaced nor allocatable. Deleting lets the Deployment backfill
-        a usable one. Applies to available and assigned Pods alike -- an assigned
-        Pod past the grace period has already lost its session, because the agent
-        serves both the probe and the session.
-        """
+        journal_released = set(released)
         unready_released = []
-        if self.not_ready_grace_seconds <= 0:
-            return unready_released
 
         for pod_info in pool_list:
             compute_pod = pod_info["name"]
-            if compute_pod in already_released:
+            if compute_pod in journal_released:
                 continue
 
-            not_ready_seconds = self._not_ready_seconds(pod_info)
-            if (
-                not_ready_seconds is None
-                or not_ready_seconds < self.not_ready_grace_seconds
-            ):
+            reason = self._release_reason(pod_info)
+            if not reason:
                 continue
 
             logger.warning(
-                "[Warning] operation=unready_compute_release compute_pod=%s "
-                "pool_status=%s assigned_user=%s not_ready_seconds=%s",
+                "[Warning] operation=orphan_compute_release compute_pod=%s "
+                "pool_status=%s assigned_user=%s reason=%s",
                 compute_pod,
                 pod_info.get("pool_status") or "unknown",
                 pod_info.get("assigned_user") or "-",
-                not_ready_seconds,
+                reason,
             )
             result = self.compute_manager.release_compute_pod(compute_pod)
             if result["status"] == "success":
                 released.append(compute_pod)
-                already_released.add(compute_pod)
-                unready_released.append(compute_pod)
+                if reason.startswith("not_ready"):
+                    unready_released.append(compute_pod)
             else:
                 errors.append({"pod": compute_pod, "error": result["message"]})
-        return unready_released
+
+        return {
+            "released": released,
+            "unready_released": unready_released,
+            "queue_recovered": queue_recovered,
+            "queue_failed": queue_failed,
+            "errors": errors,
+        }
+
+    def _release_reason(self, pod_info: Dict) -> str:
+        """Why this Compute Pod should go back to the pool, or "" to keep it.
+
+        Readiness comes first: it costs no extra API call, and it also covers
+        available Pods, which the User Pod check cannot judge.
+        """
+        not_ready_seconds = self._not_ready_seconds(pod_info)
+        if (
+            self.not_ready_grace_seconds > 0
+            and not_ready_seconds is not None
+            and not_ready_seconds >= self.not_ready_grace_seconds
+        ):
+            return f"not_ready_{not_ready_seconds}s"
+
+        if pod_info.get("pool_status") != "assigned":
+            return ""
+
+        user_pod = pod_info.get("assigned_user", "")
+        if not user_pod or user_pod == "unknown":
+            return ""
+
+        user_status = self.pool.get_pod_status(user_pod)
+        if user_status == "Running":
+            return ""
+        return f"user_pod_{str(user_status).lower()}"
 
     @staticmethod
     def _not_ready_seconds(pod_info: Dict) -> Optional[int]:
-        """How long a Pod has been NotReady, or None when it is healthy.
-
-        None also covers a pod already on its way out, or a Ready condition with
-        no transition time. No threshold here: the caller decides what counts as
-        long enough.
-        """
+        """How long a Pod has been NotReady, or None when it is healthy or going away."""
         if pod_info.get("ready") or pod_info.get("terminating"):
             return None
 
@@ -176,9 +133,7 @@ class ComputeCleanup:
         valid.
         """
         pods = pool_list if pool_list is not None else self.pool.list_pool_status()
-        checked = 0
         released = []
-        skipped = []
         errors = []
 
         for pod_info in pods:
@@ -195,7 +150,6 @@ class ComputeCleanup:
             if not ticket_id:
                 continue
 
-            checked += 1
             try:
                 ticket = self.compute_manager.tickets.get_ticket(ticket_id)
             except QueueUnavailableError as exc:
@@ -205,7 +159,6 @@ class ComputeCleanup:
                     ticket_id,
                     str(exc),
                 )
-                skipped.append(pod_info["name"])
                 continue
 
             reason = self._journal_orphan_reason(
@@ -218,6 +171,9 @@ class ComputeCleanup:
 
             compute_pod = pod_info["name"]
             try:
+                # Deleted directly rather than through release_compute_pod: the
+                # ticket-to-pod mapping is what broke here, so looking a ticket up
+                # by compute_pod could clear the context of an unrelated one.
                 self.pool.release_pod(compute_pod)
                 released.append(compute_pod)
                 logger.warning(
@@ -237,12 +193,7 @@ class ComputeCleanup:
                     str(exc),
                 )
 
-        return {
-            "checked": checked,
-            "released": released,
-            "skipped": skipped,
-            "errors": errors,
-        }
+        return {"released": released, "errors": errors}
 
     @staticmethod
     def _journal_orphan_reason(

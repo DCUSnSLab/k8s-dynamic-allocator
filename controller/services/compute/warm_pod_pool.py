@@ -64,18 +64,6 @@ class WarmPodPool(KubernetesClient):
         self.apps_v1 = client.AppsV1Api()
         self.owner_ref = self._get_owner_deployment()
 
-    def _warm_pod_pool_selector(
-        self,
-        status: Optional[str] = None,
-        compute_type: Optional[str] = None,
-    ) -> str:
-        parts = [f"{self.LABEL_APP}={self.APP_WARM_POOL}"]
-        if compute_type:
-            parts.append(f"{self.LABEL_COMPUTE_TYPE}={compute_type}")
-        if status:
-            parts.append(f"{self.LABEL_STATUS}={status}")
-        return ",".join(parts)
-
     def _compute_selector(self, compute_type: Optional[str] = None) -> str:
         parts = [f"{self.LABEL_APP}={self.APP_WARM_POOL}"]
         if compute_type:
@@ -494,11 +482,6 @@ class WarmPodPool(KubernetesClient):
             WarmPodPool._owner_ref_resolved = True
             return None
 
-    def get_available_pod(self, compute_type: Optional[str] = None) -> Optional[str]:
-        """Return one Ready warm compute pod that is currently available."""
-        names = self.get_available_pods(compute_type=compute_type, limit=1)
-        return names[0] if names else None
-
     def get_pod_ready_at(self, pod_name: str):
         try:
             pod = self.v1.read_namespaced_pod(
@@ -511,31 +494,6 @@ class WarmPodPool(KubernetesClient):
                 return None
             raise
         return self._pod_ready_at(pod)
-
-    def get_available_pods(
-        self,
-        compute_type: Optional[str] = None,
-        exclude: Optional[set] = None,
-        limit: Optional[int] = None,
-    ) -> List[str]:
-        """Return Ready warm compute pod names that are currently available.
-
-        `exclude` filters out pods already reserved in the current pass because
-        the apiserver watch cache can briefly report a freshly-patched pod
-        as still available, so callers tracking in-flight reservations pass
-        them here to avoid double-selection.
-        """
-        snapshot = self.list_pool_snapshot(compute_type=compute_type)
-        exclude_set = exclude or set()
-        names: List[str] = []
-        for candidate in snapshot["available_candidates"]:
-            name = candidate["name"]
-            if name in exclude_set:
-                continue
-            names.append(name)
-            if limit is not None and len(names) >= limit:
-                break
-        return names
 
     @staticmethod
     def _has_controller_owner(pod, kind: str) -> bool:
