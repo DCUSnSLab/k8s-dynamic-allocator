@@ -351,20 +351,6 @@ class ComputeQueues:
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to repair queue state for {compute_type}: {exc}") from exc
 
-    def _snapshot_ticket_ids(self, compute_type: str) -> List[str]:
-        compute_type_value = self.normalize_compute_type(compute_type)
-        ordered: List[str] = []
-        seen = set()
-        for ticket_id in self._queue_ids(compute_type_value):
-            if ticket_id and ticket_id not in seen:
-                seen.add(ticket_id)
-                ordered.append(ticket_id)
-        for ticket_id in self._active_ticket_ids(compute_type_value):
-            if ticket_id and ticket_id not in seen:
-                seen.add(ticket_id)
-                ordered.append(ticket_id)
-        return ordered
-
     def list_waiting_users(
         self,
         compute_type: str,

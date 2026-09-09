@@ -40,7 +40,8 @@ class Orchestrator:
                 self.pool,
                 self.queues,
                 on_capacity_available=self.compute_manager.kick_wait_queue_worker,
-                on_periodic_cleanup=self.cleanup.recover_journaled_orphans,
+                # Full sweep; it calls recover_journaled_orphans itself.
+                on_periodic_cleanup=self.cleanup.check_stale_allocations,
             )
             self.deployment_watcher = DeploymentPolicyWatcher(
                 apps_v1=self.pool.apps_v1,
@@ -201,9 +202,6 @@ class Orchestrator:
 
     def process_wait_queues(self) -> Dict:
         return self.compute_manager.process_wait_queues()
-
-    def check_stale_allocations(self) -> Dict:
-        return self.cleanup.check_stale_allocations()
 
     def get_assigned_request_context(self, compute_pod: str) -> Optional[Dict[str, object]]:
         return self.compute_manager.get_assigned_request_context(compute_pod)

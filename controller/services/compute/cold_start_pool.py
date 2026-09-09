@@ -136,17 +136,6 @@ class ColdStartComputePool(KubernetesClient):
 
         raise TimeoutError(f"Timed out waiting for cold-start compute pod Ready: {pod_name} phase={last_phase}")
 
-    def get_available_pod(self, compute_type: Optional[str] = None) -> Optional[str]:
-        return None
-
-    def get_available_pods(
-        self,
-        compute_type: Optional[str] = None,
-        exclude: Optional[set] = None,
-        limit: Optional[int] = None,
-    ) -> List[str]:
-        return []
-
     def get_pod_ready_at(self, pod_name: str):
         try:
             pod = self.v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
@@ -189,6 +178,7 @@ class ColdStartComputePool(KubernetesClient):
                     "pool_status": labels.get(self.LABEL_STATUS, "unknown"),
                     "assigned_user": labels.get(self.LABEL_USER, ""),
                     "ready": self._pod_is_ready(pod),
+                    "not_ready_since": self._pod_not_ready_since(pod),
                     "ip": pod.status.pod_ip,
                 }
             )

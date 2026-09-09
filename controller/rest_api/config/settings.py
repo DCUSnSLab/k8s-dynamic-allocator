@@ -150,6 +150,13 @@ WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS = _env_int_any(
     ('WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS',),
     60,
 )
+# How long a Compute Pod may stay NotReady before cleanup deletes it and lets the
+# Deployment backfill a usable one. 30s matches Kubernetes' own default
+# livenessProbe verdict (periodSeconds 10 x failureThreshold 3). 0 disables.
+COMPUTE_NOT_READY_GRACE_SECONDS = _env_int_any(
+    ('COMPUTE_NOT_READY_GRACE_SECONDS',),
+    30,
+)
 ASSIGNED_CONTEXT_TTL_SECONDS = _env_int_any(
     ('ASSIGNED_CONTEXT_TTL_SECONDS',),
     2592000,

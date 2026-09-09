@@ -77,3 +77,26 @@ class KubernetesClient(ABC):
             if e.status == 404:
                 return None
             raise
+
+    @staticmethod
+    def _pod_not_ready_since(pod):
+        """Ready였다가 False로 떨어진 시각 (그 외에는 None).
+
+        아직 한 번도 Ready가 된 적 없는 Pod는 Ready=False 전이 시각이 startTime과
+        같고 기동 중에도 갱신되지 않는다. 그래서 시각을 그대로 쓰면 "고장난 뒤
+        경과 시간"이 아니라 Pod 나이가 되고, 기동이 느린 Pod가 회수 대상이 된다.
+        Pod 오브젝트가 이미 들고 있는 값이라 별도 조회는 필요 없다.
+        """
+        status = getattr(pod, "status", None)
+        start_time = getattr(status, "start_time", None)
+        if start_time is None:
+            return None
+
+        for condition in getattr(status, "conditions", None) or []:
+            if condition.type != "Ready" or condition.status == "True":
+                continue
+            not_ready_since = getattr(condition, "last_transition_time", None)
+            if not_ready_since is not None and not_ready_since > start_time:
+                return not_ready_since
+            return None
+        return None
