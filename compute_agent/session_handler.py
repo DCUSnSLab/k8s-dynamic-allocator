@@ -356,10 +356,14 @@ class SessionHandler:
             logger.info("[ConnectionClosed] session_ms=%s", max(0, session_ms))
 
             # 활성 세션이 없으면 Controller에 자원 해제 요청
-            await self._maybe_notify_release()
+            await self._notify_release_if_idle()
 
-    async def _maybe_notify_release(self):
-        """Schedule one fallback release notify per compute lifecycle."""
+    async def _notify_release_if_idle(self):
+        """Tell the controller the pod is free, once the last session is gone.
+
+        Fallback path: the primary cleanup suppresses it. Scheduled at most once
+        per compute lifecycle, and only while no session is left running.
+        """
         # Fast path: avoid lock if obviously not needed (optimization)
         if self._skip_release_notify or self._active_sessions:
             return

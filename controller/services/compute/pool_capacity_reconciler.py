@@ -280,8 +280,7 @@ class PoolCapacityReconciler:
                         self.on_periodic_cleanup()
                     except Exception as exc:
                         logger.warning(
-                            "[Warning] operation=reservation_journal_cleanup "
-                            "reason=%r",
+                            "[Warning] operation=periodic_cleanup reason=%r",
                             str(exc),
                         )
                 if refresh_policies:

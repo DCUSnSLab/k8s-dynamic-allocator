@@ -83,9 +83,18 @@ class ComputeReleaser:
 
             compute_pod_ip = self.pool.get_pod_ip(compute_pod)
             if compute_pod_ip and not compute_unmounted:
-                with ComputeAgent(compute_pod_ip) as agent:
-                    agent.unmount()
-                    compute_unmounted = True
+                # Best effort: the Pod is deleted right after and takes the mount
+                # namespace with it, so a silent agent must not block the release.
+                try:
+                    with ComputeAgent(compute_pod_ip) as agent:
+                        agent.unmount()
+                        compute_unmounted = True
+                except Exception as exc:
+                    logger.warning(
+                        "[Warning] operation=compute_unmount compute_pod=%s reason=%r",
+                        compute_pod,
+                        str(exc),
+                    )
 
             released_now = self.pool.release_pod(compute_pod)
             if not released_now:

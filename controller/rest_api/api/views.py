@@ -307,29 +307,3 @@ def release_compute_pod(request: HttpRequest) -> HttpResponse:
     except Exception as exc:
         logger.error("[Failed] operation=release reason=%r", str(exc), exc_info=True)
         return _error_response(str(exc), status=500)
-
-
-@csrf_exempt
-def check_stale(request: HttpRequest) -> HttpResponse:
-    if request.method != "POST":
-        return _method_not_allowed("POST")
-
-    try:
-        result = _get_orchestrator().check_stale_allocations()
-        released_count = len(result.get("released", []))
-        if released_count > 0:
-            logger.info(
-                "Stale check: %s checked, %s released",
-                result.get("checked", 0),
-                released_count,
-            )
-        else:
-            logger.debug(
-                "Stale check: %s checked, %s released",
-                result.get("checked", 0),
-                released_count,
-            )
-        return json_response({"status": "success", **result})
-    except Exception as exc:
-        logger.error("[Failed] operation=stale_check reason=%r", str(exc), exc_info=True)
-        return _error_response(str(exc), status=500)
