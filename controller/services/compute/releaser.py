@@ -32,11 +32,32 @@ class ComputeReleaser:
         self._on_released = on_released
 
     def release_compute_pod(self, compute_pod: str, request_context: Optional[Dict[str, object]] = None) -> Dict:
+        """Release a Compute Pod back to the pool."""
+        return self._release(compute_pod, request_context, unmount=True)
+
+    def release_unreachable_compute_pod(
+        self,
+        compute_pod: str,
+        request_context: Optional[Dict[str, object]] = None,
+    ) -> Dict:
+        """Release a Compute Pod whose agent is already known to be silent.
+
+        Skips the unmount call, which would wait out its full timeout before
+        failing anyway. Everything else matches an ordinary release.
+        """
+        return self._release(compute_pod, request_context, unmount=False)
+
+    def _release(
+        self,
+        compute_pod: str,
+        request_context: Optional[Dict[str, object]],
+        unmount: bool,
+    ) -> Dict:
         release_started_ms = int(time.time() * 1000)
         request_context_value = dict(request_context or {})
 
         cleanup_context = False
-        compute_unmounted = False
+        compute_unmounted = not unmount
         released_compute_type: Optional[str] = None
 
         def _release_once() -> Dict:

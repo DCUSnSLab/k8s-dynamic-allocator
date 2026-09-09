@@ -209,6 +209,9 @@ class ComputeManager:
             request_context=request_context,
         )
 
+    def release_unreachable_compute_pod(self, compute_pod: str) -> Dict:
+        return self.releaser.release_unreachable_compute_pod(compute_pod=compute_pod)
+
     def process_wait_queues(self, compute_type: Optional[str] = None) -> Dict:
         return self.queue_processor.process_wait_queues(compute_type=compute_type)
 

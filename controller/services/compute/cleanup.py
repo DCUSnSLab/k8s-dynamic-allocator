@@ -67,10 +67,15 @@ class ComputeCleanup:
                 pod_info.get("assigned_user") or "-",
                 reason,
             )
-            result = self.compute_manager.release_compute_pod(compute_pod)
+            unready = reason.startswith("not_ready")
+            if unready:
+                result = self.compute_manager.release_unreachable_compute_pod(compute_pod)
+            else:
+                result = self.compute_manager.release_compute_pod(compute_pod)
+
             if result["status"] == "success":
                 released.append(compute_pod)
-                if reason.startswith("not_ready"):
+                if unready:
                     unready_released.append(compute_pod)
             else:
                 errors.append({"pod": compute_pod, "error": result["message"]})
