@@ -53,7 +53,7 @@ class SessionHandler:
         self._idle_release_seconds = float(
             os.getenv("COMPUTE_AGENT_IDLE_RELEASE_SECONDS", "60")
         )
-        self._assigned_since: Optional[float] = None
+        self._idle_since: Optional[float] = None
         self._idle_release_logged = False
         self._idle_watch_task: Optional[asyncio.Task] = None
         self._release_notify_lock = asyncio.Lock()
@@ -114,15 +114,20 @@ class SessionHandler:
                 logger.warning("[Warning] operation=idle_watch reason=%r", str(exc))
 
     def _idle_seconds(self) -> Optional[float]:
-        """배정된 뒤 세션 없이 지난 시간 (사용 중이거나 미배정이면 None)."""
+        """세션 없는 상태가 이어진 시간 (사용 중이거나 미배정이면 None)."""
         if self._active_sessions or self._skip_release_notify:
             return None
-        assigned_since = self._assigned_since
-        if assigned_since is None:
+        idle_since = self._idle_since
+        if idle_since is None:
             return None
         if not self._mount_context_snapshot()["user_pod_ip"]:
             return None
-        return time.monotonic() - assigned_since
+        return time.monotonic() - idle_since
+
+    def _mark_idle_since_now(self) -> None:
+        """세션이 없는 상태가 시작된 시각을 갱신한다 (배정 직후, 마지막 세션 종료 시)."""
+        self._idle_since = time.monotonic()
+        self._idle_release_logged = False
 
     def _idle_release_elapsed(self) -> bool:
         idle_seconds = self._idle_seconds()
@@ -191,8 +196,7 @@ class SessionHandler:
             self._user_pod_ip = user_pod_ip or ""
             self._user_pod = user_pod or ""
 
-        self._assigned_since = time.monotonic()
-        self._idle_release_logged = False
+        self._mark_idle_since_now()
         self._release_notify_cancelled.clear()
         async with self._release_notify_lock:
             self._skip_release_notify = False
@@ -211,7 +215,7 @@ class SessionHandler:
             }
 
     def _clear_mount_context(self) -> None:
-        self._assigned_since = None
+        self._idle_since = None
         self._idle_release_logged = False
         with self._mount_context_lock:
             self._user_pod_ip = ""
@@ -406,6 +410,8 @@ class SessionHandler:
 
             # 세션 추적 제거
             session_info = self._active_sessions.pop(session_id, None)
+            if not self._active_sessions:
+                self._mark_idle_since_now()
 
             writer.close()
             await writer.wait_closed()

@@ -271,6 +271,7 @@ async def unmount():
     except Exception as e:
         cleanup_ms = int((time.perf_counter() - cleanup_started) * 1000)
         logger.error("[UnmountFailed] cleanup_ms=%s reason=%r", cleanup_ms, str(e))
+        await state.set_error(str(e))
         return FormattedJSONResponse({
             "status": "error",
             "message": str(e)
