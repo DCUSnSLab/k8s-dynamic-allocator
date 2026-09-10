@@ -40,6 +40,8 @@ class SessionHandler:
     - 동시 접속 지원 (세션별 로컬 변수 관리)
     """
 
+    IDLE_WATCH_INTERVAL_SECONDS = 10
+
     def __init__(self, port: Optional[int] = None) -> None:
         self.port = port or int(os.getenv("COMPUTE_AGENT_TCP_PORT", "8081"))
         self.server: Optional[asyncio.Server] = None
@@ -48,6 +50,12 @@ class SessionHandler:
         self._release_notify_debounce_seconds = float(
             os.getenv("COMPUTE_AGENT_RELEASE_NOTIFY_DEBOUNCE_SECONDS", "10")
         )
+        self._idle_release_seconds = float(
+            os.getenv("COMPUTE_AGENT_IDLE_RELEASE_SECONDS", "60")
+        )
+        self._assigned_since: Optional[float] = None
+        self._idle_release_logged = False
+        self._idle_watch_task: Optional[asyncio.Task] = None
         self._release_notify_lock = asyncio.Lock()
         self._release_notify_pending = False
         self._release_notify_sent = False
@@ -74,10 +82,57 @@ class SessionHandler:
         # 서버 소켓에 TCP Keepalive 적용
         for sock in self.server.sockets:
             self._configure_keepalive(sock)
+        if self._idle_release_seconds > 0 and self._idle_watch_task is None:
+            self._idle_watch_task = asyncio.create_task(self._idle_watch_loop())
         logger.info("Session Handler started on port %s", self.port)
+
+    async def _idle_watch_loop(self) -> None:
+        """배정된 채로 세션이 붙지 않는 Compute Pod를 스스로 반납 요청한다.
+
+        세션이 한 번도 없었으면 세션 종료 경로가 돌지 않아 통보 자체가 나가지
+        않고, 통보가 실패한 경우에도 다시 시도할 계기가 없다. 두 경우 모두
+        User Pod와 Agent가 멀쩡해서 Controller의 정리 조건에도 걸리지 않는다.
+        주기는 감지 지연에만 영향을 주므로 판정 기준인 idle_release_seconds와
+        달리 고정값을 쓴다.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self.IDLE_WATCH_INTERVAL_SECONDS)
+                if not self._idle_release_elapsed():
+                    continue
+                if not self._idle_release_logged:
+                    # 재시도까지 매번 남기면 중복이다. 실패는 _notify_release 가 기록한다.
+                    self._idle_release_logged = True
+                    logger.warning(
+                        "[Warning] operation=idle_release_notify idle_seconds=%.0f",
+                        self._idle_seconds() or 0.0,
+                    )
+                await self._notify_release_if_idle()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[Warning] operation=idle_watch reason=%r", str(exc))
+
+    def _idle_seconds(self) -> Optional[float]:
+        """배정된 뒤 세션 없이 지난 시간 (사용 중이거나 미배정이면 None)."""
+        if self._active_sessions or self._skip_release_notify:
+            return None
+        assigned_since = self._assigned_since
+        if assigned_since is None:
+            return None
+        if not self._mount_context_snapshot()["user_pod_ip"]:
+            return None
+        return time.monotonic() - assigned_since
+
+    def _idle_release_elapsed(self) -> bool:
+        idle_seconds = self._idle_seconds()
+        return idle_seconds is not None and idle_seconds >= self._idle_release_seconds
 
     async def stop(self) -> None:
         """TCP 서버 중지 — 모든 활성 세션 정리"""
+        if self._idle_watch_task and not self._idle_watch_task.done():
+            self._idle_watch_task.cancel()
+        self._idle_watch_task = None
         for sid, info in list(self._active_sessions.items()):
             process = info.get("process")
             if process and process.poll() is None:
@@ -136,6 +191,8 @@ class SessionHandler:
             self._user_pod_ip = user_pod_ip or ""
             self._user_pod = user_pod or ""
 
+        self._assigned_since = time.monotonic()
+        self._idle_release_logged = False
         self._release_notify_cancelled.clear()
         async with self._release_notify_lock:
             self._skip_release_notify = False
@@ -154,6 +211,8 @@ class SessionHandler:
             }
 
     def _clear_mount_context(self) -> None:
+        self._assigned_since = None
+        self._idle_release_logged = False
         with self._mount_context_lock:
             self._user_pod_ip = ""
             self._user_pod = ""
