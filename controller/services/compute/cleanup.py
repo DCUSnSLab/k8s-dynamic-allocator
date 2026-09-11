@@ -59,19 +59,30 @@ class ComputeCleanup:
             if not reason:
                 continue
 
-            logger.warning(
-                "[Warning] operation=orphan_compute_release compute_pod=%s "
-                "pool_status=%s assigned_user=%s reason=%s",
-                compute_pod,
-                pod_info.get("pool_status") or "unknown",
-                pod_info.get("assigned_user") or "-",
-                reason,
-            )
-            unready = reason.startswith("not_ready")
-            if unready:
-                result = self.compute_manager.release_unreachable_compute_pod(compute_pod)
-            else:
-                result = self.compute_manager.release_compute_pod(compute_pod)
+            # Names the request this reclaim belongs to, and is handed to the release,
+            # which looks it up itself only if this lookup failed.
+            request_context = self._assigned_request_context(compute_pod)
+            request_label = (request_context or {}).get("request_label") or "-"
+            with settings.request_label_scope(request_label):
+                logger.warning(
+                    "[Warning] operation=orphan_compute_release compute_pod=%s "
+                    "pool_status=%s assigned_user=%s reason=%s",
+                    compute_pod,
+                    pod_info.get("pool_status") or "unknown",
+                    pod_info.get("assigned_user") or "-",
+                    reason,
+                )
+                unready = reason.startswith("not_ready")
+                if unready:
+                    result = self.compute_manager.release_unreachable_compute_pod(
+                        compute_pod,
+                        request_context=request_context,
+                    )
+                else:
+                    result = self.compute_manager.release_compute_pod(
+                        compute_pod,
+                        request_context=request_context,
+                    )
 
             if result["status"] == "success":
                 released.append(compute_pod)
@@ -113,6 +124,13 @@ class ComputeCleanup:
         if user_status == "Running":
             return ""
         return f"user_pod_{str(user_status).lower()}"
+
+    def _assigned_request_context(self, compute_pod: str) -> Optional[Dict]:
+        """The request a Pod was handed to: {} if it never was, None if Redis is down."""
+        try:
+            return self.compute_manager.get_assigned_request_context(compute_pod) or {}
+        except QueueUnavailableError:
+            return None
 
     @staticmethod
     def _not_ready_seconds(pod_info: Dict) -> Optional[int]:
