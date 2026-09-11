@@ -90,7 +90,8 @@ class ComputeReleaser:
                 }
 
             assigned_context = dict(request_context_value)
-            if not assigned_context:
+            # An empty dict means the caller already looked and found nothing.
+            if request_context is None:
                 try:
                     assigned_context = self.tickets.get_assigned_request_context(compute_pod) or {}
                 except QueueUnavailableError as exc:

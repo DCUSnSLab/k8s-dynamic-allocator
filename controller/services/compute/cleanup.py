@@ -59,8 +59,8 @@ class ComputeCleanup:
             if not reason:
                 continue
 
-            # Names the request this reclaim belongs to. When found, it is handed to
-            # the release as well, which then skips its own lookup.
+            # Names the request this reclaim belongs to, and is handed to the release,
+            # which looks it up itself only if this lookup failed.
             request_context = self._assigned_request_context(compute_pod)
             request_label = (request_context or {}).get("request_label") or "-"
             with settings.request_label_scope(request_label):
@@ -126,9 +126,9 @@ class ComputeCleanup:
         return f"user_pod_{str(user_status).lower()}"
 
     def _assigned_request_context(self, compute_pod: str) -> Optional[Dict]:
-        """The request a Pod was handed to, or None (never assigned, or Redis is down)."""
+        """The request a Pod was handed to: {} if it never was, None if Redis is down."""
         try:
-            return self.compute_manager.get_assigned_request_context(compute_pod)
+            return self.compute_manager.get_assigned_request_context(compute_pod) or {}
         except QueueUnavailableError:
             return None
 
