@@ -489,9 +489,11 @@ class SessionHandler:
                 release_notify_http_connection.connect()
                 if cancelled_event.is_set():
                     return False
+                # 컨트롤러가 이 파드를 지우므로 응답 뒤 연결을 유지하지 않는다
                 release_notify_http_connection.request("POST", release_path, body=body, headers={
                     "Content-Type": "application/json",
                     "Content-Length": str(len(body)),
+                    "Connection": "close",
                 })
                 if cancelled_event.is_set():
                     return False
