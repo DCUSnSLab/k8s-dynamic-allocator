@@ -128,6 +128,12 @@ class ComputeQueueProcessor:
 
     def recover_stale_ticket(self, ticket: Dict) -> Dict:
         """Shared with ComputeCleanup through ComputeManager."""
+        # log_queue_event tags this thread with the ticket's label, and callers
+        # loop over several tickets, so the caller's label is restored afterwards.
+        with settings.request_label_scope():
+            return self._recover_stale_ticket(ticket)
+
+    def _recover_stale_ticket(self, ticket: Dict) -> Dict:
         ticket_id = ticket.get("ticket_id", "")
         compute_type = self.queues.normalize_compute_type(ticket.get("compute_type"))
         compute_pod = ticket.get("compute_pod", "")
