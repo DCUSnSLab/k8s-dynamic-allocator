@@ -1,27 +1,19 @@
-# KDA simulator scenario template.
-# Every field is listed here with its choices. Keep configs of actual
-# experiments under experiments/ and run them with --config.
+# KDA simulator scenario.
+# Choice fields show available values in comments.
 
 experiment:
-  # Used for the result directory name and request ids.
-  name: example_smoke
-  # Label only (e.g. warm-pool, cold-start, baseline-direct). The pool mode the
-  # controller actually runs is read from the server into summary.json.
-  pool_policy: warm-pool
-  # R and N. When both are set, the run applies them to the compute Deployment
-  # and waits for the warm pool before starting. null leaves the server as is.
-  pool_size: null
-  pool_total_max: null
+  name: E2_cold_start
+  pool_policy: cold-start
+  pool_size: 0
+  controller_replicas: 2
 
 ssh:
-  host: 203.250.35.87
+  host: 203.250.33.144
   port: 30622
 
 users:
   prefix: test
-  count: 2
-  # How many commands one user may have running at the same time.
-  max_concurrent_requests: 1
+  count: 100
 
 workload:
   # profile choices:
@@ -32,7 +24,7 @@ workload:
   #   max_stress   -> 15.05 req/min
   #   nhpp_daily   -> hourly NHPP profile from OnlineJudge DB with vacation excluded, expressed as req/min
   #   any number   -> use that number as lambda_per_minute
-  profile: 30
+  profile: 0.278805
 
   # scope choices:
   #   system   -> lambda is the total system arrival rate
@@ -40,12 +32,12 @@ workload:
   lambda_scope: system
 
   # null means run until Ctrl+C or max_requests is reached.
-  duration_minutes: 5
-  max_requests: 2
+  duration_minutes: 720
+  max_requests: null
 
   # Same seed reproduces the same request schedule. null means a different
   # random schedule each run.
-  random_seed: 1
+  random_seed: 1035
   # Optional CSV trace to replay. Prefer generating one trace and replaying it
   # across baseline, warm_pool, and cold_start experiments.
   trace_file: null
@@ -56,19 +48,24 @@ workload:
   # null starts from the current local hour. Set 0-23 to make NHPP schedules
   # reproducible across branches even when runs start at different wall times.
   nhpp_start_hour: 0
-  # Only used when profile is nhpp_daily. Multiplies every hourly rate.
-  nhpp_rate_scale: 1
 
 commands:
-  # One item is picked per request by weight.
   items:
-    - name: short
-      weight: 100
-      command: sleep 5
+    - name: cpu
+      weight: 34
+      command: >-
+        python3 -c "import time, math; end=time.time()+60; x=0.0; i=0; exec('while time.time() < end:\n    x += math.sqrt(i % 1000000)\n    i += 1'); print(x)"
+    - name: mem
+      weight: 33
+      command: >-
+        python3 -c "import time; x=bytearray(256*1024*1024); exec('for i in range(0, len(x), 4096):\n    x[i] = 1'); time.sleep(60); print(len(x))"
+    - name: cpu_mem
+      weight: 33
+      command: >-
+        python3 -c "import time, math; x=bytearray(220*1024*1024); exec('for j in range(0, len(x), 4096):\n    x[j] = 1'); end=time.time()+60; y=0.0; i=0; exec('while time.time() < end:\n    y += math.sqrt(i % 1000000)\n    i += 1'); print(len(x), y)"
 
 background_activity:
-  # Keeps a small CPU and memory load running on every user pod.
-  enabled: false
+  enabled: true
   memory_mb: 20
   cpu_period_seconds: 10
   cpu_busy_seconds: 0.2
@@ -77,14 +74,11 @@ setup:
   # Existing user pods/PVCs can use a higher setup concurrency.
   # When recreating all pods/PVCs from scratch, use max_inflight: 10 and
   # retry_delay_seconds: 15 to reduce API server and storage pressure.
-  max_inflight: 2
+  max_inflight: 25
   retry_attempts: 6
-  retry_delay_seconds: 15
+  retry_delay_seconds: 5
 
 execution:
-  # mode choices:
-  #   kda             -> run the command on a compute pod through `run`
-  #   baseline-direct -> run the command directly on the user pod
   mode: kda
 
 output:
