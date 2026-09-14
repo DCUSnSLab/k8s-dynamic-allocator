@@ -50,6 +50,7 @@ EXECUTION_MODE_KDA = "kda"
 EXECUTION_MODE_BASELINE_DIRECT = "baseline-direct"
 EXECUTION_MODES = {EXECUTION_MODE_KDA, EXECUTION_MODE_BASELINE_DIRECT}
 MARKER_PREFIX = "KDA_SIM"
+KUBERNETES_NAMESPACE = "kda-test"
 CLIENT_MAX_INFLIGHT = 100
 SETUP_MAX_INFLIGHT = 10
 WARMUP_MAX_ATTEMPTS = 6
@@ -68,6 +69,7 @@ class ExperimentConfig:
     name: str
     pool_policy: str = ""
     pool_size: int | None = None
+    pool_total_max: int | None = None
     controller_replicas: int | None = None
 
 
@@ -81,6 +83,9 @@ class SSHConfig:
 class UsersConfig:
     prefix: str
     count: int
+    # How many commands one user may have running at the same time. The
+    # controller places no per-user limit, so this only shapes the load.
+    max_concurrent_requests: int = PER_USER_MAX_INFLIGHT
 
 
 @dataclass
@@ -93,6 +98,7 @@ class WorkloadConfig:
     trace_file: str | None
     nhpp_time_compression: float
     nhpp_start_hour: int | None
+    nhpp_rate_scale: float
     mode: str
     scenario: str
     lambda_per_minute: float
@@ -209,12 +215,13 @@ def _load_experiment(data: dict[str, Any]) -> ExperimentConfig:
     _ensure_allowed(
         "experiment",
         data,
-        {"name", "pool_policy", "pool_size", "controller_replicas"},
+        {"name", "pool_policy", "pool_size", "pool_total_max", "controller_replicas"},
     )
     return ExperimentConfig(
         name=str(_required_value(data, "name", "experiment")),
         pool_policy=str(data.get("pool_policy") or ""),
         pool_size=_optional_int(data.get("pool_size"), "experiment.pool_size"),
+        pool_total_max=_optional_int(data.get("pool_total_max"), "experiment.pool_total_max"),
         controller_replicas=_optional_int(
             data.get("controller_replicas"), "experiment.controller_replicas"
         ),
@@ -230,10 +237,14 @@ def _load_ssh(data: dict[str, Any]) -> SSHConfig:
 
 
 def _load_users(data: dict[str, Any]) -> UsersConfig:
-    _ensure_allowed("users", data, {"prefix", "count"})
+    _ensure_allowed("users", data, {"prefix", "count", "max_concurrent_requests"})
     return UsersConfig(
         prefix=str(data.get("prefix") or "test"),
         count=int(_required_value(data, "count", "users")),
+        max_concurrent_requests=_optional_int(
+            data.get("max_concurrent_requests"), "users.max_concurrent_requests"
+        )
+        or PER_USER_MAX_INFLIGHT,
     )
 
 
@@ -250,6 +261,7 @@ def _load_workload(data: dict[str, Any]) -> WorkloadConfig:
             "trace_file",
             "nhpp_time_compression",
             "nhpp_start_hour",
+            "nhpp_rate_scale",
         },
     )
     profile = _required_value(data, "profile", "workload")
@@ -267,6 +279,7 @@ def _load_workload(data: dict[str, Any]) -> WorkloadConfig:
         trace_file=_optional_str(data.get("trace_file"), "workload.trace_file"),
         nhpp_time_compression=float(data.get("nhpp_time_compression", 12.0)),
         nhpp_start_hour=_optional_int(data.get("nhpp_start_hour"), "workload.nhpp_start_hour"),
+        nhpp_rate_scale=float(data.get("nhpp_rate_scale", 1.0)),
         mode=mode,
         scenario=scenario,
         lambda_per_minute=lambda_per_minute,
@@ -368,12 +381,19 @@ def _lambda_for_profile(profile: str | float | int) -> float:
 def validate_config(config: SimulatorConfig) -> None:
     if not config.experiment.name:
         raise ValueError("experiment.name must be set")
+    r, n = config.experiment.pool_size, config.experiment.pool_total_max
+    if any(value is not None and value < 0 for value in (r, n)):
+        raise ValueError("experiment.pool_size and experiment.pool_total_max must be non-negative")
+    if r is not None and n is not None and r > n:
+        raise ValueError("experiment.pool_size must not exceed experiment.pool_total_max")
     if not config.ssh.host:
         raise ValueError("ssh.host must be set before running the simulator")
     if config.ssh.port <= 0:
         raise ValueError("ssh.port must be a positive integer")
     if config.users.count <= 0:
         raise ValueError("users.count must be positive")
+    if config.users.max_concurrent_requests <= 0:
+        raise ValueError("users.max_concurrent_requests must be positive")
     if config.workload.lambda_scope not in {"system", "per_user"}:
         raise ValueError("workload.lambda_scope must be 'system' or 'per_user'")
     if config.workload.duration_minutes is not None and config.workload.duration_minutes <= 0:
@@ -391,6 +411,8 @@ def validate_config(config: SimulatorConfig) -> None:
             raise ValueError("nhpp_daily profile cannot contain negative rates")
         if config.workload.nhpp_time_compression <= 0:
             raise ValueError("workload.nhpp_time_compression must be positive")
+        if config.workload.nhpp_rate_scale <= 0:
+            raise ValueError("workload.nhpp_rate_scale must be positive")
         if config.workload.nhpp_start_hour is not None and not (
             0 <= config.workload.nhpp_start_hour <= 23
         ):
