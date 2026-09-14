@@ -4,7 +4,7 @@ from typing import Callable, Dict, Optional
 
 from kubernetes.client.rest import ApiException
 
-from config.settings import set_request_label
+from config.settings import request_label_scope, set_request_label
 
 from .. import ticket_format
 from ..queue import QueueUnavailableError, safe_int
@@ -53,6 +53,17 @@ class ComputeReleaser:
         request_context: Optional[Dict[str, object]],
         unmount: bool,
     ) -> Dict:
+        # Tags this thread with the ticket's label so its own log lines attribute
+        # correctly; the caller's label comes back once the release is done.
+        with request_label_scope():
+            return self._release_with_retries(compute_pod, request_context, unmount)
+
+    def _release_with_retries(
+        self,
+        compute_pod: str,
+        request_context: Optional[Dict[str, object]],
+        unmount: bool,
+    ) -> Dict:
         release_started_ms = int(time.time() * 1000)
         request_context_value = dict(request_context or {})
 
@@ -79,7 +90,8 @@ class ComputeReleaser:
                 }
 
             assigned_context = dict(request_context_value)
-            if not assigned_context:
+            # An empty dict means the caller already looked and found nothing.
+            if request_context is None:
                 try:
                     assigned_context = self.tickets.get_assigned_request_context(compute_pod) or {}
                 except QueueUnavailableError as exc:

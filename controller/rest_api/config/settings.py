@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 # BASE_DIR: rest_api/
@@ -39,6 +40,23 @@ def get_request_label():
 def set_request_label(request_label):
     _local.request_label = request_label
     _local.request_id = request_label
+
+
+@contextmanager
+def request_label_scope(request_label=None):
+    """Restore this thread's request label on exit, optionally setting one for the block.
+
+    The label lives in a thread-local, so a long-lived thread keeps whatever the
+    last caller set. Code that changes it on behalf of one request wraps itself
+    in this so the next log line on the same thread is not attributed to it.
+    """
+    previous = get_request_label()
+    if request_label is not None:
+        set_request_label(request_label)
+    try:
+        yield
+    finally:
+        set_request_label(previous)
 
 
 def build_request_label(username, ticket_short=None):

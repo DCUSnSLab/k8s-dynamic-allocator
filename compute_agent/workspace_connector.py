@@ -40,9 +40,13 @@ class WorkspaceConnector:
     def __init__(self) -> None:
         self.user_pod_ip: Optional[str] = None
 
-    async def mount(self, user_pod_ip: str, user_pod: Optional[str] = None) -> bool:
+    def attach_user_pod(self, user_pod_ip: str) -> None:
+        """이 Compute Pod가 어느 User Pod를 위한 것인지 기록한다.
+
+        실제 SSHFS 마운트는 세션이 붙을 때 setup_chroot_namespace 안에서
+        일어난다. 여기서는 대상만 정해둔다.
+        """
         self.user_pod_ip = user_pod_ip
-        return True
 
     def setup_ssh_key(self) -> bool:
         """Secret으로 마운트된 SSH 키를 ~/.ssh/id_rsa로 복사하고 권한 설정"""
@@ -82,10 +86,13 @@ class WorkspaceConnector:
             logger.error("Failed to setup SSH key: %s", e)
             return False
 
-    async def unmount(self) -> bool:
-        """Namespace 사용으로 프로세스 종료 시 자동 정리, IP만 리셋"""
+    def detach_user_pod(self) -> None:
+        """배정 기록을 지운다.
+
+        마운트는 세션마다 만든 mount namespace 안에 있어 프로세스가 끝나면
+        커널이 정리하므로, 따로 해제할 대상이 없다.
+        """
         self.user_pod_ip = None
-        return True
 
     @staticmethod
     def _create_mount_namespace(libc: Any) -> None:

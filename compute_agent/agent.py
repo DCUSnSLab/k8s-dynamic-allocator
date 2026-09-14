@@ -228,15 +228,7 @@ async def mount(request: MountRequest):
         request.user_pod_ip,
     )
 
-    mount_success = await workspace_connector.mount(request.user_pod_ip)
-
-    if not mount_success:
-        logger.error("[MountFailed] reason=%r", "SSHFS mount failed")
-        await state.set_error("SSHFS mount failed")
-        return FormattedJSONResponse({
-            "status": "error",
-            "message": "SSHFS mount failed"
-        }, status_code=500)
+    workspace_connector.attach_user_pod(request.user_pod_ip)
 
     logger.info("[MountContextAccepted] tcp_port=%s", TCP_TERMINAL_PORT)
     await state.set_running()
@@ -267,23 +259,19 @@ async def unmount():
     await session_handler.terminate_all_sessions()
 
     try:
-        success = await workspace_connector.unmount()
-        if success:
-            await state.reset()
-            await session_handler.suppress_fallback_release()
-            cleanup_ms = int((time.perf_counter() - cleanup_started) * 1000)
-            logger.info("[Unmounted] cleanup_ms=%s", cleanup_ms)
-            return FormattedJSONResponse({
-                "status": "success",
-                "message": "Unmounted and reset"
-            })
+        workspace_connector.detach_user_pod()
+        await state.reset()
+        await session_handler.suppress_fallback_release()
+        cleanup_ms = int((time.perf_counter() - cleanup_started) * 1000)
+        logger.info("[Unmounted] cleanup_ms=%s", cleanup_ms)
         return FormattedJSONResponse({
-            "status": "warning",
-            "message": "Unmount completed with warnings"
+            "status": "success",
+            "message": "Unmounted and reset"
         })
     except Exception as e:
         cleanup_ms = int((time.perf_counter() - cleanup_started) * 1000)
         logger.error("[UnmountFailed] cleanup_ms=%s reason=%r", cleanup_ms, str(e))
+        await state.set_error(str(e))
         return FormattedJSONResponse({
             "status": "error",
             "message": str(e)
