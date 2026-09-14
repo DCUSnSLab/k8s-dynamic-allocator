@@ -9,9 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from .cluster import ServerSettingsError, prepare_server
 from .config import (
     CLIENT_MAX_INFLIGHT,
     COMMAND_TIMEOUT_SECONDS,
+    KUBERNETES_NAMESPACE,
     CommandItem,
     NHPP_DAILY_PROFILE,
     SimulatorConfig,
@@ -90,7 +92,12 @@ async def main() -> None:
     else:
         plans = iter_request_plans(config, iter_schedule(config, rng), selector)
 
-    await run_simulation(config, plans, trace_file=trace_file)
+    try:
+        server_settings = await asyncio.to_thread(prepare_server, config)
+    except ServerSettingsError as exc:
+        raise SystemExit(f"Server preparation failed: {exc}") from exc
+
+    await run_simulation(config, plans, trace_file=trace_file, server_settings=server_settings)
 
 
 def apply_overrides(config: SimulatorConfig, args: argparse.Namespace) -> None:
@@ -200,11 +207,16 @@ def print_dry_run(
         )
     print(f"mode={config.workload.mode}")
     print(f"scenario={config.workload.scenario}")
+    if config.workload.mode == "nhpp":
+        print(
+            f"nhpp_time_compression={config.workload.nhpp_time_compression} "
+            f"nhpp_rate_scale={config.workload.nhpp_rate_scale}"
+        )
     print(f"lambda_scope={config.workload.lambda_scope}")
     if trace_file:
         print(f"trace_file={trace_file}")
         print(f"trace_requests={total_trace_requests}")
-    print(f"users={config.users.count}")
+    print(f"users={config.users.count} max_concurrent_requests={config.users.max_concurrent_requests}")
     max_requests = (
         str(config.workload.max_requests)
         if config.workload.max_requests is not None
@@ -230,6 +242,7 @@ async def run_simulation(
     request_plans: Iterator[dict[str, Any]],
     *,
     trace_file: str | None = None,
+    server_settings: dict[str, Any] | None = None,
 ) -> None:
     from .ssh_runner import SSHSessionPool, strip_ansi
 
@@ -243,6 +256,7 @@ async def run_simulation(
     setup_started_wall = now_iso()
     setup_completed_wall: str | None = None
     experiment_started_wall: str | None = None
+    experiment_finished_wall: str | None = None
 
     if config.workload.duration_minutes is None and config.workload.max_requests is None:
         print("Running until Ctrl+C")
@@ -309,6 +323,8 @@ async def run_simulation(
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        if experiment_started_wall is not None:
+            experiment_finished_wall = now_iso()
         if background_attempted:
             from .background import stop_background_activity
 
@@ -321,6 +337,7 @@ async def run_simulation(
         return
     summary_payload = {
         "experiment": config.experiment.__dict__,
+        "server": server_settings,
         "ssh": {"host": config.ssh.host, "port": config.ssh.port},
         "users": {"count": config.users.count, "prefix": config.users.prefix},
         "setup": {
@@ -330,6 +347,7 @@ async def run_simulation(
             "background_activity_started": background_attempted,
         },
         "experiment_started_at": experiment_started_wall,
+        "experiment_finished_at": experiment_finished_wall,
         "workload": {
             "mode": config.workload.mode,
             "scenario": config.workload.scenario,
@@ -431,6 +449,10 @@ async def execute_request(
         "status": status,
         "exit_status": result.exit_status,
         "duration_ms": result.elapsed_ms,
+        "until_ticket_ms": result.until_ticket_ms,
+        "until_allocated_ms": result.until_allocated_ms,
+        "until_start_ms": result.until_start_ms,
+        "command_ms": span_ms(result.until_start_ms, result.until_end_ms),
         "schedule_lag_ms": schedule_lag_ms,
         "client_queue_delay_ms": client_queue_delay_ms,
         "per_user_queue_delay_ms": result.per_user_queue_delay_ms,
@@ -445,6 +467,12 @@ async def execute_request(
     add_output_tails(config, record, result, strip_output)
     summary.add(record)
     await writer.write(record)
+
+
+def span_ms(start_ms: float | None, end_ms: float | None) -> float | None:
+    if start_ms is None or end_ms is None:
+        return None
+    return end_ms - start_ms
 
 
 def classify_result(result: Any) -> str:
@@ -482,7 +510,7 @@ def server_log_export_command(output_dir: Path) -> str:
     run_id = output_dir.parent.name
     return (
         "python3 evaluation/src/log_analysis/export_experiment_logs.py "
-        f"--run-id {run_id} --namespace swlabpods --pvc logs-pvc"
+        f"--run-id {run_id} --namespace {KUBERNETES_NAMESPACE} --pvc logs-pvc"
     )
 
 
