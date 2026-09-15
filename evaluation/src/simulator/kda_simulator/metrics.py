@@ -51,6 +51,7 @@ class SummaryCollector:
     command_ms: list[float] = field(default_factory=list)
     ticket_missing: int = 0
     allocation_missing: int = 0
+    ssh_retried: int = 0
     by_command_status: dict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
 
     def add(self, record: dict[str, Any]) -> None:
@@ -75,6 +76,11 @@ class SummaryCollector:
             if isinstance(value, (int, float)) and math.isfinite(value):
                 target.append(float(value))
 
+        if (record.get("ssh_attempts") or 1) > 1:
+            self.ssh_retried += 1
+        # A request that never left the load generator says nothing about the server.
+        if status == "ssh_error":
+            return
         if record.get("ticket_expected", True) and not record.get("ticket_id"):
             self.ticket_missing += 1
         if record.get("compute_allocation_expected", True) and not record.get("compute_pod"):
@@ -98,6 +104,7 @@ class SummaryCollector:
             "command_ms": summarize_values(self.command_ms),
             "ticket_missing": self.ticket_missing,
             "allocation_missing": self.allocation_missing,
+            "ssh_retried": self.ssh_retried,
         }
 
 

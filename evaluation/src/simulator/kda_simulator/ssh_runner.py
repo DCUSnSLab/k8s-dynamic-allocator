@@ -14,6 +14,8 @@ from .config import (
     PTY_HEIGHT,
     PTY_TERM_TYPE,
     PTY_WIDTH,
+    SSH_KEEPALIVE_COUNT_MAX,
+    SSH_KEEPALIVE_INTERVAL_SECONDS,
     SimulatorConfig,
 )
 
@@ -40,7 +42,7 @@ TRANSIENT_SSH_ERRORS = (
     "Connection lost",
     "Connection reset",
     "Connection aborted",
-    "Client not responding to keepalive",
+    "not responding to keepalive",
     "Login timeout expired",
 )
 
@@ -57,11 +59,17 @@ class CommandResult:
     compute_pod_ip: str | None
     timed_out: bool = False
     error: str | None = None
-    # Milliseconds from sending the command until each milestone line arrived.
+    # Milliseconds from sending the command until each milestone line arrived,
+    # counted from the last attempt.
     until_ticket_ms: float | None = None
     until_allocated_ms: float | None = None
     until_start_ms: float | None = None
     until_end_ms: float | None = None
+    # False means the server never accepted the command.
+    command_delivered: bool = False
+    ssh_attempts: int = 1
+    # Time lost on attempts that failed before the last one started.
+    ssh_retry_ms: float = 0.0
 
 
 class _CommandTimeout(Exception):
@@ -76,6 +84,12 @@ class _TimedOutput:
         self._lines: list[str] = []
         self.stderr = ""
         self.seen_ms: dict[str, float] = {}
+        # Set once the server accepted the command; a failure before that is safe to resend.
+        self.channel_opened = False
+
+    def restart(self, started: float) -> None:
+        self._started = started
+        self.channel_opened = False
 
     @property
     def received(self) -> bool:
@@ -134,6 +148,8 @@ class SSHUserSession:
                 password=self._config.password_for(self.username),
                 known_hosts=None,
                 login_timeout=CONNECT_TIMEOUT_SECONDS,
+                keepalive_interval=SSH_KEEPALIVE_INTERVAL_SECONDS,
+                keepalive_count_max=SSH_KEEPALIVE_COUNT_MAX,
             )
 
     async def warmup(self) -> CommandResult:
@@ -148,8 +164,9 @@ class SSHUserSession:
             exit_status: int | None = None
             timed_out = False
             error: str | None = None
+            attempts = [started]
             try:
-                exit_status = await self._run_with_retry(remote_command, timeout, output, started)
+                exit_status = await self._run_with_retry(remote_command, timeout, output, attempts)
             except _CommandTimeout:
                 timed_out = True
                 error = f"command timed out after {timeout} seconds"
@@ -173,6 +190,9 @@ class SSHUserSession:
                 until_allocated_ms=output.seen_ms.get("allocated"),
                 until_start_ms=output.seen_ms.get("start"),
                 until_end_ms=output.seen_ms.get("end"),
+                command_delivered=output.channel_opened or output.received,
+                ssh_attempts=len(attempts),
+                ssh_retry_ms=(attempts[-1] - started) * 1000.0,
             )
 
     async def _run_with_retry(
@@ -180,10 +200,13 @@ class SSHUserSession:
         remote_command: str,
         timeout: float,
         output: _TimedOutput,
-        started: float,
+        attempts: list[float],
     ) -> int | None:
         last_error: str | None = None
         for attempt in range(1, SSH_RUN_ATTEMPTS + 1):
+            if attempt > 1:
+                attempts.append(time.monotonic())
+                output.restart(attempts[-1])
             try:
                 await self.connect()
                 if self._connection is None:
@@ -198,12 +221,17 @@ class SSHUserSession:
                 last_error = str(exc)
                 self._connection = None
                 # Once output arrives the remote side has acted on the command,
-                # so running it again would submit a second request.
+                # so running it again would submit a second request. An accepted
+                # command with no output yet may already be running, so only a
+                # quick failure is retried; one never accepted is always safe.
                 can_retry = (
                     attempt < SSH_RUN_ATTEMPTS
                     and not output.received
                     and _is_transient_ssh_error(exc)
-                    and (time.monotonic() - started) <= SSH_RETRY_MAX_ELAPSED_SECONDS
+                    and (
+                        not output.channel_opened
+                        or (time.monotonic() - attempts[-1]) <= SSH_RETRY_MAX_ELAPSED_SECONDS
+                    )
                 )
                 if not can_retry:
                     raise
@@ -217,6 +245,7 @@ class SSHUserSession:
             encoding="utf-8",
             errors="replace",
         )
+        output.channel_opened = True
         try:
             async def read_stdout() -> None:
                 async for line in process.stdout:
