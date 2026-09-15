@@ -92,7 +92,7 @@ def _iter_nhpp_schedule(config: SimulatorConfig, rng: random.Random) -> Iterator
         if duration is not None and segment_start >= duration:
             break
 
-        lambda_per_minute = _apply_scope(config, profile[hour])
+        lambda_per_minute = _apply_scope(config, profile[hour]) * config.workload.nhpp_rate_scale
         lambda_for_segment = lambda_per_minute * 60.0
         if lambda_for_segment <= 0:
             segment_index += 1

@@ -2,7 +2,7 @@
 
 이 시뮬레이터는 로컬에서 서버에 배포되어 있는 `swlabssh`에 SSH로 접속하여 여러 사용자의 `run` 요청을 반복 실행한다.
 
-시뮬레이터는 Kubernetes 리소스를 직접 수정하지 않는다. Pool 크기, controller 개수, namespace, image 등은 서버에서 먼저 배포해두고 실행한다.
+실행 전에 config의 `experiment.pool_size`(R)와 `experiment.pool_total_max`(N)를 `kda-test`의 compute Deployment에 맞추고, 대기 파드가 준비될 때까지 기다린다. 둘 중 하나라도 비어 있으면 서버를 건드리지 않는다. controller 개수, pool 모드, image 등 나머지 서버 설정은 바꾸지 않고 읽어서 `summary.json`의 `server`에 기록한다. 이를 위해 `kubectl`이 `KUBECONFIG`로 클러스터에 접근할 수 있어야 한다.
 
 ## config 파일
 

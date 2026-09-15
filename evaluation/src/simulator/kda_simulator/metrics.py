@@ -45,6 +45,10 @@ class SummaryCollector:
     schedule_lag_ms: list[float] = field(default_factory=list)
     client_queue_delay_ms: list[float] = field(default_factory=list)
     per_user_queue_delay_ms: list[float] = field(default_factory=list)
+    until_ticket_ms: list[float] = field(default_factory=list)
+    until_allocated_ms: list[float] = field(default_factory=list)
+    until_start_ms: list[float] = field(default_factory=list)
+    command_ms: list[float] = field(default_factory=list)
     ticket_missing: int = 0
     allocation_missing: int = 0
     by_command_status: dict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
@@ -62,6 +66,10 @@ class SummaryCollector:
             (self.schedule_lag_ms, "schedule_lag_ms"),
             (self.client_queue_delay_ms, "client_queue_delay_ms"),
             (self.per_user_queue_delay_ms, "per_user_queue_delay_ms"),
+            (self.until_ticket_ms, "until_ticket_ms"),
+            (self.until_allocated_ms, "until_allocated_ms"),
+            (self.until_start_ms, "until_start_ms"),
+            (self.command_ms, "command_ms"),
         ):
             value = record.get(key)
             if isinstance(value, (int, float)) and math.isfinite(value):
@@ -84,6 +92,10 @@ class SummaryCollector:
             "schedule_lag_ms": summarize_values(self.schedule_lag_ms),
             "client_queue_delay_ms": summarize_values(self.client_queue_delay_ms),
             "per_user_queue_delay_ms": summarize_values(self.per_user_queue_delay_ms),
+            "until_ticket_ms": summarize_values(self.until_ticket_ms),
+            "until_allocated_ms": summarize_values(self.until_allocated_ms),
+            "until_start_ms": summarize_values(self.until_start_ms),
+            "command_ms": summarize_values(self.command_ms),
             "ticket_missing": self.ticket_missing,
             "allocation_missing": self.allocation_missing,
         }

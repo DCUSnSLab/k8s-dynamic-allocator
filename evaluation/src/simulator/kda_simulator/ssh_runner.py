@@ -4,14 +4,13 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
 
 import asyncssh
 
 from .config import (
     COMMAND_TIMEOUT_SECONDS,
     CONNECT_TIMEOUT_SECONDS,
-    PER_USER_MAX_INFLIGHT,
+    MARKER_PREFIX,
     PTY_HEIGHT,
     PTY_TERM_TYPE,
     PTY_WIDTH,
@@ -19,10 +18,20 @@ from .config import (
 )
 
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# Any CSI sequence: colors, and the "\x1b[K" line erase the PTY puts before the first line.
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 TICKET_RE = re.compile(r"\[INFO\]\s+Ticket queued:\s*(?P<ticket_id>[0-9a-fA-F]{32})")
 ALLOC_RE = re.compile(
     r"\[INFO\]\s+Compute pod allocated:\s*(?P<compute_pod>\S+) \((?P<compute_pod_ip>[^)]+)\)"
+)
+# Anchored to the line start: `run` first echoes the whole command, markers included.
+START_RE = re.compile(rf"^{re.escape(MARKER_PREFIX)}_START\s")
+END_RE = re.compile(rf"^{re.escape(MARKER_PREFIX)}_END\s")
+MILESTONES = (
+    ("ticket", TICKET_RE),
+    ("allocated", ALLOC_RE),
+    ("start", START_RE),
+    ("end", END_RE),
 )
 SSH_RUN_ATTEMPTS = 2
 SSH_RETRY_MAX_ELAPSED_SECONDS = 3.0
@@ -48,6 +57,41 @@ class CommandResult:
     compute_pod_ip: str | None
     timed_out: bool = False
     error: str | None = None
+    # Milliseconds from sending the command until each milestone line arrived.
+    until_ticket_ms: float | None = None
+    until_allocated_ms: float | None = None
+    until_start_ms: float | None = None
+    until_end_ms: float | None = None
+
+
+class _CommandTimeout(Exception):
+    pass
+
+
+class _TimedOutput:
+    """Command output, plus when each milestone line first arrived."""
+
+    def __init__(self, started: float) -> None:
+        self._started = started
+        self._lines: list[str] = []
+        self.stderr = ""
+        self.seen_ms: dict[str, float] = {}
+
+    @property
+    def received(self) -> bool:
+        return bool(self._lines)
+
+    @property
+    def stdout(self) -> str:
+        return "".join(self._lines)
+
+    def add_line(self, line: str) -> None:
+        elapsed_ms = (time.monotonic() - self._started) * 1000.0
+        self._lines.append(line)
+        text = strip_ansi(line).strip()
+        for name, pattern in MILESTONES:
+            if name not in self.seen_ms and pattern.search(text):
+                self.seen_ms[name] = elapsed_ms
 
 
 def strip_ansi(value: str) -> str:
@@ -65,21 +109,13 @@ def parse_run_output(stdout: str, stderr: str) -> dict[str, str | None]:
     }
 
 
-def _to_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value)
-
-
 class SSHUserSession:
     def __init__(self, config: SimulatorConfig, username: str) -> None:
         self._config = config
         self.username = username
         self._connection: asyncssh.SSHClientConnection | None = None
         self._connect_lock = asyncio.Lock()
-        self._run_lock = asyncio.Semaphore(PER_USER_MAX_INFLIGHT)
+        self._run_lock = asyncio.Semaphore(config.users.max_concurrent_requests)
 
     async def connect(self) -> None:
         if self._connection is not None and self._connection_is_closed():
@@ -108,79 +144,89 @@ class SSHUserSession:
         async with self._run_lock:
             per_user_queue_delay_ms = (time.monotonic() - lock_wait_started) * 1000.0
             started = time.monotonic()
-            last_error: str | None = None
+            output = _TimedOutput(started)
+            exit_status: int | None = None
+            timed_out = False
+            error: str | None = None
             try:
-                for attempt in range(1, SSH_RUN_ATTEMPTS + 1):
-                    try:
-                        await self.connect()
-                        if self._connection is None:
-                            raise RuntimeError("SSH connection was not established")
-                        result = await self._connection.run(
-                            remote_command,
-                            check=False,
-                            timeout=timeout,
-                            term_type=PTY_TERM_TYPE,
-                            term_size=(
-                                PTY_WIDTH,
-                                PTY_HEIGHT,
-                            ),
-                        )
-                        break
-                    except Exception as exc:
-                        last_error = str(exc)
-                        self._connection = None
-                        can_retry = (
-                            attempt < SSH_RUN_ATTEMPTS
-                            and _is_transient_ssh_error(exc)
-                            and (time.monotonic() - started) <= SSH_RETRY_MAX_ELAPSED_SECONDS
-                        )
-                        if not can_retry:
-                            raise
-                else:
-                    raise RuntimeError(last_error or "SSH command failed")
-
-                elapsed_ms = (time.monotonic() - started) * 1000.0
-                stdout = _to_text(result.stdout)
-                stderr = _to_text(result.stderr)
-                parsed = parse_run_output(stdout, stderr)
-                return CommandResult(
-                    exit_status=result.exit_status,
-                    stdout=stdout,
-                    stderr=stderr,
-                    elapsed_ms=elapsed_ms,
-                    per_user_queue_delay_ms=per_user_queue_delay_ms,
-                    ticket_id=parsed["ticket_id"],
-                    compute_pod=parsed["compute_pod"],
-                    compute_pod_ip=parsed["compute_pod_ip"],
-                )
-            except asyncio.TimeoutError:
-                elapsed_ms = (time.monotonic() - started) * 1000.0
-                return CommandResult(
-                    exit_status=None,
-                    stdout="",
-                    stderr="",
-                    elapsed_ms=elapsed_ms,
-                    per_user_queue_delay_ms=per_user_queue_delay_ms,
-                    ticket_id=None,
-                    compute_pod=None,
-                    compute_pod_ip=None,
-                    timed_out=True,
-                    error=f"command timed out after {timeout} seconds",
-                )
+                exit_status = await self._run_with_retry(remote_command, timeout, output, started)
+            except _CommandTimeout:
+                timed_out = True
+                error = f"command timed out after {timeout} seconds"
             except Exception as exc:
                 self._connection = None
-                elapsed_ms = (time.monotonic() - started) * 1000.0
-                return CommandResult(
-                    exit_status=None,
-                    stdout="",
-                    stderr="",
-                    elapsed_ms=elapsed_ms,
-                    per_user_queue_delay_ms=per_user_queue_delay_ms,
-                    ticket_id=None,
-                    compute_pod=None,
-                    compute_pod_ip=None,
-                    error=str(exc),
+                error = str(exc)
+
+            parsed = parse_run_output(output.stdout, output.stderr)
+            return CommandResult(
+                exit_status=exit_status,
+                stdout=output.stdout,
+                stderr=output.stderr,
+                elapsed_ms=(time.monotonic() - started) * 1000.0,
+                per_user_queue_delay_ms=per_user_queue_delay_ms,
+                ticket_id=parsed["ticket_id"],
+                compute_pod=parsed["compute_pod"],
+                compute_pod_ip=parsed["compute_pod_ip"],
+                timed_out=timed_out,
+                error=error,
+                until_ticket_ms=output.seen_ms.get("ticket"),
+                until_allocated_ms=output.seen_ms.get("allocated"),
+                until_start_ms=output.seen_ms.get("start"),
+                until_end_ms=output.seen_ms.get("end"),
+            )
+
+    async def _run_with_retry(
+        self,
+        remote_command: str,
+        timeout: float,
+        output: _TimedOutput,
+        started: float,
+    ) -> int | None:
+        last_error: str | None = None
+        for attempt in range(1, SSH_RUN_ATTEMPTS + 1):
+            try:
+                await self.connect()
+                if self._connection is None:
+                    raise RuntimeError("SSH connection was not established")
+                try:
+                    return await asyncio.wait_for(self._stream(remote_command, output), timeout)
+                except asyncio.TimeoutError as exc:
+                    raise _CommandTimeout() from exc
+            except _CommandTimeout:
+                raise
+            except Exception as exc:
+                last_error = str(exc)
+                self._connection = None
+                # Once output arrives the remote side has acted on the command,
+                # so running it again would submit a second request.
+                can_retry = (
+                    attempt < SSH_RUN_ATTEMPTS
+                    and not output.received
+                    and _is_transient_ssh_error(exc)
+                    and (time.monotonic() - started) <= SSH_RETRY_MAX_ELAPSED_SECONDS
                 )
+                if not can_retry:
+                    raise
+        raise RuntimeError(last_error or "SSH command failed")
+
+    async def _stream(self, remote_command: str, output: _TimedOutput) -> int | None:
+        process = await self._connection.create_process(
+            remote_command,
+            term_type=PTY_TERM_TYPE,
+            term_size=(PTY_WIDTH, PTY_HEIGHT),
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            async def read_stdout() -> None:
+                async for line in process.stdout:
+                    output.add_line(line)
+
+            _, output.stderr = await asyncio.gather(read_stdout(), process.stderr.read())
+            completed = await process.wait()
+            return completed.exit_status
+        finally:
+            process.close()
 
     async def close(self) -> None:
         if self._connection is None:
