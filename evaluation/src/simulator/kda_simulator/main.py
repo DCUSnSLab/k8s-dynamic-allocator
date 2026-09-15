@@ -273,6 +273,10 @@ async def run_simulation(
             background_attempted = True
             await start_background_activity(config, pool)
 
+        # Setup takes minutes and some connections die meanwhile; reconnect them
+        # here so the first requests do not go out on a dead connection.
+        await warmup_users(config, pool, stage="Connection check")
+
         setup_completed_wall = now_iso()
         print(f"Warm-up complete at {setup_completed_wall}")
 
@@ -367,8 +371,8 @@ async def run_simulation(
     print(f"Summary: {output_dir / 'summary.json'}")
 
 
-async def warmup_users(config: SimulatorConfig, pool: Any) -> None:
-    print(f"Warming up {config.users.count} user pods...")
+async def warmup_users(config: SimulatorConfig, pool: Any, stage: str = "Warm-up") -> None:
+    print(f"{stage}: {config.users.count} user pods...")
     sem = asyncio.Semaphore(config.setup.max_inflight)
 
     async def _warm(username: str) -> tuple[str, Any]:
@@ -385,14 +389,14 @@ async def warmup_users(config: SimulatorConfig, pool: Any) -> None:
             if result.error or result.timed_out or result.exit_status not in (0, None)
         ]
         if not failed:
-            print("User pod warm-up complete")
+            print(f"{stage} complete")
             return
 
         remaining = [username for username, _error in failed]
         preview = ", ".join(f"{username}={error}" for username, error in failed[:5])
         if attempt < config.setup.retry_attempts:
             print(
-                "Warm-up retry "
+                f"{stage} retry "
                 f"{attempt}/{config.setup.retry_attempts}: "
                 f"{len(failed)} users not ready yet ({preview})"
             )
@@ -400,7 +404,7 @@ async def warmup_users(config: SimulatorConfig, pool: Any) -> None:
 
     if failed:
         preview = ", ".join(f"{username}={error}" for username, error in failed[:5])
-        raise RuntimeError(f"Warm-up failed for {len(failed)} users: {preview}")
+        raise RuntimeError(f"{stage} failed for {len(failed)} users: {preview}")
 
 
 async def execute_request(
@@ -463,6 +467,9 @@ async def execute_request(
         "compute_pod_ip": result.compute_pod_ip,
         "timed_out": result.timed_out,
         "error": result.error,
+        "command_delivered": result.command_delivered,
+        "ssh_attempts": result.ssh_attempts,
+        "ssh_retry_ms": result.ssh_retry_ms,
     }
     add_output_tails(config, record, result, strip_output)
     summary.add(record)
@@ -478,6 +485,9 @@ def span_ms(start_ms: float | None, end_ms: float | None) -> float | None:
 def classify_result(result: Any) -> str:
     if result.timed_out:
         return "timeout"
+    if result.error and not result.command_delivered:
+        # The load generator failed to deliver the request; the server never saw it.
+        return "ssh_error"
     if result.error:
         return "error"
     if result.exit_status == 0:
