@@ -10,6 +10,7 @@ __pycache__/
 .codex
 .agents
 evaluation/data/
+evaluation/src/simulator/experiments/
 
 venv/
 env/
