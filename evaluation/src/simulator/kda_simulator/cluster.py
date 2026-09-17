@@ -56,10 +56,10 @@ def prepare_server(config: SimulatorConfig) -> dict[str, Any]:
                         f"{ANNOTATION_N}={n}",
                         "--overwrite",
                     )
-            _wait_for_pools(r, n)
+            wait_for_pools(r, n)
             settings = read_server_settings()
 
-    print(f"Server: {_describe(settings)}")
+    print(f"Server: {describe_settings(settings)}")
     return settings
 
 
@@ -111,7 +111,8 @@ def read_server_settings() -> dict[str, Any]:
     }
 
 
-def _wait_for_pools(r: int, n: int) -> None:
+def wait_for_pools(r: int, n: int) -> None:
+    """Wait until every pool holds the ready warm pods R/N asks for."""
     started = time.monotonic()
     while True:
         pending = [pool for pool in read_server_settings()["pools"] if not _settled(pool, r, n)]
@@ -140,7 +141,15 @@ def _settled(pool: dict[str, Any], r: int, n: int) -> bool:
     return pool["available"] == desired and pool["available_ready"] == desired
 
 
-def _describe(settings: dict[str, Any]) -> str:
+def wait_for_current_policy() -> None:
+    """Wait using the R/N already on the server, for callers that change neither."""
+    pools = read_server_settings()["pools"]
+    policies = {(pool["R"], pool["N"]) for pool in pools if None not in (pool["R"], pool["N"])}
+    for r, n in policies:
+        wait_for_pools(r, n)
+
+
+def describe_settings(settings: dict[str, Any]) -> str:
     pools = ", ".join(
         f"{pool['deployment']} R={pool['R']} N={pool['N']} ready={pool['available_ready']}"
         for pool in settings["pools"]
