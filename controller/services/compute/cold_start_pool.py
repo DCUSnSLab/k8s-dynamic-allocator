@@ -10,7 +10,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import yaml
 from kubernetes.client.rest import ApiException
@@ -21,6 +21,10 @@ from ..infra.kubernetes_client import KubernetesClient
 from .manifest_images import override_compute_agent_image
 
 logger = logging.getLogger(__name__)
+
+
+class AllocationClaimLost(RuntimeError):
+    """The ticket stopped owning the allocation while its pod was starting."""
 
 
 MANIFESTS_DIR = os.path.join(
@@ -112,13 +116,25 @@ class ColdStartComputePool(KubernetesClient):
                 raise RuntimeError(f"Cold-start compute pod already exists: {pod_name}") from exc
             raise
 
-    def wait_pod_ready(self, pod_name: str):
+    def wait_pod_ready(self, pod_name: str, keep_claim: Optional[Callable[[], bool]] = None):
+        """Wait for the pod to become Ready.
+
+        A slow image can take longer than the ticket's allocating TTL, and a
+        lapsed claim is requeued and gets a second pod. keep_claim renews the
+        claim on the way and returns False once the ticket no longer owns it.
+        """
         timeout = max(1.0, float(settings.COLD_START_POD_READY_TIMEOUT_SECONDS))
         poll = max(0.2, float(settings.COLD_START_POD_READY_POLL_SECONDS))
+        renew_interval = max(1.0, float(settings.WAIT_QUEUE_ALLOCATING_TTL_SECONDS) / 3.0)
         deadline = time.monotonic() + timeout
+        next_renew = time.monotonic() + renew_interval
         last_phase = ""
 
         while time.monotonic() < deadline:
+            if keep_claim is not None and time.monotonic() >= next_renew:
+                if not keep_claim():
+                    raise AllocationClaimLost(f"Ticket no longer owns the allocation while waiting for {pod_name}")
+                next_renew = time.monotonic() + renew_interval
             try:
                 pod = self.v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
             except ApiException as exc:
@@ -179,6 +195,7 @@ class ColdStartComputePool(KubernetesClient):
                     "assigned_user": labels.get(self.LABEL_USER, ""),
                     "ready": self._pod_is_ready(pod),
                     "not_ready_since": self._pod_not_ready_since(pod),
+                    "terminating": getattr(pod.metadata, "deletion_timestamp", None) is not None,
                     "ip": pod.status.pod_ip,
                 }
             )

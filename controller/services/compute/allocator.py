@@ -10,6 +10,7 @@ from config import settings
 from .. import ticket_format
 from ..queue import QueueUnavailableError
 from .agent_client import ComputeAgent, ComputeAgentError
+from .cold_start_pool import AllocationClaimLost
 from .warm_pod_pool import PodConflictError
 
 logger = logging.getLogger(__name__)
@@ -356,7 +357,10 @@ class ComputeAllocator:
 
         try:
             compute_pod = self.pool.create_pod_for_ticket(ticket)
-            ready_pod = self.pool.wait_pod_ready(compute_pod)
+            ready_pod = self.pool.wait_pod_ready(
+                compute_pod,
+                keep_claim=lambda: self.tickets.extend_allocation_deadline(ticket_id, claim_token),
+            )
             compute_pod_ip = getattr(ready_pod.status, "pod_ip", "") or self.pool.get_pod_ip(compute_pod) or ""
             if not compute_pod_ip:
                 raise RuntimeError("Compute IP unavailable after pod Ready")
@@ -382,6 +386,18 @@ class ComputeAllocator:
                 )
 
             return self._execute_allocated_ticket(committed)
+        except AllocationClaimLost:
+            # Whoever holds the ticket now (a cancel, or another worker after
+            # the claim lapsed) owns what happens next; only drop our pod.
+            try:
+                self.pool.release_pod(compute_pod)
+            except Exception:
+                pass
+            current = self.tickets.get_ticket(ticket_id)
+            return ticket_format.ticket_response(
+                current or ticket,
+                "Ticket no longer owns the allocation",
+            )
         except Exception as exc:
             return self._handle_cold_start_failure(
                 ticket=ticket,
