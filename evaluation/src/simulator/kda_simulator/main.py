@@ -244,6 +244,7 @@ async def run_simulation(
     trace_file: str | None = None,
     server_settings: dict[str, Any] | None = None,
 ) -> None:
+    from .pod_watch import PodRecorder
     from .ssh_runner import SSHSessionPool, strip_ansi
 
     summary = SummaryCollector()
@@ -253,6 +254,7 @@ async def run_simulation(
     background_attempted = False
     output_dir: Path | None = None
     writer: AsyncJsonlWriter | None = None
+    pod_recorder: PodRecorder | None = None
     setup_started_wall = now_iso()
     setup_completed_wall: str | None = None
     experiment_started_wall: str | None = None
@@ -289,6 +291,8 @@ async def run_simulation(
 
         writer = AsyncJsonlWriter(output_dir / "requests.jsonl", WRITER_QUEUE_SIZE)
         await writer.start()
+        pod_recorder = PodRecorder(output_dir / "pods.jsonl")
+        await pod_recorder.start()
 
         started_mono = time.monotonic()
         experiment_started_wall = now_iso()
@@ -329,13 +333,25 @@ async def run_simulation(
             await asyncio.gather(*pending, return_exceptions=True)
         if experiment_started_wall is not None:
             experiment_finished_wall = now_iso()
-        if background_attempted:
+
+        async def stop_background() -> None:
             from .background import stop_background_activity
 
             await stop_background_activity(config, pool)
-        await pool.close()
+
+        # Each step runs even if an earlier one failed, so a long run always
+        # leaves its records behind.
+        steps = [("pod recording", pod_recorder.stop)] if pod_recorder is not None else []
+        if background_attempted:
+            steps.append(("background activity", stop_background))
+        steps.append(("SSH sessions", pool.close))
         if writer is not None:
-            await writer.close()
+            steps.append(("request log", writer.close))
+        for name, step in steps:
+            try:
+                await step()
+            except Exception as exc:  # noqa: BLE001 - report and keep tearing down
+                print(f"Teardown step failed ({name}): {exc}")
 
     if output_dir is None:
         return
