@@ -236,9 +236,23 @@ kubectl annotate deployment/compute-general \
     "${pool_annotation_n}=${pool_total_max}" \
     -n "${namespace}" --overwrite
 
-kubectl set image deployment/compute-general \
-    compute-agent="${COMPUTE_POD_IMAGE}" \
-    -n "${namespace}"
+# The controller creates compute-general from its manifest only when it is
+# missing, so node placement and resources changed in the manifest later have
+# to be carried onto the live Deployment here. Same rollout as the image change.
+compute_manifest="${WORKSPACE}/controller/manifests/compute-general.yaml"
+compute_node_selector=$(kubectl create --dry-run=client -f "${compute_manifest}" \
+    -o jsonpath='{.spec.template.spec.nodeSelector}')
+compute_resources=$(kubectl create --dry-run=client -f "${compute_manifest}" \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="compute-agent")].resources}')
+if [ -z "${compute_node_selector}" ] || [ -z "${compute_resources}" ]; then
+    echo "[DeployFailed] ${compute_manifest} must set nodeSelector and compute-agent resources"
+    exit 1
+fi
+echo "[Deploy] Sync compute-general image, nodeSelector=${compute_node_selector} resources=${compute_resources}"
+# Image, placement and resources in one patch, so the Deployment rolls out once.
+kubectl patch deployment/compute-general -n "${namespace}" --type=strategic \
+    -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":${compute_node_selector},\"containers\":[{\"name\":\"compute-agent\",\"image\":\"${COMPUTE_POD_IMAGE}\",\"resources\":${compute_resources}}]}}}}"
+
 kubectl rollout status deployment/compute-general \
     -n "${namespace}" --timeout=5m
 
