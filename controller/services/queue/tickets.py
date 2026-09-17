@@ -19,6 +19,8 @@ except Exception:  # pragma: no cover - import fallback for local analysis
 
 logger = logging.getLogger(__name__)
 
+WAIT_ABANDONED_REASON = "Client stopped polling for the wait timeout"
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -59,9 +61,15 @@ class Tickets:
     TRANSIENT_STATES = ACTIVE_STATES | FINAL_STATES
 
     # HSET has no "only if the key exists" form, so guard it in one round trip.
+    # A waiting ticket's TTL is renewed too, so a long queue never expires the
+    # ticket of a client that is still polling; assigned tickets keep their own.
     TOUCH_POLL_SCRIPT = (
-        "if redis.call('EXISTS', KEYS[1]) == 1 then "
-        "redis.call('HSET', KEYS[1], ARGV[1], ARGV[2]); return 1 end; return 0"
+        "local status = redis.call('HGET', KEYS[1], 'status'); "
+        "if not status then return 0 end; "
+        "redis.call('HSET', KEYS[1], ARGV[1], ARGV[2]); "
+        "if status == 'queued' or status == 'allocating' then "
+        "redis.call('EXPIRE', KEYS[1], ARGV[3]) end; "
+        "return 1"
     )
 
     def __init__(self, queue):
@@ -83,7 +91,6 @@ class Tickets:
         for field in (
             "created_at",
             "updated_at",
-            "wait_deadline",
             "claimed_at",
             "allocation_deadline",
             "assigned_at",
@@ -117,7 +124,6 @@ class Tickets:
             "ticket_short": "",
             "ingress_ts_ms": "0",
             "last_poll_ms": "0",
-            "wait_deadline": "",
             "claimed_by": "",
             "claim_token": "",
             "claimed_at": "",
@@ -165,7 +171,6 @@ class Tickets:
             request_label=request_label,
             ticket_short=ticket_short,
             ingress_ts_ms=ingress_ts_ms or 0,
-            wait_deadline=(_utc_now() + timedelta(seconds=self.queue.wait_timeout_seconds)).isoformat(),
         )
         client = self.queue._redis_client()
         try:
@@ -293,6 +298,7 @@ class Tickets:
                 self.queue._ticket_key(ticket_id),
                 "last_poll_ms",
                 str(int(time.time() * 1000)),
+                str(self.queue.ticket_ttl_seconds),
             )
         except RedisError as exc:
             logger.warning(
@@ -449,6 +455,24 @@ class Tickets:
             },
         )
 
+    def extend_allocation_deadline(self, ticket_id: str, claim_token: str) -> bool:
+        """Keep an allocating claim alive while its compute pod is still starting.
+
+        Returns False once the claim is lost (cancelled, failed, or reclaimed by
+        another worker), so the caller can stop waiting and delete its pod.
+        """
+        ticket = self._ticket_transition(
+            ticket_id,
+            expected_statuses={"allocating"},
+            expected_claim_token=claim_token,
+            updates={
+                "allocation_deadline": (
+                    _utc_now() + timedelta(seconds=self.queue.allocating_ttl_seconds)
+                ).isoformat(),
+            },
+        )
+        return ticket is not None
+
     def requeue_ticket(
         self,
         ticket_id: str,
@@ -465,7 +489,7 @@ class Tickets:
         if status in self.FINAL_STATES:
             return ticket
         if self.queue.is_wait_timeout_expired(ticket):
-            return self.mark_failed(ticket_id, reason or "Queue wait timeout exceeded")
+            return self.mark_failed(ticket_id, reason or WAIT_ABANDONED_REASON)
 
         compute_type = self.queue.normalize_compute_type(ticket.get("compute_type"))
         retry_count = safe_int(ticket.get("retry_count"), 0)

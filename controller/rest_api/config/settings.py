@@ -144,6 +144,8 @@ COMPUTE_POD_IMAGE = _env_first(
     ('COMPUTE_POD_IMAGE',),
     'harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:latest',
 ).strip()
+# Counted from the client's last poll, not from enqueue: a polling client waits
+# as long as the queue takes, and a ticket silent this long is failed. 0 disables.
 WAIT_QUEUE_TIMEOUT_SECONDS = _env_int_any(('WAIT_QUEUE_TIMEOUT_SECONDS',), 1800)
 WAIT_QUEUE_LOCK_TTL_SECONDS = _env_int_any(
     ('WAIT_QUEUE_LOCK_TTL_SECONDS', 'ALLOCATOR_LOCK_TIMEOUT_SECONDS'),
@@ -153,6 +155,7 @@ WAIT_QUEUE_LOCK_RENEW_SECONDS = _env_int_any(
     ('WAIT_QUEUE_LOCK_RENEW_SECONDS',),
     20,
 )
+# Renewed on every poll while a ticket waits, so it only expires abandoned tickets.
 WAIT_QUEUE_TICKET_TTL_SECONDS = _env_int_any(
     ('WAIT_QUEUE_TICKET_TTL_SECONDS', 'WAIT_TICKET_TTL_SECONDS', 'TICKET_TTL_SECONDS'),
     7200,

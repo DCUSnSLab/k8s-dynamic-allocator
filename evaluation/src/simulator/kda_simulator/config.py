@@ -60,7 +60,11 @@ CONNECT_TIMEOUT_SECONDS = 30.0
 # A dead connection is otherwise noticed only when TCP gives up, minutes later.
 SSH_KEEPALIVE_INTERVAL_SECONDS = 15.0
 SSH_KEEPALIVE_COUNT_MAX = 3
-COMMAND_TIMEOUT_SECONDS = 1800.0
+# A request may wait in the queue for hours under overload; this is only a
+# backstop against a hung command, not a limit on queue wait.
+COMMAND_TIMEOUT_SECONDS = 86400.0
+# Setup commands never queue, so they keep a short limit.
+SETUP_COMMAND_TIMEOUT_SECONDS = 120.0
 WRITER_QUEUE_SIZE = 10000
 PTY_TERM_TYPE = "xterm"
 PTY_WIDTH = 120
