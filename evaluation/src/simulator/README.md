@@ -72,3 +72,13 @@ evaluation/data/<timestamp>_<experiment.name>/simulator/
 
 `requests.jsonl`에는 `request_id`, `ticket_id`, `compute_pod`,
 `duration_ms`, `schedule_lag_ms`, `status`, `error` 등이 저장된다.
+
+`status` 값:
+
+- `success` : 명령이 exit 0으로 끝남
+- `exit_nonzero` : 명령이 0이 아닌 exit code로 끝남
+- `timeout` : 명령 제한 시간 초과
+- `error` : `swlabssh`가 명령을 받은 뒤 실패
+- `ssh_error` : SSH 연결 문제로 `swlabssh`가 명령을 받지 못함(`command_delivered`가 false). 서버 쪽 실패가 아니므로 `ticket_missing`, `allocation_missing`에서 제외
+
+죽은 SSH 연결은 keepalive로 감지하고, 명령이 서버에 전달되기 전에 끊긴 요청은 새 연결로 한 번 다시 보낸다. 이때 `ssh_attempts`는 2가 되고, 앞 시도에서 잃은 시간은 `ssh_retry_ms`에 기록된다. `until_*_ms`는 마지막 시도부터 잰 값이다. 요청 스케줄 시작 직전에는 모든 사용자 연결을 한 번 더 확인한다.
