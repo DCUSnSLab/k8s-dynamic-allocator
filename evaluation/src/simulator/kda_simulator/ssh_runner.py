@@ -8,12 +8,12 @@ from dataclasses import dataclass
 import asyncssh
 
 from .config import (
-    COMMAND_TIMEOUT_SECONDS,
     CONNECT_TIMEOUT_SECONDS,
     MARKER_PREFIX,
     PTY_HEIGHT,
     PTY_TERM_TYPE,
     PTY_WIDTH,
+    SETUP_COMMAND_TIMEOUT_SECONDS,
     SSH_KEEPALIVE_COUNT_MAX,
     SSH_KEEPALIVE_INTERVAL_SECONDS,
     SimulatorConfig,
@@ -153,7 +153,7 @@ class SSHUserSession:
             )
 
     async def warmup(self) -> CommandResult:
-        return await self.run_remote("pwd", timeout=COMMAND_TIMEOUT_SECONDS)
+        return await self.run_remote("pwd", timeout=SETUP_COMMAND_TIMEOUT_SECONDS)
 
     async def run_remote(self, remote_command: str, timeout: float) -> CommandResult:
         lock_wait_started = time.monotonic()

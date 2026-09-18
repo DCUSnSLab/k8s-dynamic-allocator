@@ -53,6 +53,7 @@ TIMELINE_COLUMNS = [
     "message",
 ]
 
+SAFE_LOG_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+\.jsonl(\.gz)?$")
 KEY_VALUE_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\"[^\"]*\"|'[^']*'|[^\s]+)")
 EVENT_TAG_RE = re.compile(r"^\[(?P<tag>[^\]]+)\](?:\s+(?P<rest>.*))?$")
 LEVEL_PREFIX_RE = re.compile(r"^(?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL):\s*(?P<message>.*)$")
@@ -743,20 +744,63 @@ def delete_reader_pod(args: argparse.Namespace, pod_name: str) -> None:
 
 
 def copy_logs(args: argparse.Namespace, pod_name: str, raw_dir: Path) -> None:
+    """Stream each log file out of the reader pod.
+
+    `kubectl cp` reads a Windows destination such as `C:\\...` as `pod:path`,
+    and a tar of files Fluent Bit is still appending to comes out corrupt, so
+    each file is read up to the size it had when listed.
+    """
     raw_dir.mkdir(parents=True, exist_ok=True)
     for pattern in ("*.jsonl", "*.jsonl.gz"):
         for existing in raw_dir.glob(pattern):
             existing.unlink()
-    run_command(
-        [
-            args.kubectl,
-            "-n",
-            args.namespace,
-            "cp",
-            f"{pod_name}:/mnt/logs/.",
-            str(raw_dir),
+
+    exec_prefix = [args.kubectl, "-n", args.namespace, "exec", pod_name, "--"]
+    listing = run_capture(
+        exec_prefix
+        + [
+            "sh",
+            "-c",
+            'cd /mnt/logs && for f in *.jsonl *.jsonl.gz; do [ -f "$f" ] && stat -c "%s %n" "$f"; done; true',
         ]
     )
+    for line in listing.splitlines():
+        size_text, _, name = line.strip().partition(" ")
+        # Only flat JSONL names; anything else is not a log file we wrote.
+        if not size_text.isdigit() or not SAFE_LOG_NAME_RE.match(name):
+            continue
+        target = raw_dir / name
+        command = exec_prefix + ["head", "-c", size_text, f"/mnt/logs/{name}"]
+        print("+ " + " ".join(command))
+        with target.open("wb") as handle:
+            subprocess.run(command, check=True, stdout=handle)
+        if name.endswith(".jsonl"):
+            drop_partial_last_line(target)
+
+
+def run_capture(command: List[str]) -> str:
+    print("+ " + " ".join(command))
+    return subprocess.run(command, check=True, capture_output=True, text=True).stdout
+
+
+def drop_partial_last_line(path: Path) -> None:
+    """Cut a line Fluent Bit was still writing when the file was read."""
+    with path.open("rb+") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        if size == 0:
+            return
+        position = size
+        while position > 0:
+            step = min(65536, position)
+            position -= step
+            handle.seek(position)
+            chunk = handle.read(step)
+            newline = chunk.rfind(b"\n")
+            if newline != -1:
+                handle.truncate(position + newline + 1)
+                return
+        handle.truncate(0)
 
 
 def list_log_files(raw_dir: Path) -> List[Path]:

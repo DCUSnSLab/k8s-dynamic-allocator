@@ -22,6 +22,7 @@ except Exception:  # pragma: no cover - import fallback for local analysis
 from .tickets import (
     QueueUnavailableError,
     Tickets,
+    WAIT_ABANDONED_REASON,
     _iso_now,
     _utc_now,
     parse_datetime,
@@ -717,31 +718,40 @@ class ComputeQueues:
         return False
 
     def is_wait_timeout_expired(self, ticket: Dict[str, object]) -> bool:
-        wait_deadline = ticket.get("wait_deadline")
-        if isinstance(wait_deadline, datetime):
-            return wait_deadline <= _utc_now()
-        return False
+        """True when the waiting client has been silent for the whole wait timeout.
+
+        The timeout counts from the last poll, not from enqueue, so a client
+        that keeps polling waits as long as the queue takes. It only reclaims
+        tickets whose client went away without cancelling.
+        """
+        timeout_seconds = self.wait_timeout_seconds
+        if timeout_seconds <= 0:
+            return False
+        silent_seconds = self._client_silent_seconds(ticket)
+        return silent_seconds is not None and silent_seconds > timeout_seconds
 
     def is_client_disconnected(self, ticket: Dict[str, object]) -> bool:
-        """True when a queued client has stopped polling for its ticket.
+        """True when a queued client has stopped polling for its ticket."""
+        timeout_seconds = self.client_timeout_seconds
+        if timeout_seconds <= 0:
+            return False
+        silent_seconds = self._client_silent_seconds(ticket)
+        return silent_seconds is not None and silent_seconds > timeout_seconds
+
+    @staticmethod
+    def _client_silent_seconds(ticket: Dict[str, object]) -> Optional[float]:
+        """Seconds since the client last polled.
 
         Clients poll about once a second while waiting; tickets predating the
         field fall back to their creation time.
         """
-        timeout_seconds = self.client_timeout_seconds
-        if timeout_seconds <= 0:
-            return False
-
         last_poll_ms = safe_int(ticket.get("last_poll_ms"), 0)
-        if last_poll_ms <= 0:
-            created_at = ticket.get("created_at")
-            if not isinstance(created_at, datetime):
-                return False
-            silent_seconds = (_utc_now() - created_at).total_seconds()
-        else:
-            silent_seconds = (time.time() * 1000 - last_poll_ms) / 1000.0
-
-        return silent_seconds > timeout_seconds
+        if last_poll_ms > 0:
+            return (time.time() * 1000 - last_poll_ms) / 1000.0
+        created_at = ticket.get("created_at")
+        if not isinstance(created_at, datetime):
+            return None
+        return (_utc_now() - created_at).total_seconds()
 
     def find_stale_allocating_tickets(self, compute_type: Optional[str] = None) -> List[Dict[str, object]]:
         types = [self.normalize_compute_type(compute_type)] if compute_type else self.known_compute_types()
@@ -777,11 +787,12 @@ class ComputeQueues:
             if status != "queued":
                 continue
             if self.is_wait_timeout_expired(ticket):
-                self.tickets.mark_failed(ticket_id, "Queue wait timeout exceeded")
+                self.tickets.mark_failed(ticket_id, WAIT_ABANDONED_REASON)
                 continue
             if self.is_client_disconnected(ticket):
                 # Left in the queue on purpose: a client that reconnects keeps
-                # its place, and one that never does expires on wait_deadline.
+                # its place, and one that stays silent for the wait timeout is
+                # failed above.
                 logger.debug(
                     "[QueueSkipped] ticket_id=%s reason=%r",
                     ticket_id,
