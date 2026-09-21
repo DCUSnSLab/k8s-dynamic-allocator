@@ -13,12 +13,14 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
 import yaml
+from kubernetes import client
 from kubernetes.client.rest import ApiException
 
 from config import settings
 
 from ..infra.kubernetes_client import KubernetesClient
 from .manifest_images import override_compute_agent_image
+from .warm_pod_pool import POOL_TOTAL_MAX_ANNOTATION
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +52,14 @@ class ColdStartComputePool(KubernetesClient):
     STATUS_AVAILABLE = "available"
     STATUS_ASSIGNED = "assigned"
 
+    # Cold start has no R -- nothing is created ahead of a request -- but N is
+    # read from the same Deployment annotation the warm buffer uses, so both
+    # allocation modes run under one capacity and one source of truth.
+    ANNOTATION_POOL_TOTAL_MAX = POOL_TOTAL_MAX_ANNOTATION
+
     def __init__(self):
         super().__init__()
+        self.apps_v1 = client.AppsV1Api()
         self._templates_by_type: Dict[str, Dict] = {}
 
     def initialize_pool(self, *, log_existing: bool = True) -> Dict:
@@ -200,6 +208,82 @@ class ColdStartComputePool(KubernetesClient):
                 }
             )
         return status_list
+
+    def read_capacity(self, compute_type: Optional[str] = None) -> Optional[int]:
+        """N for this compute type, or None when no Deployment declares one.
+
+        None means "no cap", which is how the run behaves if the annotation is
+        missing; a capped run is the comparable one, so the caller logs it.
+        """
+        deployments = self.apps_v1.list_namespaced_deployment(
+            namespace=self.namespace,
+            label_selector=self._compute_selector(compute_type=compute_type),
+            _request_timeout=self.api_request_timeout,
+        )
+        values = []
+        for deployment in deployments.items:
+            raw = (getattr(deployment.metadata, "annotations", None) or {}).get(
+                self.ANNOTATION_POOL_TOTAL_MAX
+            )
+            if raw is None:
+                continue
+            try:
+                values.append(int(str(raw).strip()))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "[Warning] operation=cold_start_capacity deployment=%s reason=%r",
+                    deployment.metadata.name,
+                    f"{self.ANNOTATION_POOL_TOTAL_MAX} is not an integer: {raw!r}",
+                )
+        if not values:
+            return None
+        # One Deployment per compute type is the rule; the lowest value is the
+        # safe reading if a migration ever leaves two behind.
+        return max(0, min(values))
+
+    def count_active_pods(self, compute_type: Optional[str] = None) -> int:
+        """Pods that still hold capacity. Terminating ones are already giving it back."""
+        return sum(
+            1
+            for pod in self.list_pool_status(compute_type=compute_type)
+            if not pod["terminating"]
+        )
+
+    def drain_warm_deployments(self) -> int:
+        """Scale the warm Deployments to zero and report how many were scaled.
+
+        Cold start never allocates those Pods, but nothing else scales them down
+        in this mode: the capacity reconciler only runs for the warm buffer. Left
+        alone they keep holding CPU and memory that then shows up in this run's
+        occupancy numbers.
+        """
+        scaled = 0
+        deployments = self.apps_v1.list_namespaced_deployment(
+            namespace=self.namespace,
+            label_selector=f"{self.LABEL_APP}={self.APP_WARM_POOL}",
+            _request_timeout=self.api_request_timeout,
+        )
+        for deployment in deployments.items:
+            name = deployment.metadata.name
+            if (getattr(deployment.spec, "replicas", 0) or 0) == 0:
+                continue
+            try:
+                self.apps_v1.patch_namespaced_deployment_scale(
+                    name=name,
+                    namespace=self.namespace,
+                    body={"spec": {"replicas": 0}},
+                    _request_timeout=self.api_request_timeout,
+                )
+            except ApiException as exc:
+                logger.warning(
+                    "[Warning] operation=cold_start_drain_warm deployment=%s reason=%r",
+                    name,
+                    str(exc),
+                )
+                continue
+            scaled += 1
+            logger.info("[Drained] deployment=%s replicas=0 reason=cold_start_mode", name)
+        return scaled
 
     def _template_for_compute_type(self, compute_type: str) -> Dict:
         if compute_type not in self._templates_by_type:

@@ -253,7 +253,12 @@ class ComputeAllocator:
             if not self.queues.has_queued_tickets(compute_type_value):
                 return result
 
-            for _ in range(effective_batch):
+            claim_limit = self._cold_start_claim_limit(
+                compute_type_value,
+                effective_batch,
+                result,
+            )
+            for _ in range(claim_limit):
                 ticket = self.queues.claim_next_ticket(
                     compute_type_value,
                     worker_id=self.queues.worker_identity,
@@ -277,6 +282,38 @@ class ComputeAllocator:
         if not claimed_tickets:
             result["queued"] += 1
         return result
+
+    def _cold_start_claim_limit(
+        self,
+        compute_type: str,
+        effective_batch: int,
+        result: Dict,
+    ) -> int:
+        """How many tickets may be claimed now without going over N.
+
+        Tickets over the cap stay queued and keep their position, the same way
+        the warm buffer holds them, so both allocation modes face one capacity
+        and their wait times can be compared.
+        """
+        try:
+            capacity = self.pool.read_capacity(compute_type)
+            if capacity is None:
+                return effective_batch
+            active = self.pool.count_active_pods(compute_type)
+        except Exception as exc:
+            # Reading capacity is a Kubernetes call; a blip must not stall the
+            # queue, and the per-ticket create still fails safely on its own.
+            logger.warning(
+                "[Warning] operation=cold_start_capacity_check compute_type=%s reason=%r",
+                compute_type,
+                str(exc),
+            )
+            return effective_batch
+
+        remaining = max(0, capacity - active)
+        if remaining == 0:
+            result["capacity_blocked"] = "capacity"
+        return min(effective_batch, remaining)
 
     def _compute_wait_queue_batch_plan(self) -> Tuple[int, int]:
         """Return (effective_batch, mount_concurrency) clamped against TTL."""

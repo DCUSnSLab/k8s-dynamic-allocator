@@ -20,6 +20,13 @@ from config import settings
 from ..infra.kubernetes_client import KubernetesClient
 from .manifest_images import override_compute_agent_image
 
+# The pool policy lives on the compute Deployment and is read by both allocation
+# modes -- the warm buffer keeps R Pods available under a total of N, and cold
+# start creates Pods on demand under the same N. Defined once so the two cannot
+# drift apart.
+POOL_AVAILABLE_MIN_ANNOTATION = "k8s-dynamic-allocator/pool-available-min"
+POOL_TOTAL_MAX_ANNOTATION = "k8s-dynamic-allocator/pool-total-max"
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,8 +58,8 @@ class WarmPodPool(KubernetesClient):
     STATUS_AVAILABLE = "available"
     STATUS_ASSIGNED = "assigned"
 
-    ANNOTATION_POOL_AVAILABLE_MIN = "k8s-dynamic-allocator/pool-available-min"
-    ANNOTATION_POOL_TOTAL_MAX = "k8s-dynamic-allocator/pool-total-max"
+    ANNOTATION_POOL_AVAILABLE_MIN = POOL_AVAILABLE_MIN_ANNOTATION
+    ANNOTATION_POOL_TOTAL_MAX = POOL_TOTAL_MAX_ANNOTATION
     ANNOTATION_ALLOCATION_TICKET = "k8s-dynamic-allocator/allocation-ticket-id"
     ANNOTATION_ALLOCATION_CLAIM = "k8s-dynamic-allocator/allocation-claim-token"
 

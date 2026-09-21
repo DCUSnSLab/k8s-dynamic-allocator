@@ -22,6 +22,10 @@ from .status import ControllerStatus
 
 logger = logging.getLogger(__name__)
 
+# How often the cold-start cleanup worker checks whether it should stop while
+# waiting for its next sweep.
+CLEANUP_STOP_POLL_SECONDS = 1.0
+
 
 class Orchestrator:
     def __init__(self):
@@ -89,6 +93,10 @@ class Orchestrator:
         self.leader_elector = None
         self.queue_worker_thread: Optional[threading.Thread] = None
         self.queue_worker_stop_event = threading.Event()
+        # Cold start has no capacity reconciler to carry the periodic sweep, so
+        # the leader runs it on a thread of its own.
+        self.cleanup_thread: Optional[threading.Thread] = None
+        self.cleanup_stop_event = threading.Event()
         self.startup_completed = False
         self._initial_pool_result: Optional[Dict] = None
 
@@ -97,6 +105,14 @@ class Orchestrator:
 
     def initialize_pool(self) -> Dict:
         result = self.pool.initialize_pool()
+        if self.capacity_reconciler is None and hasattr(self.pool, "drain_warm_deployments"):
+            # Warm Deployments are never allocated from in cold-start mode and
+            # nothing else scales them down here, so their Pods would keep
+            # holding resources that land in this run's occupancy numbers.
+            try:
+                result["warm_deployments_drained"] = self.pool.drain_warm_deployments()
+            except Exception as exc:
+                logger.warning("[Warning] operation=drain_warm_deployments reason=%r", str(exc))
         self.compute_manager.refresh_compute_types(force=True)
         return result
 
@@ -129,6 +145,9 @@ class Orchestrator:
         self.queue_worker_stop_event.set()
         if self.queue_worker_thread and self.queue_worker_thread.is_alive():
             self.queue_worker_thread.join(timeout=5)
+        self.cleanup_stop_event.set()
+        if self.cleanup_thread and self.cleanup_thread.is_alive():
+            self.cleanup_thread.join(timeout=5)
 
     def _queue_worker_loop(self) -> None:
         while not self.queue_worker_stop_event.wait(settings.WAIT_QUEUE_WORKER_INTERVAL_SECONDS):
@@ -153,9 +172,57 @@ class Orchestrator:
         self.queue_worker_thread.start()
         logger.info("Queue worker started")
 
+    def _sleep_until_cleanup_due(self, interval: int) -> bool:
+        """Wait out one interval. False once the worker has been told to stop.
+
+        Waiting in short steps rather than one long one keeps a leadership
+        change from being held up by a sweep that is not due yet.
+        """
+        remaining = float(interval)
+        while remaining > 0:
+            step = min(CLEANUP_STOP_POLL_SECONDS, remaining)
+            if self.cleanup_stop_event.wait(step):
+                return False
+            remaining -= step
+        return True
+
+    def _cleanup_loop(self) -> None:
+        interval = max(1, int(settings.POOL_RECONCILE_RESYNC_SECONDS))
+        while self._sleep_until_cleanup_due(interval):
+            set_request_label("-")
+            try:
+                self.cleanup.check_stale_allocations()
+            except Exception as exc:
+                logger.exception("[Failed] operation=periodic_cleanup reason=%r", str(exc))
+            finally:
+                set_request_label("-")
+        logger.info("Cleanup worker stopped")
+
+    def _start_cleanup_worker(self) -> None:
+        if self.cleanup_thread and self.cleanup_thread.is_alive():
+            # A thread from a previous term may still be winding down. Let it
+            # finish first, or this term would be left with no sweep at all.
+            self.cleanup_stop_event.set()
+            self.cleanup_thread.join(timeout=CLEANUP_STOP_POLL_SECONDS * 3)
+            if self.cleanup_thread.is_alive():
+                logger.warning("[Warning] operation=cleanup_worker_restart reason='previous thread still running'")
+                return
+        self.cleanup_stop_event.clear()
+        self.cleanup_thread = threading.Thread(
+            target=self._cleanup_loop,
+            name="cleanup-worker",
+            daemon=True,
+        )
+        self.cleanup_thread.start()
+        logger.info("Cleanup worker started")
+
     def _start_leader_services(self) -> None:
         if self.capacity_reconciler:
             self.capacity_reconciler.start()
+        else:
+            # The reconciler carries the sweep for the warm buffer; without it
+            # a Compute Pod whose client died would never be reclaimed.
+            self._start_cleanup_worker()
         if self.deployment_watcher:
             self.deployment_watcher.start()
         self.compute_watcher.start()
@@ -166,6 +233,8 @@ class Orchestrator:
         self.compute_watcher.stop()
         if self.capacity_reconciler:
             self.capacity_reconciler.stop()
+        else:
+            self.cleanup_stop_event.set()
 
     def execute_command(
         self,
