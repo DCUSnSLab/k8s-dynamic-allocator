@@ -49,7 +49,7 @@ def prepare_server(config: SimulatorConfig) -> dict[str, Any]:
             for pool in settings["pools"]:
                 if (pool["R"], pool["N"]) != (r, n):
                     print(f"Pool policy {pool['deployment']}: R={pool['R']} N={pool['N']} -> R={r} N={n}")
-                    _kubectl(
+                    run_kubectl(
                         "annotate",
                         f"deployment/{pool['deployment']}",
                         f"{ANNOTATION_R}={r}",
@@ -160,8 +160,19 @@ def describe_settings(settings: dict[str, Any]) -> str:
     )
 
 
-def _kubectl(*args: str) -> str:
+def run_kubectl(
+    *args: str,
+    timeout: float = KUBECTL_TIMEOUT_SECONDS,
+    allow_missing: bool = False,
+) -> str:
+    """Run kubectl in the experiment namespace and return stdout.
+
+    allow_missing swallows the "no matching resources" failure that commands
+    like `wait --for=delete` report when the thing is already gone, which is
+    the outcome the caller wanted.
+    """
     command = ["kubectl", "--namespace", KUBERNETES_NAMESPACE, *args]
+    label = " ".join(args[:2])
     try:
         result = subprocess.run(
             command,
@@ -169,17 +180,19 @@ def _kubectl(*args: str) -> str:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=KUBECTL_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ServerSettingsError(f"kubectl {args[0]} failed: {exc}") from exc
+        raise ServerSettingsError(f"kubectl {label} failed: {exc}") from exc
     if result.returncode != 0:
-        raise ServerSettingsError(f"kubectl {args[0]} failed: {result.stderr.strip()}")
+        if allow_missing and "no matching resources" in result.stderr.lower():
+            return ""
+        raise ServerSettingsError(f"kubectl {label} failed: {result.stderr.strip()}")
     return result.stdout
 
 
 def _kubectl_json(*args: str) -> dict[str, Any]:
-    return json.loads(_kubectl(*args, "-o", "json"))
+    return json.loads(run_kubectl(*args, "-o", "json"))
 
 
 def _labels(pod: dict[str, Any]) -> dict[str, str]:

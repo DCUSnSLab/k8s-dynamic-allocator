@@ -17,12 +17,18 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
-import math
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
+
+# The simulator already defines how a percentile is computed, and summary.json
+# is written with it. Reusing it here keeps the two files from reporting
+# slightly different p95s for the same run.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "simulator"))
+from kda_simulator.metrics import summarize_values  # noqa: E402
 
 GIB = 2**30
 CONTROLLER_EVENT_RE = re.compile(r"\] \[(?P<label>[^\]]+)\] \[(?P<event>Request|Assigned)\] (?P<rest>.*)")
@@ -129,8 +135,8 @@ def request_metrics(requests: list[dict[str, Any]]) -> dict[str, Any]:
         "status": statuses,
         # ssh_error never reached the server, so it is not a server failure.
         "server_failures": sum(n for s, n in statuses.items() if s not in ("success", "ssh_error")),
-        "start_delay_s": _stats(r["until_start_ms"] / 1000.0 for r in success if r.get("until_start_ms") is not None),
-        "command_s": _stats(r["command_ms"] / 1000.0 for r in success if r.get("command_ms") is not None),
+        "start_delay_s": summarize_values([r["until_start_ms"] / 1000.0 for r in success if r.get("until_start_ms") is not None]),
+        "command_s": summarize_values([r["command_ms"] / 1000.0 for r in success if r.get("command_ms") is not None]),
         "ssh_retried": sum(1 for r in requests if (r.get("ssh_attempts") or 1) > 1),
     }
 
@@ -141,10 +147,10 @@ def assignment_metrics(items: list[dict[str, float]]) -> dict[str, Any]:
         "assigned": len(items),
         # Requests that found no warm pod and waited for one.
         "compute_wait_ratio": (len(waited) / len(items)) if items else None,
-        "compute_wait_s": _stats(ms / 1000.0 for ms in waited),
-        "queue_wait_s": _stats(item["queue_wait_ms"] / 1000.0 for item in items if "queue_wait_ms" in item),
-        "total_assignment_s": _stats(
-            item["total_assignment_ms"] / 1000.0 for item in items if "total_assignment_ms" in item
+        "compute_wait_s": summarize_values([ms / 1000.0 for ms in waited]),
+        "queue_wait_s": summarize_values([item["queue_wait_ms"] / 1000.0 for item in items if "queue_wait_ms" in item]),
+        "total_assignment_s": summarize_values(
+            [item["total_assignment_ms"] / 1000.0 for item in items if "total_assignment_ms" in item]
         ),
     }
 
@@ -305,26 +311,6 @@ def _end(pod: PodLife, window: tuple[datetime, datetime]) -> datetime:
 
 def _overlap(start: datetime, end: datetime, window: tuple[datetime, datetime]) -> float:
     return max(0.0, _seconds(max(start, window[0]), min(end, window[1])))
-
-
-def _stats(values: Iterable[float]) -> dict[str, float | int | None]:
-    ordered = sorted(values)
-    if not ordered:
-        return {"count": 0, "mean": None, "p50": None, "p95": None, "p99": None, "max": None}
-    return {
-        "count": len(ordered),
-        "mean": sum(ordered) / len(ordered),
-        "p50": _percentile(ordered, 0.50),
-        "p95": _percentile(ordered, 0.95),
-        "p99": _percentile(ordered, 0.99),
-        "max": ordered[-1],
-    }
-
-
-def _percentile(ordered: list[float], p: float) -> float:
-    position = (len(ordered) - 1) * p
-    lower, upper = math.floor(position), math.ceil(position)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
 def _fmt(stats: dict[str, Any]) -> str:

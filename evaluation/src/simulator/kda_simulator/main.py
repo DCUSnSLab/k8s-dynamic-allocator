@@ -6,6 +6,7 @@ import json
 import random
 import time
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -23,7 +24,7 @@ from .config import (
     validate_config,
 )
 from .metrics import AsyncJsonlWriter, SummaryCollector
-from .scheduler import ScheduledRequest, generate_schedule, iter_schedule
+from .scheduler import ScheduledRequest, iter_schedule
 from .trace import (
     TraceEntry,
     generate_trace_entries,
@@ -81,8 +82,16 @@ async def main() -> None:
             plans = [build_request_plan_from_trace(config, item) for item in entries[:preview_limit]]
             print_dry_run(config, plans, trace_file=trace_file, total_trace_requests=len(entries))
         else:
-            schedule = generate_schedule(config, rng, limit=preview_limit)
-            plans = [build_request_plan(config, item, selector) for item in schedule]
+            # Same generator as the real run: it draws the command for each
+            # request before scheduling the next one, so building the whole
+            # schedule first would consume the seeded rng in a different order
+            # and preview a schedule that never runs.
+            plans = list(
+                islice(
+                    iter_request_plans(config, iter_schedule(config, rng), selector),
+                    preview_limit,
+                )
+            )
             print_dry_run(config, plans)
         return
 

@@ -132,9 +132,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_command(args: List[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_command(
+    args: List[str], *, check: bool = True, capture: bool = False
+) -> subprocess.CompletedProcess[str]:
     print("+ " + " ".join(args))
-    return subprocess.run(args, check=check, text=True)
+    return subprocess.run(args, check=check, text=True, capture_output=capture)
 
 
 def iter_input_paths(inputs: Iterable[str]) -> List[Path]:
@@ -190,12 +192,6 @@ def parse_datetime_value(value: object) -> Optional[datetime]:
 def normalize_fractional_seconds(value: str) -> str:
     """Trim nanosecond log timestamps to Python datetime microsecond precision."""
     return re.sub(r"(\.\d{6})\d+(?=Z|[+-]\d{2}:?\d{2}$|$)", r"\1", value)
-
-
-def floor_time(dt: datetime, bucket_seconds: int) -> datetime:
-    epoch = int(dt.timestamp())
-    bucket = epoch - (epoch % bucket_seconds)
-    return datetime.fromtimestamp(bucket, timezone.utc)
 
 
 def format_time(dt: datetime) -> str:
@@ -756,14 +752,15 @@ def copy_logs(args: argparse.Namespace, pod_name: str, raw_dir: Path) -> None:
             existing.unlink()
 
     exec_prefix = [args.kubectl, "-n", args.namespace, "exec", pod_name, "--"]
-    listing = run_capture(
+    listing = run_command(
         exec_prefix
         + [
             "sh",
             "-c",
             'cd /mnt/logs && for f in *.jsonl *.jsonl.gz; do [ -f "$f" ] && stat -c "%s %n" "$f"; done; true',
-        ]
-    )
+        ],
+        capture=True,
+    ).stdout
     for line in listing.splitlines():
         size_text, _, name = line.strip().partition(" ")
         # Only flat JSONL names; anything else is not a log file we wrote.
@@ -776,11 +773,6 @@ def copy_logs(args: argparse.Namespace, pod_name: str, raw_dir: Path) -> None:
             subprocess.run(command, check=True, stdout=handle)
         if name.endswith(".jsonl"):
             drop_partial_last_line(target)
-
-
-def run_capture(command: List[str]) -> str:
-    print("+ " + " ".join(command))
-    return subprocess.run(command, check=True, capture_output=True, text=True).stdout
 
 
 def drop_partial_last_line(path: Path) -> None:
