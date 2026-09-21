@@ -15,17 +15,6 @@ class ScheduledRequest:
     username: str
 
 
-def generate_schedule(
-    config: SimulatorConfig, rng: random.Random, limit: int | None = None
-) -> list[ScheduledRequest]:
-    events: list[ScheduledRequest] = []
-    for event in iter_schedule(config, rng):
-        events.append(event)
-        if limit is not None and len(events) >= limit:
-            break
-    return events
-
-
 def iter_schedule(config: SimulatorConfig, rng: random.Random) -> Iterator[ScheduledRequest]:
     if config.workload.mode == "constant":
         yield from _iter_constant_schedule(config, rng)
