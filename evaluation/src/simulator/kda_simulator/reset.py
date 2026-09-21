@@ -8,11 +8,15 @@ so nothing writes old state back, then everything is restarted.
 
 from __future__ import annotations
 
-import subprocess
 import time
 
-from .cluster import describe_settings, read_server_settings, wait_for_current_policy
-from .config import KUBERNETES_NAMESPACE
+from .cluster import (
+    ServerSettingsError,
+    describe_settings,
+    read_server_settings,
+    run_kubectl,
+    wait_for_current_policy,
+)
 
 REDIS_KEY_PATTERN = "kda:*"
 ROLLOUT_TIMEOUT = "5m"
@@ -106,21 +110,13 @@ def _step(message: str) -> None:
 
 
 def _kubectl(*args: str, allow_missing: bool = False) -> str:
-    command = ["kubectl", "--namespace", KUBERNETES_NAMESPACE, *args]
+    # Rollouts and pod deletions take far longer than a settings read, so this
+    # reuses the shared runner with a longer deadline and reports as a reset.
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+        return run_kubectl(
+            *args,
             timeout=COMMAND_TIMEOUT_SECONDS,
+            allow_missing=allow_missing,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ResetError(f"kubectl {' '.join(args[:2])} failed: {exc}") from exc
-    if result.returncode != 0:
-        # `kubectl wait --for=delete` fails when nothing matches, which is the goal.
-        if allow_missing and "no matching resources" in result.stderr.lower():
-            return ""
-        raise ResetError(f"kubectl {' '.join(args[:2])} failed: {result.stderr.strip()}")
-    return result.stdout
+    except ServerSettingsError as exc:
+        raise ResetError(str(exc)) from exc
