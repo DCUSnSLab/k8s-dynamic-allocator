@@ -28,6 +28,7 @@ from typing import Any, Iterable
 # is written with it. Reusing it here keeps the two files from reporting
 # slightly different p95s for the same run.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "simulator"))
+from kda_simulator.config import SUMMARY_SCHEMA_VERSION  # noqa: E402
 from kda_simulator.metrics import summarize_values  # noqa: E402
 
 GIB = 2**30
@@ -59,6 +60,7 @@ def main() -> int:
     run_dir = Path(args.run_dir).resolve()
     simulator_dir = run_dir / "simulator"
     summary = json.loads((simulator_dir / "summary.json").read_text(encoding="utf-8"))
+    _require_supported_schema(summary, run_dir)
     window = (_parse_time(summary["experiment_started_at"]), _parse_time(summary["experiment_finished_at"]))
     users = int(summary["users"]["count"])
     requests = _read_jsonl(simulator_dir / "requests.jsonl")
@@ -77,9 +79,9 @@ def main() -> int:
         "window": {"start": window[0].isoformat(), "end": window[1].isoformat(),
                    "minutes": _seconds(*window) / 60.0},
         "users": users,
-        "server_pools": [
+        "server_buffers": [
             {"deployment": p.get("deployment"), "R": p.get("R"), "N": p.get("N")}
-            for p in (summary.get("server") or {}).get("pools") or []
+            for p in (summary.get("server") or {}).get("buffers") or []
         ],
         "sources": {"pods": pods is not None, "controller_logs": assignments is not None},
         "overall": window_metrics(window, requests, pods, assignments, users, summary),
@@ -101,6 +103,24 @@ def main() -> int:
     print_report(metrics)
     print(f"\nmetrics: {out_path}")
     return 0
+
+
+def _require_supported_schema(summary: dict[str, Any], run_dir: Path) -> None:
+    """Stop rather than misread a run written before the fields were renamed.
+
+    Without this the missing keys read as "no data" and the report comes out
+    full of zeros that look like a result.
+    """
+    found = summary.get("schema_version")
+    if found == SUMMARY_SCHEMA_VERSION:
+        return
+    raise SystemExit(
+        f"{run_dir.name} was written by an older simulator "
+        f"(schema_version={found!r}, this tool expects {SUMMARY_SCHEMA_VERSION})." + "\n"
+        "Its field names differ, so these metrics would be wrong. "
+        "Read it with the tool from the commit that produced it, for example:" + "\n"
+        "  git show b1380a4:evaluation/src/log_analysis/experiment_metrics.py > old_metrics.py"
+    )
 
 
 def window_metrics(
@@ -135,22 +155,22 @@ def request_metrics(requests: list[dict[str, Any]]) -> dict[str, Any]:
         "status": statuses,
         # ssh_error never reached the server, so it is not a server failure.
         "server_failures": sum(n for s, n in statuses.items() if s not in ("success", "ssh_error")),
-        "start_delay_s": summarize_values([r["until_start_ms"] / 1000.0 for r in success if r.get("until_start_ms") is not None]),
-        "command_s": summarize_values([r["command_ms"] / 1000.0 for r in success if r.get("command_ms") is not None]),
+        "start_delay_s": summarize_values([r["since_send_to_start_ms"] / 1000.0 for r in success if r.get("since_send_to_start_ms") is not None]),
+        "command_s": summarize_values([r["command_duration_ms"] / 1000.0 for r in success if r.get("command_duration_ms") is not None]),
         "ssh_retried": sum(1 for r in requests if (r.get("ssh_attempts") or 1) > 1),
     }
 
 
 def assignment_metrics(items: list[dict[str, float]]) -> dict[str, Any]:
-    waited = [item["compute_wait_ms"] for item in items if item.get("compute_wait_ms", 0) > 0]
+    waited = [item["since_request_to_compute_ready_ms"] for item in items if item.get("since_request_to_compute_ready_ms", 0) > 0]
     return {
         "assigned": len(items),
         # Requests that found no warm pod and waited for one.
         "compute_wait_ratio": (len(waited) / len(items)) if items else None,
         "compute_wait_s": summarize_values([ms / 1000.0 for ms in waited]),
-        "queue_wait_s": summarize_values([item["queue_wait_ms"] / 1000.0 for item in items if "queue_wait_ms" in item]),
+        "queue_wait_s": summarize_values([item["since_request_to_claim_ms"] / 1000.0 for item in items if "since_request_to_claim_ms" in item]),
         "total_assignment_s": summarize_values(
-            [item["total_assignment_ms"] / 1000.0 for item in items if "total_assignment_ms" in item]
+            [item["since_request_to_assigned_ms"] / 1000.0 for item in items if "since_request_to_assigned_ms" in item]
         ),
     }
 
@@ -201,7 +221,7 @@ def build_pod_lives(records: Iterable[dict[str, Any]], run_end: datetime) -> lis
             lives[pod["uid"]] = life
         if pod.get("ready") and life.ready_at is None:
             life.ready_at = at
-        if pod.get("pool_status") == "assigned" and life.assigned_at is None:
+        if pod.get("compute_status") == "assigned" and life.assigned_at is None:
             life.assigned_at = at
         if pod.get("deleting") and life.deleting_at is None:
             life.deleting_at = at
@@ -265,7 +285,7 @@ def print_report(metrics: dict[str, Any]) -> None:
     overall = metrics["overall"]
     req = overall["requests"]
     print(f"run {metrics['run']}  {metrics['window']['minutes']:.1f} min  users={metrics['users']}  "
-          f"pools={metrics['server_pools']}")
+          f"buffers={metrics['server_buffers']}")
     print(f"requests {req['count']}  status={req['status']}  server_failures={req['server_failures']}")
     print(f"start delay s  {_fmt(req['start_delay_s'])}")
     if "controller" in overall:

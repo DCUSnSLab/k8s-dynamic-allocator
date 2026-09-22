@@ -47,7 +47,7 @@ NHPP_DAILY_PROFILE = [
 # Internal simulator behavior. These are intentionally not YAML fields.
 RUN_COMMAND = "run"
 EXECUTION_MODE_KDA = "kda"
-EXECUTION_MODE_BASELINE_DIRECT = "baseline-direct"
+EXECUTION_MODE_BASELINE_DIRECT = "baseline_direct"
 EXECUTION_MODES = {EXECUTION_MODE_KDA, EXECUTION_MODE_BASELINE_DIRECT}
 MARKER_PREFIX = "KDA_SIM"
 KUBERNETES_NAMESPACE = "kda-test"
@@ -62,6 +62,11 @@ SSH_KEEPALIVE_INTERVAL_SECONDS = 15.0
 SSH_KEEPALIVE_COUNT_MAX = 3
 # A request may wait in the queue for hours under overload; this is only a
 # backstop against a hung command, not a limit on queue wait.
+# Version of the layout written to summary.json and requests.jsonl. Raise it
+# whenever a field is renamed or removed so older runs are rejected loudly
+# instead of being parsed into zeros.
+SUMMARY_SCHEMA_VERSION = 2
+
 COMMAND_TIMEOUT_SECONDS = 86400.0
 # Setup commands never queue, so they keep a short limit.
 SETUP_COMMAND_TIMEOUT_SECONDS = 120.0
@@ -74,9 +79,9 @@ PTY_HEIGHT = 40
 @dataclass
 class ExperimentConfig:
     name: str
-    pool_policy: str = ""
-    pool_size: int | None = None
-    pool_total_max: int | None = None
+    system: str = ""
+    buffer_reserve: int | None = None
+    buffer_capacity: int | None = None
     controller_replicas: int | None = None
 
 
@@ -222,13 +227,13 @@ def _load_experiment(data: dict[str, Any]) -> ExperimentConfig:
     _ensure_allowed(
         "experiment",
         data,
-        {"name", "pool_policy", "pool_size", "pool_total_max", "controller_replicas"},
+        {"name", "system", "buffer_reserve", "buffer_capacity", "controller_replicas"},
     )
     return ExperimentConfig(
         name=str(_required_value(data, "name", "experiment")),
-        pool_policy=str(data.get("pool_policy") or ""),
-        pool_size=_optional_int(data.get("pool_size"), "experiment.pool_size"),
-        pool_total_max=_optional_int(data.get("pool_total_max"), "experiment.pool_total_max"),
+        system=str(data.get("system") or ""),
+        buffer_reserve=_optional_int(data.get("buffer_reserve"), "experiment.buffer_reserve"),
+        buffer_capacity=_optional_int(data.get("buffer_capacity"), "experiment.buffer_capacity"),
         controller_replicas=_optional_int(
             data.get("controller_replicas"), "experiment.controller_replicas"
         ),
@@ -388,11 +393,11 @@ def _lambda_for_profile(profile: str | float | int) -> float:
 def validate_config(config: SimulatorConfig) -> None:
     if not config.experiment.name:
         raise ValueError("experiment.name must be set")
-    r, n = config.experiment.pool_size, config.experiment.pool_total_max
+    r, n = config.experiment.buffer_reserve, config.experiment.buffer_capacity
     if any(value is not None and value < 0 for value in (r, n)):
-        raise ValueError("experiment.pool_size and experiment.pool_total_max must be non-negative")
+        raise ValueError("experiment.buffer_reserve and experiment.buffer_capacity must be non-negative")
     if r is not None and n is not None and r > n:
-        raise ValueError("experiment.pool_size must not exceed experiment.pool_total_max")
+        raise ValueError("experiment.buffer_reserve must not exceed experiment.buffer_capacity")
     if not config.ssh.host:
         raise ValueError("ssh.host must be set before running the simulator")
     if config.ssh.port <= 0:

@@ -151,7 +151,7 @@ def pod_summary(pod: dict[str, Any]) -> dict[str, Any] | None:
         "name": metadata.get("name"),
         "uid": metadata.get("uid"),
         "group": group,
-        "pool_status": labels.get("pool-status"),
+        "compute_status": labels.get("compute-status"),
         "compute_type": labels.get("compute-type"),
         "node": spec.get("nodeName"),
         "phase": status.get("phase"),
@@ -169,7 +169,7 @@ def pod_summary(pod: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def pod_group(labels: dict[str, str]) -> str | None:
-    if labels.get("app") == "warm-pod-pool":
+    if labels.get("app") == "compute-pod":
         return "compute"
     if labels.get("kubessh") == "userpods":
         return "user"

@@ -15,6 +15,7 @@ from .config import (
     CLIENT_MAX_INFLIGHT,
     COMMAND_TIMEOUT_SECONDS,
     KUBERNETES_NAMESPACE,
+    SUMMARY_SCHEMA_VERSION,
     CommandItem,
     NHPP_DAILY_PROFILE,
     SimulatorConfig,
@@ -257,7 +258,7 @@ async def run_simulation(
     from .ssh_runner import SSHSessionPool, strip_ansi
 
     summary = SummaryCollector()
-    pool = SSHSessionPool(config)
+    sessions = SSHSessionPool(config)
     tasks: list[asyncio.Task[None]] = []
     stopped_by_interrupt = False
     background_attempted = False
@@ -277,16 +278,16 @@ async def run_simulation(
         print(f"Running for {config.workload.duration_minutes} minutes of scheduled workload")
 
     try:
-        await warmup_users(config, pool)
+        await warmup_users(config, sessions)
         if config.background_activity.enabled:
             from .background import start_background_activity
 
             background_attempted = True
-            await start_background_activity(config, pool)
+            await start_background_activity(config, sessions)
 
         # Setup takes minutes and some connections die meanwhile; reconnect them
         # here so the first requests do not go out on a dead connection.
-        await warmup_users(config, pool, stage="Connection check")
+        await warmup_users(config, sessions, stage="Connection check")
 
         setup_completed_wall = now_iso()
         print(f"Warm-up complete at {setup_completed_wall}")
@@ -318,7 +319,7 @@ async def run_simulation(
                 asyncio.create_task(
                     execute_request(
                         config=config,
-                        pool=pool,
+                        sessions=sessions,
                         writer=writer,
                         summary=summary,
                         global_sem=global_sem,
@@ -346,14 +347,14 @@ async def run_simulation(
         async def stop_background() -> None:
             from .background import stop_background_activity
 
-            await stop_background_activity(config, pool)
+            await stop_background_activity(config, sessions)
 
         # Each step runs even if an earlier one failed, so a long run always
         # leaves its records behind.
         steps = [("pod recording", pod_recorder.stop)] if pod_recorder is not None else []
         if background_attempted:
             steps.append(("background activity", stop_background))
-        steps.append(("SSH sessions", pool.close))
+        steps.append(("SSH sessions", sessions.close))
         if writer is not None:
             steps.append(("request log", writer.close))
         for name, step in steps:
@@ -365,6 +366,10 @@ async def run_simulation(
     if output_dir is None:
         return
     summary_payload = {
+        # Bumped whenever a field in this file or in requests.jsonl is renamed
+        # or removed, so the analysis tool can refuse a run it would misread
+        # rather than report zeros for fields it cannot find.
+        "schema_version": SUMMARY_SCHEMA_VERSION,
         "experiment": config.experiment.__dict__,
         "server": server_settings,
         "ssh": {"host": config.ssh.host, "port": config.ssh.port},
@@ -396,13 +401,13 @@ async def run_simulation(
     print(f"Summary: {output_dir / 'summary.json'}")
 
 
-async def warmup_users(config: SimulatorConfig, pool: Any, stage: str = "Warm-up") -> None:
+async def warmup_users(config: SimulatorConfig, sessions: Any, stage: str = "Warm-up") -> None:
     print(f"{stage}: {config.users.count} user pods...")
     sem = asyncio.Semaphore(config.setup.max_inflight)
 
     async def _warm(username: str) -> tuple[str, Any]:
         async with sem:
-            return username, await pool.get(username).warmup()
+            return username, await sessions.get(username).warmup()
 
     remaining = list(config.user_names())
     failed: list[tuple[str, Any]] = []
@@ -435,7 +440,7 @@ async def warmup_users(config: SimulatorConfig, pool: Any, stage: str = "Warm-up
 async def execute_request(
     *,
     config: SimulatorConfig,
-    pool: Any,
+    sessions: Any,
     writer: AsyncJsonlWriter,
     summary: SummaryCollector,
     global_sem: asyncio.Semaphore,
@@ -447,14 +452,14 @@ async def execute_request(
     command: SelectedCommand = plan["command"]
     scheduled_mono = experiment_started_mono + float(plan["planned_offset_seconds"])
     task_created_mono = time.monotonic()
-    schedule_lag_ms = max(0.0, (task_created_mono - scheduled_mono) * 1000.0)
+    schedule_delay_ms = max(0.0, (task_created_mono - scheduled_mono) * 1000.0)
     queue_started_mono = task_created_mono
 
     async with global_sem:
         acquired_mono = time.monotonic()
-        client_queue_delay_ms = (acquired_mono - queue_started_mono) * 1000.0
+        client_send_delay_ms = (acquired_mono - queue_started_mono) * 1000.0
         started_at = now_iso()
-        result = await pool.get(plan["username"]).run_remote(
+        result = await sessions.get(plan["username"]).run_remote(
             command.remote_command,
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
@@ -477,14 +482,14 @@ async def execute_request(
         "execution_mode": config.execution.mode,
         "status": status,
         "exit_status": result.exit_status,
-        "duration_ms": result.elapsed_ms,
-        "until_ticket_ms": result.until_ticket_ms,
-        "until_allocated_ms": result.until_allocated_ms,
-        "until_start_ms": result.until_start_ms,
-        "command_ms": span_ms(result.until_start_ms, result.until_end_ms),
-        "schedule_lag_ms": schedule_lag_ms,
-        "client_queue_delay_ms": client_queue_delay_ms,
-        "per_user_queue_delay_ms": result.per_user_queue_delay_ms,
+        "request_duration_ms": result.elapsed_ms,
+        "since_send_to_ticket_ms": result.since_send_to_ticket_ms,
+        "since_send_to_assigned_ms": result.since_send_to_assigned_ms,
+        "since_send_to_start_ms": result.since_send_to_start_ms,
+        "command_duration_ms": span_ms(result.since_send_to_start_ms, result.since_send_to_end_ms),
+        "schedule_delay_ms": schedule_delay_ms,
+        "client_send_delay_ms": client_send_delay_ms,
+        "user_concurrency_delay_ms": result.user_concurrency_delay_ms,
         "ticket_expected": config.expects_ticket(),
         "ticket_id": result.ticket_id,
         "compute_allocation_expected": config.expects_compute_allocation(),
@@ -494,7 +499,7 @@ async def execute_request(
         "error": result.error,
         "command_delivered": result.command_delivered,
         "ssh_attempts": result.ssh_attempts,
-        "ssh_retry_ms": result.ssh_retry_ms,
+        "ssh_retry_delay_ms": result.ssh_retry_delay_ms,
     }
     add_output_tails(config, record, result, strip_output)
     summary.add(record)

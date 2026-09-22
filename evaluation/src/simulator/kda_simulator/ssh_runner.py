@@ -53,7 +53,7 @@ class CommandResult:
     stdout: str
     stderr: str
     elapsed_ms: float
-    per_user_queue_delay_ms: float
+    user_concurrency_delay_ms: float
     ticket_id: str | None
     compute_pod: str | None
     compute_pod_ip: str | None
@@ -61,15 +61,15 @@ class CommandResult:
     error: str | None = None
     # Milliseconds from sending the command until each milestone line arrived,
     # counted from the last attempt.
-    until_ticket_ms: float | None = None
-    until_allocated_ms: float | None = None
-    until_start_ms: float | None = None
-    until_end_ms: float | None = None
+    since_send_to_ticket_ms: float | None = None
+    since_send_to_assigned_ms: float | None = None
+    since_send_to_start_ms: float | None = None
+    since_send_to_end_ms: float | None = None
     # False means the server never accepted the command.
     command_delivered: bool = False
     ssh_attempts: int = 1
     # Time lost on attempts that failed before the last one started.
-    ssh_retry_ms: float = 0.0
+    ssh_retry_delay_ms: float = 0.0
 
 
 class _CommandTimeout(Exception):
@@ -158,7 +158,7 @@ class SSHUserSession:
     async def run_remote(self, remote_command: str, timeout: float) -> CommandResult:
         lock_wait_started = time.monotonic()
         async with self._run_lock:
-            per_user_queue_delay_ms = (time.monotonic() - lock_wait_started) * 1000.0
+            user_concurrency_delay_ms = (time.monotonic() - lock_wait_started) * 1000.0
             started = time.monotonic()
             output = _TimedOutput(started)
             exit_status: int | None = None
@@ -180,19 +180,19 @@ class SSHUserSession:
                 stdout=output.stdout,
                 stderr=output.stderr,
                 elapsed_ms=(time.monotonic() - started) * 1000.0,
-                per_user_queue_delay_ms=per_user_queue_delay_ms,
+                user_concurrency_delay_ms=user_concurrency_delay_ms,
                 ticket_id=parsed["ticket_id"],
                 compute_pod=parsed["compute_pod"],
                 compute_pod_ip=parsed["compute_pod_ip"],
                 timed_out=timed_out,
                 error=error,
-                until_ticket_ms=output.seen_ms.get("ticket"),
-                until_allocated_ms=output.seen_ms.get("allocated"),
-                until_start_ms=output.seen_ms.get("start"),
-                until_end_ms=output.seen_ms.get("end"),
+                since_send_to_ticket_ms=output.seen_ms.get("ticket"),
+                since_send_to_assigned_ms=output.seen_ms.get("allocated"),
+                since_send_to_start_ms=output.seen_ms.get("start"),
+                since_send_to_end_ms=output.seen_ms.get("end"),
                 command_delivered=output.channel_opened or output.received,
                 ssh_attempts=len(attempts),
-                ssh_retry_ms=(attempts[-1] - started) * 1000.0,
+                ssh_retry_delay_ms=(attempts[-1] - started) * 1000.0,
             )
 
     async def _run_with_retry(
