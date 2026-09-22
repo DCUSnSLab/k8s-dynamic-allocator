@@ -25,6 +25,13 @@ from workspace_connector import WorkspaceConnector
 
 logger = logging.getLogger(__name__)
 
+# Last bytes of a session: the command's exit status, so the client can tell a
+# finished command from a connection that dropped. Both look like a closed
+# socket otherwise. NUL never appears in terminal output from these workloads,
+# which keeps the marker from colliding with the stream it rides on.
+EXIT_TRAILER_PREFIX = b"\x00KDA_EXIT:"
+
+
 TCP_KEEPIDLE = int(os.getenv("TCP_KEEPIDLE", "10"))
 TCP_KEEPINTVL = int(os.getenv("TCP_KEEPINTVL", "5"))
 TCP_KEEPCNT = int(os.getenv("TCP_KEEPCNT", "3"))
@@ -413,6 +420,7 @@ class SessionHandler:
             if not self._active_sessions:
                 self._mark_idle_since_now()
 
+            await self._send_exit_trailer(writer, process)
             writer.close()
             await writer.wait_closed()
             session_ready_at = session_info.get("ready_at") if session_info else None
@@ -531,6 +539,27 @@ class SessionHandler:
                         self._release_notify_sent = True
                     if self._release_notify_task is asyncio.current_task():
                         self._release_notify_task = None
+
+    async def _send_exit_trailer(self, writer, process) -> None:
+        """Tell the client how the command ended, before the socket closes.
+
+        Without this the client cannot distinguish a command that finished
+        from a Compute Pod that died mid-command: both arrive as EOF. It used
+        to assume success, so a killed Pod was recorded as a successful run,
+        and a command that exited non-zero was recorded the same way.
+        """
+        code = process.returncode if process is not None else None
+        if code is None:
+            # Reaped without a status, or no process at all. Report it as a
+            # failure rather than inventing a zero.
+            code = 1
+        try:
+            writer.write(EXIT_TRAILER_PREFIX + str(int(code)).encode("ascii") + b"\n")
+            await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+            # The client is already gone; it will see the missing trailer and
+            # treat the session as cut, which is the right answer here.
+            logger.warning("[Warning] operation=exit_trailer reason=%r", str(exc))
 
     async def _handle_io(
         self,

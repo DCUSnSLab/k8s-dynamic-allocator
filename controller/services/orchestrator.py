@@ -105,16 +105,34 @@ class Orchestrator:
 
     def initialize_buffer(self) -> Dict:
         result = self.provider.initialize_buffer()
-        if self.capacity_reconciler is None and hasattr(self.provider, "drain_buffer_deployments"):
-            # Warm Deployments are never allocated from in cold-start mode and
-            # nothing else scales them down here, so their Pods would keep
-            # holding resources that land in this run's occupancy numbers.
-            try:
-                result["warm_deployments_drained"] = self.provider.drain_buffer_deployments()
-            except Exception as exc:
-                logger.warning("[Warning] operation=drain_buffer_deployments reason=%r", str(exc))
+        drained = self._drain_warm_deployments()
+        if drained is not None:
+            result["warm_deployments_drained"] = drained
         self.compute_manager.refresh_compute_types(force=True)
         return result
+
+    def _drain_warm_deployments(self) -> Optional[int]:
+        """Hold the cold-start invariant: no warm buffer replicas.
+
+        Warm Deployments are never allocated from in cold-start mode, so their
+        Pods would sit idle while still counting toward this run's occupancy
+        numbers - which would make cold start look more expensive than it is.
+
+        This has to be re-applied rather than done once at startup. During a
+        mode switch the outgoing warm-mode leader still holds the lease for a
+        few seconds after the new controllers have drained, and its reconciler
+        scales the Deployment straight back to R. Nothing then brought it down
+        again, so the replicas survived for the whole run.
+        """
+        if self.capacity_reconciler is not None:
+            return None
+        if not hasattr(self.provider, "drain_buffer_deployments"):
+            return None
+        try:
+            return self.provider.drain_buffer_deployments()
+        except Exception as exc:
+            logger.warning("[Warning] operation=drain_buffer_deployments reason=%r", str(exc))
+            return None
 
     def start(self) -> Dict:
         if self.startup_completed:
@@ -192,6 +210,7 @@ class Orchestrator:
             set_request_label("-")
             try:
                 self.cleanup.check_stale_allocations()
+                self._drain_warm_deployments()
             except Exception as exc:
                 logger.exception("[Failed] operation=periodic_cleanup reason=%r", str(exc))
             finally:
@@ -222,6 +241,7 @@ class Orchestrator:
         else:
             # The reconciler carries the sweep for the warm buffer; without it
             # a Compute Pod whose client died would never be reclaimed.
+            self._drain_warm_deployments()
             self._start_cleanup_worker()
         if self.deployment_watcher:
             self.deployment_watcher.start()
