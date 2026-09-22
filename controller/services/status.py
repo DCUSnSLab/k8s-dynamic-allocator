@@ -97,7 +97,7 @@ class ControllerStatus:
 
             item = {
                 "compute_type": compute_type,
-                "pool_total": buffer_available + buffer_assigned,
+                "buffer_total": buffer_available + buffer_assigned,
                 "buffer_available": buffer_available,
                 "buffer_assigned": buffer_assigned,
                 "physical_total": len(pods),

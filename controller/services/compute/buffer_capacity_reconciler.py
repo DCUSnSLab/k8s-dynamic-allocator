@@ -102,7 +102,7 @@ class BufferCapacityReconciler:
                     self._restart_thread = threading.Thread(
                         target=self._restart_after_thread_exit,
                         args=(old_thread,),
-                        name="pool-capacity-restart",
+                        name="buffer-capacity-restart",
                         daemon=True,
                     )
                     self._restart_thread.start()
@@ -114,7 +114,7 @@ class BufferCapacityReconciler:
                 self.queues.clear_buffer_policy_ready()
             except QueueUnavailableError as exc:
                 logger.warning(
-                    "[Warning] operation=pool_policy_ready_invalidate reason=%r",
+                    "[Warning] operation=buffer_policy_ready_invalidate reason=%r",
                     str(exc),
                 )
             self._stop_event.clear()
@@ -122,12 +122,12 @@ class BufferCapacityReconciler:
             self._next_run_at = time.monotonic()
             self._thread = threading.Thread(
                 target=self._run,
-                name="pool-capacity-reconciler",
+                name="buffer-capacity-reconciler",
                 daemon=True,
             )
             self._thread.start()
             self._condition.notify_all()
-        logger.info("[PoolCapacityReconcilerStarted]")
+        logger.info("[BufferCapacityReconcilerStarted]")
 
     def _restart_after_thread_exit(self, old_thread: threading.Thread) -> None:
         old_thread.join()
@@ -155,11 +155,11 @@ class BufferCapacityReconciler:
                 self.queues.clear_buffer_policy_ready(token)
             except QueueUnavailableError as exc:
                 logger.warning(
-                    "[Warning] operation=pool_policy_ready_clear reason=%r",
+                    "[Warning] operation=buffer_policy_ready_clear reason=%r",
                     str(exc),
                 )
         self._policy_ready = False
-        logger.info("[PoolCapacityReconcilerStopped]")
+        logger.info("[BufferCapacityReconcilerStopped]")
 
     def on_buffer_event(self, event_type: str, pod, source: str = "watch") -> None:
         del event_type, source
@@ -312,7 +312,7 @@ class BufferCapacityReconciler:
                     except QueueUnavailableError as exc:
                         renewed = False
                         logger.warning(
-                            "[Warning] operation=pool_policy_ready_renew reason=%r",
+                            "[Warning] operation=buffer_policy_ready_renew reason=%r",
                             str(exc),
                         )
                     if renewed:
@@ -370,7 +370,7 @@ class BufferCapacityReconciler:
                                         )
                                     except Exception as exc:
                                         logger.debug(
-                                            "[PoolQueueKickSkipped] "
+                                            "[BufferQueueKickSkipped] "
                                             "compute_type=%s reason=%r",
                                             compute_type,
                                             str(exc),
@@ -379,7 +379,7 @@ class BufferCapacityReconciler:
                             self._policy_ready = False
                             next_ready_renew_at = float("inf")
                             logger.warning(
-                                "[Warning] operation=pool_policy_ready_publish "
+                                "[Warning] operation=buffer_policy_ready_publish "
                                 "reason=%r",
                                 str(exc),
                             )
@@ -404,7 +404,7 @@ class BufferCapacityReconciler:
             deployments = self.provider.list_buffer_deployments()
         except Exception as exc:
             logger.warning(
-                "[Warning] operation=pool_policy_sync reason=%r",
+                "[Warning] operation=buffer_policy_sync reason=%r",
                 str(exc),
             )
             self._record_status("_global", policy_error=str(exc))
@@ -452,7 +452,7 @@ class BufferCapacityReconciler:
             except QueueUnavailableError as exc:
                 sync_succeeded = False
                 logger.warning(
-                    "[Warning] operation=pool_policy_clear compute_type=%s reason=%r",
+                    "[Warning] operation=buffer_policy_clear compute_type=%s reason=%r",
                     compute_type,
                     str(exc),
                 )
@@ -466,7 +466,7 @@ class BufferCapacityReconciler:
                 policy_error=error,
             )
             logger.error(
-                "[PoolPolicyInvalid] compute_type=%s reason=%r",
+                "[BufferPolicyInvalid] compute_type=%s reason=%r",
                 compute_type,
                 error,
             )
@@ -494,7 +494,7 @@ class BufferCapacityReconciler:
                     policy_error=str(exc),
                 )
                 logger.warning(
-                    "[Warning] operation=pool_policy_store compute_type=%s reason=%r",
+                    "[Warning] operation=buffer_policy_store compute_type=%s reason=%r",
                     compute_type,
                     str(exc),
                 )
@@ -505,7 +505,7 @@ class BufferCapacityReconciler:
             except QueueUnavailableError as exc:
                 sync_succeeded = False
                 logger.warning(
-                    "[Warning] operation=pool_policy_register reason=%r",
+                    "[Warning] operation=buffer_policy_register reason=%r",
                     str(exc),
                 )
 
@@ -594,7 +594,7 @@ class BufferCapacityReconciler:
                     self.on_capacity_available(compute_type_value)
                 except Exception as exc:
                     logger.debug(
-                        "[PoolQueueKickSkipped] compute_type=%s reason=%r",
+                        "[BufferQueueKickSkipped] compute_type=%s reason=%r",
                         compute_type_value,
                         str(exc),
                     )
@@ -608,7 +608,7 @@ class BufferCapacityReconciler:
             self.queues.clear_buffer_policy_ready(token)
         except QueueUnavailableError as exc:
             logger.warning(
-                "[Warning] operation=pool_policy_ready_clear reason=%r",
+                "[Warning] operation=buffer_policy_ready_clear reason=%r",
                 str(exc),
             )
 
@@ -647,7 +647,7 @@ class BufferCapacityReconciler:
                 "deployment_name": policy["deployment_name"],
                 "R": policy["R"],
                 "N": policy["N"],
-                "pool_total": snapshot["pool_total"],
+                "buffer_total": snapshot["buffer_total"],
                 "buffer_available": snapshot["buffer_available"],
                 "buffer_assigned": snapshot["buffer_assigned"],
                 "current_replicas": current,
@@ -685,7 +685,7 @@ class BufferCapacityReconciler:
             return result
         except Exception as exc:
             logger.exception(
-                "[Failed] operation=pool_capacity_reconcile compute_type=%s reason=%r",
+                "[Failed] operation=buffer_capacity_reconcile compute_type=%s reason=%r",
                 compute_type_value,
                 str(exc),
             )
@@ -734,7 +734,7 @@ class BufferCapacityReconciler:
                 **base_result,
                 "R": policy["R"],
                 "N": policy["N"],
-                "pool_total": snapshot["pool_total"],
+                "buffer_total": snapshot["buffer_total"],
                 "buffer_available": snapshot["buffer_available"],
                 "buffer_assigned": snapshot["buffer_assigned"],
                 "current_replicas": current,
@@ -762,7 +762,7 @@ class BufferCapacityReconciler:
                 desired,
             )
             logger.info(
-                "[PoolScaled] compute_type=%s direction=up replicas=%s->%s "
+                "[BufferScaled] compute_type=%s direction=up replicas=%s->%s "
                 "assigned=%s R=%s N=%s",
                 compute_type,
                 current,
@@ -799,7 +799,7 @@ class BufferCapacityReconciler:
         heartbeat = threading.Thread(
             target=self._renew_gate_loop,
             args=(compute_type, gate_token, heartbeat_stop, heartbeat_lost),
-            name=f"pool-gate-{compute_type}",
+            name=f"buffer-gate-{compute_type}",
             daemon=True,
         )
         heartbeat.start()
@@ -879,7 +879,7 @@ class BufferCapacityReconciler:
                     "deployment_name": policy["deployment_name"],
                     "R": policy["R"],
                     "N": policy["N"],
-                    "pool_total": snapshot["pool_total"],
+                    "buffer_total": snapshot["buffer_total"],
                     "buffer_available": snapshot["buffer_available"],
                     "buffer_assigned": snapshot["buffer_assigned"],
                     "current_replicas": current,
@@ -948,7 +948,7 @@ class BufferCapacityReconciler:
                     }
                 )
             logger.info(
-                "[PoolScaleDownObserved] compute_type=%s patched=%s "
+                "[BufferScaleDownObserved] compute_type=%s patched=%s "
                 "replicas=%s->%s deletion_observed=%s",
                 compute_type,
                 patched,
@@ -968,13 +968,13 @@ class BufferCapacityReconciler:
                         self.on_capacity_available(compute_type)
                     except Exception as exc:
                         logger.debug(
-                            "[PoolQueueKickSkipped] compute_type=%s reason=%r",
+                            "[BufferQueueKickSkipped] compute_type=%s reason=%r",
                             compute_type,
                             str(exc),
                         )
             if patched and heartbeat_lost.is_set():
                 logger.warning(
-                    "[Warning] operation=pool_scale_down compute_type=%s "
+                    "[Warning] operation=buffer_scale_down compute_type=%s "
                     "reason=%r",
                     compute_type,
                     "scale-down gate expired after replicas patch",
