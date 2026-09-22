@@ -1,5 +1,5 @@
 """
-Compute pool manager
+Compute buffer manager
 
 - Creates compute Deployments from manifests
 - Allocates warm compute pods to user pods
@@ -39,11 +39,11 @@ class PodConflictError(Exception):
 
 class WarmBufferProvider(KubernetesClient):
     """
-    Compute pod pool manager.
+    Compute pod buffer manager.
 
     `app` identifies compute pods managed by this controller.
     `compute-status` is part of the Deployment selector, so changing it from
-    available -> assigned removes a pod from warm-pool membership while keeping
+    available -> assigned removes a pod from warm-buffer membership while keeping
     the compute identity labels intact. Released assigned pods are deleted so
     the Deployment can backfill a new Ready warm pod.
     """
@@ -179,7 +179,7 @@ class WarmBufferProvider(KubernetesClient):
         raw_n = annotations.get(cls.ANNOTATION_BUFFER_CAPACITY)
         if raw_r is None or raw_n is None:
             raise ValueError(
-                "Pool policy annotations are required: "
+                "Buffer policy annotations are required: "
                 f"{cls.ANNOTATION_BUFFER_RESERVE}, "
                 f"{cls.ANNOTATION_BUFFER_CAPACITY}"
             )
@@ -188,14 +188,14 @@ class WarmBufferProvider(KubernetesClient):
             buffer_reserve = int(str(raw_r).strip())
             buffer_capacity = int(str(raw_n).strip())
         except (TypeError, ValueError) as exc:
-            raise ValueError("Pool policy annotations must be integers") from exc
+            raise ValueError("Buffer policy annotations must be integers") from exc
 
         if (
             buffer_reserve < 0
             or buffer_capacity < 0
             or buffer_reserve > buffer_capacity
         ):
-            raise ValueError("Pool policy must satisfy 0 <= R <= N")
+            raise ValueError("Buffer policy must satisfy 0 <= R <= N")
 
         return buffer_reserve, buffer_capacity
 
@@ -392,9 +392,9 @@ class WarmBufferProvider(KubernetesClient):
         )
         if not live_identity_matches:
             logger.error(
-                "[PoolPolicyMigrationBlocked] deployment=%s reason=%r",
+                "[BufferPolicyMigrationBlocked] deployment=%s reason=%r",
                 getattr(metadata, "name", "") or "",
-                "live selector/template does not match the warm-pool manifest",
+                "live selector/template does not match the warm-buffer manifest",
             )
             return False
 
@@ -425,7 +425,7 @@ class WarmBufferProvider(KubernetesClient):
             _request_timeout=self.api_request_timeout,
         )
         logger.info(
-            "[PoolPolicyMigrated] deployment=%s R=%s N=%s",
+            "[BufferPolicyMigrated] deployment=%s R=%s N=%s",
             metadata.name,
             body["metadata"]["annotations"][
                 self.ANNOTATION_BUFFER_RESERVE
@@ -519,7 +519,7 @@ class WarmBufferProvider(KubernetesClient):
         """
         Return one API-list based snapshot for allocation and capacity control.
 
-        Pool_Total counts non-terminating available + assigned pods. Creating
+        buffer_total counts non-terminating available + assigned pods. Creating
         Pods are included even when they are Pending or NotReady.
         """
         pods = self.v1.list_namespaced_pod(
@@ -528,7 +528,7 @@ class WarmBufferProvider(KubernetesClient):
             _request_timeout=self.api_request_timeout,
         )
 
-        pool_total = 0
+        buffer_total = 0
         buffer_available = 0
         buffer_assigned = 0
         terminating = 0
@@ -552,10 +552,10 @@ class WarmBufferProvider(KubernetesClient):
                 terminating += 1
             elif buffer_status == self.STATUS_AVAILABLE:
                 buffer_available += 1
-                pool_total += 1
+                buffer_total += 1
             elif buffer_status == self.STATUS_ASSIGNED:
                 buffer_assigned += 1
-                pool_total += 1
+                buffer_total += 1
                 if self._has_controller_owner(pod, "ReplicaSet"):
                     assigned_with_replicaset_owner += 1
 
@@ -597,7 +597,7 @@ class WarmBufferProvider(KubernetesClient):
                     "not_ready_since": self._pod_not_ready_since(pod),
                     "ip": getattr(status, "pod_ip", None),
                     "terminating": deletion_timestamp is not None,
-                    "counted_in_pool_total": counted,
+                    "counted_in_buffer_total": counted,
                     "replicaset_owned": self._has_controller_owner(pod, "ReplicaSet"),
                     "allocation_ticket_id": annotations.get(
                         self.ANNOTATION_ALLOCATION_TICKET,
@@ -618,7 +618,7 @@ class WarmBufferProvider(KubernetesClient):
         )
         return {
             "compute_type": (compute_type or "").strip().lower(),
-            "pool_total": pool_total,
+            "buffer_total": buffer_total,
             "buffer_available": buffer_available,
             "buffer_assigned": buffer_assigned,
             "ready_available": ready_available,
@@ -687,7 +687,7 @@ class WarmBufferProvider(KubernetesClient):
         Mark an available warm pod as assigned.
 
         Because compute-status=available is part of the Deployment selector,
-        changing it to assigned removes the pod from warm-pool membership and
+        changing it to assigned removes the pod from warm-buffer membership and
         lets the Deployment backfill a new warm pod.
         """
         try:

@@ -99,7 +99,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Compute Agent",
-    description="Warm Pod Pool Pod Agent for SSHFS mount and command execution",
+    description="Warm buffer compute pod agent for SSHFS mount and command execution",
     version="1.0.0"
 )
 
