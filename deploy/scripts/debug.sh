@@ -28,7 +28,7 @@ kubectl logs -n "${DEPLOY_NAMESPACE}" \
 
 echo '[Diagnostics] Compute logs'
 kubectl logs -n "${DEPLOY_NAMESPACE}" \
-    -l app=warm-pod-pool --all-containers=true --prefix=true --tail=150
+    -l app=compute-pod --all-containers=true --prefix=true --tail=150
 
 echo '[Diagnostics] Redis logs'
 kubectl logs -n "${DEPLOY_NAMESPACE}" \

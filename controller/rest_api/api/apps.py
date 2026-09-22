@@ -25,7 +25,7 @@ class ApiConfig(AppConfig):
         try:
             from services.orchestrator import Orchestrator
 
-            logger.info("Controller starting - initializing warm pod pool...")
+            logger.info("Controller starting - initializing the warm buffer...")
             orchestrator = Orchestrator()
             result = orchestrator.start()
             orchestrator_instance = orchestrator
@@ -35,7 +35,7 @@ class ApiConfig(AppConfig):
             existing = len(result.get("existing", []))
             failed = len(result.get("failed", []))
             logger.info(
-                "Pool init complete: %s created, %s existing, %s failed",
+                "Buffer init complete: %s created, %s existing, %s failed",
                 created,
                 existing,
                 failed,

@@ -31,12 +31,12 @@ pipeline {
     // falls back to the default.
     parameters {
         string(
-            name: 'POOL_AVAILABLE_MIN',
+            name: 'BUFFER_RESERVE',
             defaultValue: '2',
             description: 'R - warm Compute Pods kept immediately allocatable'
         )
         string(
-            name: 'POOL_TOTAL_MAX',
+            name: 'BUFFER_CAPACITY',
             defaultValue: '5',
             description: 'N - upper bound on available + assigned Compute Pods'
         )
@@ -86,13 +86,13 @@ pipeline {
                     env.DEPLOY_STARTED = 'false'
                     env.DEPLOY_DIAGNOSTICS_DONE = 'false'
 
-                    env.POOL_AVAILABLE_MIN = (params.POOL_AVAILABLE_MIN ?: '2').trim()
-                    env.POOL_TOTAL_MAX = (params.POOL_TOTAL_MAX ?: '5').trim()
+                    env.BUFFER_RESERVE = (params.BUFFER_RESERVE ?: '2').trim()
+                    env.BUFFER_CAPACITY = (params.BUFFER_CAPACITY ?: '5').trim()
 
                     echo "BRANCH_NAME=${env.BRANCH_NAME}"
                     echo "IMAGE_TAG=${env.IMAGE_TAG}"
                     echo "IS_MANUAL_BUILD=${env.IS_MANUAL_BUILD}"
-                    echo "POOL_POLICY R=${env.POOL_AVAILABLE_MIN} N=${env.POOL_TOTAL_MAX}"
+                    echo "BUFFER_POLICY R=${env.BUFFER_RESERVE} N=${env.BUFFER_CAPACITY}"
 
                     if (env.IS_MANUAL_BUILD != 'true') {
                         echo 'Automatic Multibranch/SCM build detected: image build and deployment are skipped.'

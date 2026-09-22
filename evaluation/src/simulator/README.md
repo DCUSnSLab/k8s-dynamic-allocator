@@ -2,7 +2,7 @@
 
 이 시뮬레이터는 로컬에서 서버에 배포되어 있는 `swlabssh`에 SSH로 접속하여 여러 사용자의 `run` 요청을 반복 실행한다.
 
-실행 전에 config의 `experiment.pool_size`(R)와 `experiment.pool_total_max`(N)를 `kda-test`의 compute Deployment에 맞추고, 대기 파드가 준비될 때까지 기다린다. 둘 중 하나라도 비어 있으면 서버를 건드리지 않는다. controller 개수, pool 모드, image 등 나머지 서버 설정은 바꾸지 않고 읽어서 `summary.json`의 `server`에 기록한다. 이를 위해 `kubectl`이 `KUBECONFIG`로 클러스터에 접근할 수 있어야 한다.
+실행 전에 config의 `experiment.buffer_reserve`(R)와 `experiment.buffer_capacity`(N)를 `kda-test`의 compute Deployment에 맞추고, 대기 파드가 준비될 때까지 기다린다. 둘 중 하나라도 비어 있으면 서버를 건드리지 않는다. controller 개수, 할당 모드, image 등 나머지 서버 설정은 바꾸지 않고 읽어서 `summary.json`의 `server`에 기록한다. 이를 위해 `kubectl`이 `KUBECONFIG`로 클러스터에 접근할 수 있어야 한다.
 
 ## config 파일
 
@@ -86,7 +86,7 @@ evaluation/data/<timestamp>_<experiment.name>/simulator/
 - `summary.json`: 전체 요약 통계
 
 `requests.jsonl`에는 `request_id`, `ticket_id`, `compute_pod`,
-`duration_ms`, `schedule_lag_ms`, `status`, `error` 등이 저장된다.
+`request_duration_ms`, `schedule_delay_ms`, `status`, `error` 등이 저장된다.
 
 `status` 값:
 
@@ -115,4 +115,4 @@ python evaluation\src\log_analysis\experiment_metrics.py evaluation\data\<run-id
 - 컨트롤러 로그: 대기 pod가 없어 기다린 요청 비율과 대기 시간, 큐 대기 시간, 배정 시간
 - `pods.jsonl`: compute·user pod의 시간 평균 점유 자원(limits 기준, 사용자 1명당 포함), compute·대기·배정 pod 수의 시간 평균과 최대
 
-죽은 SSH 연결은 keepalive로 감지하고, 명령이 서버에 전달되기 전에 끊긴 요청은 새 연결로 한 번 다시 보낸다. 이때 `ssh_attempts`는 2가 되고, 앞 시도에서 잃은 시간은 `ssh_retry_ms`에 기록된다. `until_*_ms`는 마지막 시도부터 잰 값이다. 요청 스케줄 시작 직전에는 모든 사용자 연결을 한 번 더 확인한다.
+죽은 SSH 연결은 keepalive로 감지하고, 명령이 서버에 전달되기 전에 끊긴 요청은 새 연결로 한 번 다시 보낸다. 이때 `ssh_attempts`는 2가 되고, 앞 시도에서 잃은 시간은 `ssh_retry_delay_ms`에 기록된다. `until_*_ms`는 마지막 시도부터 잰 값이다. 요청 스케줄 시작 직전에는 모든 사용자 연결을 한 번 더 확인한다.

@@ -15,13 +15,13 @@ logger = logging.getLogger(__name__)
 class ComputeQueueProcessor:
     def __init__(
         self,
-        pool,
+        provider,
         queues,
         tickets,
         allocator,
         release_pod_best_effort: Callable[[str, str], bool],
     ):
-        self.pool = pool
+        self.provider = provider
         self.queues = queues
         self.tickets = tickets
         self.allocator = allocator
@@ -115,11 +115,11 @@ class ComputeQueueProcessor:
             self._last_compute_refresh = now
             compute_types = set()
             try:
-                self.pool.initialize_pool(log_existing=False)
+                self.provider.initialize_buffer(log_existing=False)
             except Exception as exc:
                 logger.debug("[ComputeRefreshSkipped] reason=%r", str(exc))
             compute_types.update(self.queues.known_compute_types())
-            for item in self.pool.list_pool_status():
+            for item in self.provider.list_buffer_status():
                 if item.get("compute_type"):
                     compute_types.add(self.queues.normalize_compute_type(item.get("compute_type")))
 
@@ -151,10 +151,10 @@ class ComputeQueueProcessor:
             compute_pod = current.get("compute_pod") or compute_pod
             if (
                 not compute_pod
-                and hasattr(self.pool, "find_reserved_pod")
+                and hasattr(self.provider, "find_reserved_pod")
             ):
                 try:
-                    compute_pod = self.pool.find_reserved_pod(
+                    compute_pod = self.provider.find_reserved_pod(
                         ticket_id=ticket_id,
                         claim_token=claim_token or "",
                         compute_type=compute_type,

@@ -10,15 +10,15 @@ from config import settings
 from .. import ticket_format
 from ..queue import QueueUnavailableError
 from .agent_client import ComputeAgent, ComputeAgentError
-from .cold_start_pool import AllocationClaimLost
-from .warm_pod_pool import PodConflictError
+from .cold_start_provider import AllocationClaimLost
+from .warm_buffer_provider import PodConflictError
 
 logger = logging.getLogger(__name__)
 
 
 class ComputeAllocator:
-    def __init__(self, pool, queues, tickets):
-        self.pool = pool
+    def __init__(self, provider, queues, tickets):
+        self.provider = provider
         self.queues = queues
         self.tickets = tickets
 
@@ -27,7 +27,7 @@ class ComputeAllocator:
         compute_type: str,
         recover_stale_ticket: Callable[[Dict], Dict],
     ) -> Dict:
-        if getattr(self.pool, "allocation_mode", "") == "cold_start":
+        if getattr(self.provider, "allocation_mode", "") == "cold_start":
             return self._drain_wait_queue_for_type_cold_start(
                 compute_type,
                 recover_stale_ticket,
@@ -49,7 +49,7 @@ class ComputeAllocator:
         lock_token = None
         lock_renewed_at = 0.0
         try:
-            if not self.queues.is_pool_policy_ready():
+            if not self.queues.is_buffer_policy_ready():
                 result["queued"] += 1
                 result["capacity_blocked"] = "policy_not_ready"
                 return result
@@ -66,7 +66,7 @@ class ComputeAllocator:
                 return result
             lock_renewed_at = time.monotonic()
 
-            if not self.queues.is_pool_policy_ready():
+            if not self.queues.is_buffer_policy_ready():
                 result["queued"] += 1
                 result["capacity_blocked"] = "policy_not_ready"
                 return result
@@ -95,7 +95,7 @@ class ComputeAllocator:
                         result["errors"].append(recovered)
 
                 if (
-                    not self.queues.is_pool_policy_ready()
+                    not self.queues.is_buffer_policy_ready()
                     or self.queues.is_scale_down_gated(compute_type_value)
                 ):
                     result["queued"] += 1
@@ -112,7 +112,7 @@ class ComputeAllocator:
                 lock_renewed_at = time.monotonic()
 
                 if (
-                    not self.queues.is_pool_policy_ready()
+                    not self.queues.is_buffer_policy_ready()
                     or self.queues.is_scale_down_gated(compute_type_value)
                 ):
                     result["queued"] += 1
@@ -122,13 +122,13 @@ class ComputeAllocator:
             if not self.queues.has_queued_tickets(compute_type_value):
                 return result
 
-            policy = self.queues.get_pool_policy(compute_type_value)
+            policy = self.queues.get_buffer_policy(compute_type_value)
             if not policy:
                 result["queued"] += 1
                 result["capacity_blocked"] = "policy_unavailable"
                 return result
 
-            snapshot = self.pool.list_pool_snapshot(compute_type=compute_type_value)
+            snapshot = self.provider.list_buffer_snapshot(compute_type=compute_type_value)
             available = snapshot["available_candidates"][:effective_batch]
             if not available:
                 self._mark_compute_unavailable_started(compute_type_value)
@@ -138,12 +138,12 @@ class ComputeAllocator:
             reserved_pods: set = set()
             remaining_capacity = max(
                 0,
-                int(policy["N"]) - int(snapshot["pool_assigned"]),
+                int(policy["N"]) - int(snapshot["buffer_assigned"]),
             )
             max_claims = min(effective_batch, len(available), remaining_capacity)
             if max_claims <= 0:
                 result["queued"] += 1
-                result["capacity_blocked"] = "pool_total_max"
+                result["capacity_blocked"] = "buffer_capacity"
                 return result
 
             for _ in range(max_claims):
@@ -296,10 +296,10 @@ class ComputeAllocator:
         and their wait times can be compared.
         """
         try:
-            capacity = self.pool.read_capacity(compute_type)
+            capacity = self.provider.read_capacity(compute_type)
             if capacity is None:
                 return effective_batch
-            active = self.pool.count_active_pods(compute_type)
+            active = self.provider.count_active_pods(compute_type)
         except Exception as exc:
             # Reading capacity is a Kubernetes call; a blip must not stall the
             # queue, and the per-ticket create still fails safely on its own.
@@ -393,16 +393,16 @@ class ComputeAllocator:
         compute_pod = ""
 
         try:
-            compute_pod = self.pool.create_pod_for_ticket(ticket)
-            ready_pod = self.pool.wait_pod_ready(
+            compute_pod = self.provider.create_pod_for_ticket(ticket)
+            ready_pod = self.provider.wait_pod_ready(
                 compute_pod,
                 keep_claim=lambda: self.tickets.extend_allocation_deadline(ticket_id, claim_token),
             )
-            compute_pod_ip = getattr(ready_pod.status, "pod_ip", "") or self.pool.get_pod_ip(compute_pod) or ""
+            compute_pod_ip = getattr(ready_pod.status, "pod_ip", "") or self.provider.get_pod_ip(compute_pod) or ""
             if not compute_pod_ip:
                 raise RuntimeError("Compute IP unavailable after pod Ready")
 
-            compute_ready_at = self.pool.get_pod_ready_at(compute_pod)
+            compute_ready_at = self.provider.get_pod_ready_at(compute_pod)
             committed = self.tickets.mark_allocating(
                 ticket_id,
                 compute_pod=compute_pod,
@@ -413,7 +413,7 @@ class ComputeAllocator:
             )
             if not committed or committed.get("status") != "allocating":
                 try:
-                    self.pool.release_pod(compute_pod)
+                    self.provider.release_pod(compute_pod)
                 except Exception:
                     pass
                 current = self.tickets.get_ticket(ticket_id)
@@ -427,7 +427,7 @@ class ComputeAllocator:
             # Whoever holds the ticket now (a cancel, or another worker after
             # the claim lapsed) owns what happens next; only drop our pod.
             try:
-                self.pool.release_pod(compute_pod)
+                self.provider.release_pod(compute_pod)
             except Exception:
                 pass
             current = self.tickets.get_ticket(ticket_id)
@@ -460,7 +460,7 @@ class ComputeAllocator:
             if candidate_name in reserved_pods:
                 continue
             try:
-                self.pool.assign_pod(
+                self.provider.assign_pod(
                     candidate_name,
                     user_pod_identity,
                     expected_resource_version=candidate.get("resource_version"),
@@ -589,7 +589,7 @@ class ComputeAllocator:
             return None
         if not committed or committed.get("status") != "allocating":
             try:
-                self.pool.release_pod(compute_pod)
+                self.provider.release_pod(compute_pod)
             except Exception:
                 pass
             reserved_pods.discard(compute_pod)
@@ -658,7 +658,7 @@ class ComputeAllocator:
         current = self.tickets.get_ticket(ticket_id)
         if not current or current.get("status") != "allocating" or current.get("claim_token") != claim_token:
             try:
-                self.pool.release_pod(compute_pod)
+                self.provider.release_pod(compute_pod)
             except Exception:
                 pass
             ticket_format.log_queue_event(
@@ -712,7 +712,7 @@ class ComputeAllocator:
         current = self.tickets.get_ticket(ticket_id)
         if not current or current.get("status") != "allocating" or current.get("claim_token") != claim_token:
             try:
-                self.pool.release_pod(compute_pod)
+                self.provider.release_pod(compute_pod)
             except Exception:
                 pass
             return {
@@ -749,7 +749,7 @@ class ComputeAllocator:
             return response
 
         try:
-            self.pool.release_pod(compute_pod)
+            self.provider.release_pod(compute_pod)
         except Exception:
             pass
         current = self.tickets.get_ticket(ticket_id)
@@ -831,7 +831,7 @@ class ComputeAllocator:
         if not compute_pod:
             return True
         try:
-            self.pool.release_pod(compute_pod)
+            self.provider.release_pod(compute_pod)
             return True
         except Exception as exc:
             logger.warning(
@@ -856,7 +856,7 @@ class ComputeAllocator:
 
         if compute_pod:
             try:
-                self.pool.release_pod(compute_pod)
+                self.provider.release_pod(compute_pod)
             except Exception as release_exc:
                 logger.warning(
                     "[Warning] operation=release_after_cold_start_error ticket_id=%s compute_pod=%s reason=%r",

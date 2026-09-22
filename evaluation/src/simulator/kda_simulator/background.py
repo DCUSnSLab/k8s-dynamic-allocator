@@ -83,7 +83,7 @@ if __name__ == "__main__":
 """
 
 
-async def start_background_activity(config: SimulatorConfig, pool: Any) -> None:
+async def start_background_activity(config: SimulatorConfig, sessions: Any) -> None:
     if not config.background_activity.enabled:
         return
 
@@ -98,7 +98,7 @@ async def start_background_activity(config: SimulatorConfig, pool: Any) -> None:
     remaining = list(config.user_names())
     failed: list[tuple[str, str]] = []
     for attempt in range(1, config.setup.retry_attempts + 1):
-        results = await _run_for_users(config, pool, command, usernames=remaining)
+        results = await _run_for_users(config, sessions, command, usernames=remaining)
         failed = [
             (username, _result_error_summary(result))
             for username, result in results
@@ -122,12 +122,12 @@ async def start_background_activity(config: SimulatorConfig, pool: Any) -> None:
     raise RuntimeError(f"Background activity failed for {len(failed)} users: {preview}")
 
 
-async def stop_background_activity(config: SimulatorConfig, pool: Any) -> None:
+async def stop_background_activity(config: SimulatorConfig, sessions: Any) -> None:
     if not config.background_activity.enabled:
         return
 
     print("Stopping background activity...")
-    results = await _run_for_users(config, pool, build_stop_command(), return_exceptions=True)
+    results = await _run_for_users(config, sessions, build_stop_command(), return_exceptions=True)
     failed = []
     for username, result in results:
         if isinstance(result, BaseException):
@@ -147,7 +147,7 @@ async def stop_background_activity(config: SimulatorConfig, pool: Any) -> None:
 
 async def _run_for_users(
     config: SimulatorConfig,
-    pool: Any,
+    sessions: Any,
     command: str,
     *,
     usernames: list[str] | None = None,
@@ -158,7 +158,7 @@ async def _run_for_users(
     async def _run(username: str) -> tuple[str, Any]:
         async with sem:
             try:
-                result = await pool.get(username).run_remote(
+                result = await sessions.get(username).run_remote(
                     command,
                     timeout=BACKGROUND_COMMAND_TIMEOUT_SECONDS,
                 )

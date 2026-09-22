@@ -1,7 +1,7 @@
 """Put the test server back into a clean state before an experiment.
 
 Restarting pods is not enough: Redis keeps its data on a volume, so tickets,
-assigned-request records and pool policy from earlier runs survive a restart
+assigned-request records and sessions policy from earlier runs survive a restart
 and can leak into the next run. Controllers are stopped while Redis is cleared
 so nothing writes old state back, then everything is restarted.
 """
@@ -50,7 +50,7 @@ def reset_server(*, clear_logs: bool) -> None:
     # Assigned pods have left the Deployment selector, so a rollout restart
     # would not remove them; cold-start pods are standalone.
     _step("Delete compute pods outside the Deployment")
-    _kubectl("delete", "pod", "-l", "app=warm-pod-pool,pool-status=assigned", "--wait=true", "--timeout=120s")
+    _kubectl("delete", "pod", "-l", "app=compute-pod,compute-status=assigned", "--wait=true", "--timeout=120s")
 
     _step(f"Start controllers (replicas 0 -> {controller_replicas}) and restart swlabssh, compute-general")
     _kubectl("scale", "deployment/controller", f"--replicas={controller_replicas}")
@@ -67,7 +67,7 @@ def reset_server(*, clear_logs: bool) -> None:
 
     settings = read_server_settings()
     print(f"\nServer: {describe_settings(settings)}")
-    print(f"Redis keys matching {REDIS_KEY_PATTERN}: {_redis_key_count()} (controllers republish pool policy)")
+    print(f"Redis keys matching {REDIS_KEY_PATTERN}: {_redis_key_count()} (controllers republish sessions policy)")
 
 
 def _controller_replicas() -> int:

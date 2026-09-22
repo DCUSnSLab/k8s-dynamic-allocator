@@ -3,24 +3,24 @@ kind: Deployment
 metadata:
   name: compute-general
   labels:
-    app: warm-pod-pool
+    app: compute-pod
     compute-type: general
   annotations:
-    k8s-dynamic-allocator/pool-available-min: "2"
-    k8s-dynamic-allocator/pool-total-max: "5"
+    k8s-dynamic-allocator/buffer-reserve: "2"
+    k8s-dynamic-allocator/buffer-capacity: "5"
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: warm-pod-pool
+      app: compute-pod
       compute-type: general
-      pool-status: available
+      compute-status: available
   template:
     metadata:
       labels:
-        app: warm-pod-pool
+        app: compute-pod
         compute-type: general
-        pool-status: available
+        compute-status: available
         assigned-user: ""
     spec:
       # Same general-purpose nodes as the user pods; keeps compute pods off the GPU nodes.

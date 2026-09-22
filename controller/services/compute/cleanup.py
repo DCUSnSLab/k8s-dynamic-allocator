@@ -12,18 +12,18 @@ logger = logging.getLogger(__name__)
 class ComputeCleanup:
     """Periodic cleanup of stale queue tickets and orphaned compute pods.
 
-    A Compute Pod goes back to the pool when the User Pod behind it is gone, or
+    A Compute Pod goes back to the buffer when the User Pod behind it is gone, or
     when its agent has been NotReady past the grace period -- nothing in
     Kubernetes replaces a NotReady Pod on its own.
 
     Runs independently of the allocation path. Tolerates partial failure:
     if the Redis queue is unavailable, stale-ticket recovery is skipped
-    but pool-level orphan cleanup still proceeds so that compute pods bound
+    but buffer-level orphan cleanup still proceeds so that compute pods bound
     to dead users are released.
     """
 
-    def __init__(self, pool, queues, compute_manager):
-        self.pool = pool
+    def __init__(self, provider, queues, compute_manager):
+        self.provider = provider
         self.queues = queues
         self.compute_manager = compute_manager
         self.not_ready_grace_seconds = settings.COMPUTE_NOT_READY_GRACE_SECONDS
@@ -42,15 +42,15 @@ class ComputeCleanup:
         except QueueUnavailableError as exc:
             logger.warning("[Warning] operation=stale_recovery status=skipped reason=%r", str(exc))
 
-        pool_list = self.pool.list_pool_status()
-        journal_cleanup = self.recover_journaled_orphans(pool_list=pool_list)
+        buffer_list = self.provider.list_buffer_status()
+        journal_cleanup = self.recover_journaled_orphans(buffer_list=buffer_list)
 
         released = list(journal_cleanup["released"])
         errors = list(journal_cleanup["errors"])
         journal_released = set(released)
         unready_released = []
 
-        for pod_info in pool_list:
+        for pod_info in buffer_list:
             compute_pod = pod_info["name"]
             if compute_pod in journal_released:
                 continue
@@ -66,9 +66,9 @@ class ComputeCleanup:
             with settings.request_label_scope(request_label):
                 logger.warning(
                     "[Warning] operation=orphan_compute_release compute_pod=%s "
-                    "pool_status=%s assigned_user=%s reason=%s",
+                    "buffer_status=%s assigned_user=%s reason=%s",
                     compute_pod,
-                    pod_info.get("pool_status") or "unknown",
+                    pod_info.get("buffer_status") or "unknown",
                     pod_info.get("assigned_user") or "-",
                     reason,
                 )
@@ -100,7 +100,7 @@ class ComputeCleanup:
         }
 
     def _release_reason(self, pod_info: Dict) -> str:
-        """Why this Compute Pod should go back to the pool, or "" to keep it.
+        """Why this Compute Pod should go back to the buffer, or "" to keep it.
 
         Readiness comes first: it costs no extra API call, and it also covers
         available Pods, which the User Pod check cannot judge.
@@ -113,14 +113,14 @@ class ComputeCleanup:
         ):
             return f"not_ready_{not_ready_seconds}s"
 
-        if pod_info.get("pool_status") != "assigned":
+        if pod_info.get("buffer_status") != "assigned":
             return ""
 
         user_pod = pod_info.get("assigned_user", "")
         if not user_pod or user_pod == "unknown":
             return ""
 
-        user_status = self.pool.get_pod_status(user_pod)
+        user_status = self.provider.get_pod_status(user_pod)
         if user_status == "Running":
             return ""
         return f"user_pod_{str(user_status).lower()}"
@@ -144,7 +144,7 @@ class ComputeCleanup:
 
         return int((datetime.now(timezone.utc) - not_ready_since).total_seconds())
 
-    def recover_journaled_orphans(self, pool_list=None) -> Dict:
+    def recover_journaled_orphans(self, buffer_list=None) -> Dict:
         """
         Retry deletion of assigned Pods whose reservation journal no longer
         matches the ticket that owns them.
@@ -155,13 +155,13 @@ class ComputeCleanup:
         with the same claim token and an empty compute_pod is still considered
         valid.
         """
-        pods = pool_list if pool_list is not None else self.pool.list_pool_status()
+        pods = buffer_list if buffer_list is not None else self.provider.list_buffer_status()
         released = []
         errors = []
 
         for pod_info in pods:
             if (
-                pod_info.get("pool_status") != "assigned"
+                pod_info.get("buffer_status") != "assigned"
                 or pod_info.get("terminating")
             ):
                 continue
@@ -197,7 +197,7 @@ class ComputeCleanup:
                 # Deleted directly rather than through release_compute_pod: the
                 # ticket-to-pod mapping is what broke here, so looking a ticket up
                 # by compute_pod could clear the context of an unrelated one.
-                self.pool.release_pod(compute_pod)
+                self.provider.release_pod(compute_pod)
                 released.append(compute_pod)
                 logger.warning(
                     "[ReservationOrphanReleased] compute_pod=%s "

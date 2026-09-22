@@ -6,11 +6,11 @@ from config import settings
 from config.settings import set_request_label
 
 from .compute import (
-    ColdStartComputePool,
+    ColdStartProvider,
     ComputeCleanup,
     ComputeManager,
-    PoolCapacityReconciler,
-    WarmPodPool,
+    BufferCapacityReconciler,
+    WarmBufferProvider,
 )
 from .infra import (
     ComputeAvailabilityWatcher,
@@ -29,52 +29,52 @@ CLEANUP_STOP_POLL_SECONDS = 1.0
 
 class Orchestrator:
     def __init__(self):
-        if settings.COMPUTE_POOL_MODE == "cold_start":
-            self.pool = ColdStartComputePool()
+        if settings.COMPUTE_ALLOCATION_MODE == "cold_start":
+            self.provider = ColdStartProvider()
         else:
-            self.pool = WarmPodPool()
+            self.provider = WarmBufferProvider()
         self.queues = ComputeQueues()
         self.tickets = self.queues.tickets
-        self.compute_manager = ComputeManager(self.pool, self.queues, self.tickets)
-        self.cleanup = ComputeCleanup(self.pool, self.queues, self.compute_manager)
+        self.compute_manager = ComputeManager(self.provider, self.queues, self.tickets)
+        self.cleanup = ComputeCleanup(self.provider, self.queues, self.compute_manager)
         self.capacity_reconciler = None
         self.deployment_watcher = None
-        if isinstance(self.pool, WarmPodPool):
-            self.capacity_reconciler = PoolCapacityReconciler(
-                self.pool,
+        if isinstance(self.provider, WarmBufferProvider):
+            self.capacity_reconciler = BufferCapacityReconciler(
+                self.provider,
                 self.queues,
                 on_capacity_available=self.compute_manager.kick_wait_queue_worker,
                 # Full sweep; it calls recover_journaled_orphans itself.
                 on_periodic_cleanup=self.cleanup.check_stale_allocations,
             )
             self.deployment_watcher = DeploymentPolicyWatcher(
-                apps_v1=self.pool.apps_v1,
-                namespace=self.pool.namespace,
+                apps_v1=self.provider.apps_v1,
+                namespace=self.provider.namespace,
                 on_policy_event=self.capacity_reconciler.on_deployment_event,
                 label_selector=(
-                    f"{self.pool.LABEL_APP}={self.pool.APP_WARM_POOL}"
+                    f"{self.provider.LABEL_APP}={self.provider.APP_COMPUTE_POD}"
                 ),
                 timeout_seconds=settings.COMPUTE_AVAILABILITY_WATCH_TIMEOUT_SECONDS,
                 retry_seconds=settings.COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS,
             )
         self.status = ControllerStatus(
-            self.pool,
+            self.provider,
             self.queues,
             self.tickets,
             capacity_reconciler=self.capacity_reconciler,
         )
-        pool_uses_watch = getattr(self.pool, "uses_availability_watch", True)
-        watch_enabled = pool_uses_watch and (
+        provider_uses_watch = getattr(self.provider, "uses_availability_watch", True)
+        watch_enabled = provider_uses_watch and (
             settings.COMPUTE_AVAILABILITY_WATCH_ENABLED
             or self.capacity_reconciler is not None
         )
         self.compute_watcher = ComputeAvailabilityWatcher(
-            v1=self.pool.v1,
-            namespace=self.pool.namespace,
-            label_selector=f"{self.pool.LABEL_APP}={self.pool.APP_WARM_POOL}",
+            v1=self.provider.v1,
+            namespace=self.provider.namespace,
+            label_selector=f"{self.provider.LABEL_APP}={self.provider.APP_COMPUTE_POD}",
             on_compute_available=self.compute_manager.notify_compute_available,
-            on_pool_event=(
-                self.capacity_reconciler.on_pool_event
+            on_buffer_event=(
+                self.capacity_reconciler.on_buffer_event
                 if self.capacity_reconciler
                 else None
             ),
@@ -84,11 +84,11 @@ class Orchestrator:
             ),
             timeout_seconds=settings.COMPUTE_AVAILABILITY_WATCH_TIMEOUT_SECONDS,
             retry_seconds=settings.COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS,
-            app_label=self.pool.LABEL_APP,
-            app_value=self.pool.APP_WARM_POOL,
-            status_label=self.pool.LABEL_STATUS,
-            available_status=self.pool.STATUS_AVAILABLE,
-            compute_type_label=self.pool.LABEL_COMPUTE_TYPE,
+            app_label=self.provider.LABEL_APP,
+            app_value=self.provider.APP_COMPUTE_POD,
+            status_label=self.provider.LABEL_STATUS,
+            available_status=self.provider.STATUS_AVAILABLE,
+            compute_type_label=self.provider.LABEL_COMPUTE_TYPE,
         )
         self.leader_elector = None
         self.queue_worker_thread: Optional[threading.Thread] = None
@@ -98,30 +98,30 @@ class Orchestrator:
         self.cleanup_thread: Optional[threading.Thread] = None
         self.cleanup_stop_event = threading.Event()
         self.startup_completed = False
-        self._initial_pool_result: Optional[Dict] = None
+        self._initial_buffer_result: Optional[Dict] = None
 
     def health_check(self) -> str:
         return "Orchestrator healthy"
 
-    def initialize_pool(self) -> Dict:
-        result = self.pool.initialize_pool()
-        if self.capacity_reconciler is None and hasattr(self.pool, "drain_warm_deployments"):
+    def initialize_buffer(self) -> Dict:
+        result = self.provider.initialize_buffer()
+        if self.capacity_reconciler is None and hasattr(self.provider, "drain_buffer_deployments"):
             # Warm Deployments are never allocated from in cold-start mode and
             # nothing else scales them down here, so their Pods would keep
             # holding resources that land in this run's occupancy numbers.
             try:
-                result["warm_deployments_drained"] = self.pool.drain_warm_deployments()
+                result["warm_deployments_drained"] = self.provider.drain_buffer_deployments()
             except Exception as exc:
-                logger.warning("[Warning] operation=drain_warm_deployments reason=%r", str(exc))
+                logger.warning("[Warning] operation=drain_buffer_deployments reason=%r", str(exc))
         self.compute_manager.refresh_compute_types(force=True)
         return result
 
     def start(self) -> Dict:
         if self.startup_completed:
-            return self._initial_pool_result or {"status": "success", "created": 0, "existing": 0}
+            return self._initial_buffer_result or {"status": "success", "created": 0, "existing": 0}
 
-        result = self.initialize_pool()
-        self._initial_pool_result = result
+        result = self.initialize_buffer()
+        self._initial_buffer_result = result
         self._start_queue_worker()
 
         self.leader_elector = LeaseLeaderElector(
@@ -187,7 +187,7 @@ class Orchestrator:
         return True
 
     def _cleanup_loop(self) -> None:
-        interval = max(1, int(settings.POOL_RECONCILE_RESYNC_SECONDS))
+        interval = max(1, int(settings.BUFFER_RECONCILE_RESYNC_SECONDS))
         while self._sleep_until_cleanup_due(interval):
             set_request_label("-")
             try:
@@ -243,7 +243,7 @@ class Orchestrator:
         user_pod_ip: str,
         user_pod: str = "",
         compute_type: Optional[str] = None,
-        ingress_ts_ms: Optional[int] = None,
+        request_at_ms: Optional[int] = None,
         ticket_id: Optional[str] = None,
     ) -> Dict:
         return self.compute_manager.execute_command(
@@ -252,7 +252,7 @@ class Orchestrator:
             user_pod_ip=user_pod_ip,
             user_pod=user_pod,
             compute_type=compute_type,
-            ingress_ts_ms=ingress_ts_ms,
+            request_at_ms=request_at_ms,
             ticket_id=ticket_id,
         )
 
@@ -275,8 +275,8 @@ class Orchestrator:
     def get_assigned_request_context(self, compute_pod: str) -> Optional[Dict[str, object]]:
         return self.compute_manager.get_assigned_request_context(compute_pod)
 
-    def get_pool_status(self) -> Dict:
-        return self.status.get_pool_status()
+    def get_buffer_status(self) -> Dict:
+        return self.status.get_buffer_status()
 
     def get_queue_status(self, compute_type: Optional[str] = None) -> Dict:
         return self.status.get_queue_status(compute_type=compute_type)

@@ -468,7 +468,7 @@ def identify_module(labels: Dict[str, object], pod_name: str, container_name: st
 
     if app_label == "controller":
         return "controller"
-    if app_label == "warm-pod-pool":
+    if app_label == "compute-pod":
         return "compute"
     if app_label == "controller-queue-redis":
         return "redis"

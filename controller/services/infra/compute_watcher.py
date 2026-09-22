@@ -21,14 +21,14 @@ class ComputeAvailabilityWatcher:
         namespace: str,
         label_selector: str,
         on_compute_available: Callable[[str, str, str, str], None],
-        on_pool_event: Optional[Callable[[str, object, str], None]] = None,
+        on_buffer_event: Optional[Callable[[str, object, str], None]] = None,
         enabled: bool = True,
         availability_notifications_enabled: bool = True,
         timeout_seconds: int = 60,
         retry_seconds: float = 1.0,
         app_label: str = "app",
-        app_value: str = "warm-pod-pool",
-        status_label: str = "pool-status",
+        app_value: str = "compute-pod",
+        status_label: str = "compute-status",
         available_status: str = "available",
         compute_type_label: str = "compute-type",
     ):
@@ -36,7 +36,7 @@ class ComputeAvailabilityWatcher:
         self.namespace = namespace
         self.label_selector = label_selector
         self.on_compute_available = on_compute_available
-        self.on_pool_event = on_pool_event
+        self.on_buffer_event = on_buffer_event
         self.enabled = enabled
         self.availability_notifications_enabled = (
             availability_notifications_enabled
@@ -174,7 +174,7 @@ class ComputeAvailabilityWatcher:
             label_selector=self.label_selector,
         )
         for pod in pods.items:
-            self._notify_pool_event("SYNC", pod, source="snapshot")
+            self._notify_buffer_event("SYNC", pod, source="snapshot")
             self._notify_if_available(pod, source="snapshot")
         return getattr(getattr(pods, "metadata", None), "resource_version", "") or ""
 
@@ -185,7 +185,7 @@ class ComputeAvailabilityWatcher:
         pod = event.get("object")
         if pod is None:
             return
-        self._notify_pool_event(event_type, pod, source="watch")
+        self._notify_buffer_event(event_type, pod, source="watch")
         if event_type in {"ADDED", "MODIFIED"}:
             self._notify_if_available(pod, source="watch")
 
@@ -197,14 +197,14 @@ class ComputeAvailabilityWatcher:
             return
         self._notify_compute_available(compute_type, compute_pod, source=source)
 
-    def _notify_pool_event(self, event_type: str, pod, source: str) -> None:
-        if self.on_pool_event is None:
+    def _notify_buffer_event(self, event_type: str, pod, source: str) -> None:
+        if self.on_buffer_event is None:
             return
         try:
-            self.on_pool_event(event_type, pod, source)
+            self.on_buffer_event(event_type, pod, source)
         except Exception as exc:
             logger.warning(
-                "[Warning] operation=compute_pool_watch_callback event_type=%s "
+                "[Warning] operation=compute_buffer_watch_callback event_type=%s "
                 "compute_pod=%s reason=%r",
                 event_type,
                 getattr(getattr(pod, "metadata", None), "name", "") or "",

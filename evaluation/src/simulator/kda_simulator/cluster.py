@@ -2,7 +2,7 @@
 
 R/N are Deployment annotations the controller picks up without a restart, and
 Jenkins resets them on every deploy, so a run sets them itself. Controller
-count, pool mode and images are only read: changing those needs a redeploy.
+count, allocation mode and images are only read: changing those needs a redeploy.
 """
 
 from __future__ import annotations
@@ -15,11 +15,11 @@ from typing import Any
 from .config import KUBERNETES_NAMESPACE, SimulatorConfig
 
 
-ANNOTATION_R = "k8s-dynamic-allocator/pool-available-min"
-ANNOTATION_N = "k8s-dynamic-allocator/pool-total-max"
+BUFFER_RESERVE_ANNOTATION = "k8s-dynamic-allocator/buffer-reserve"
+BUFFER_CAPACITY_ANNOTATION = "k8s-dynamic-allocator/buffer-capacity"
 KUBECTL_TIMEOUT_SECONDS = 30
-POOL_SETTLE_TIMEOUT_SECONDS = 180.0
-POOL_SETTLE_POLL_SECONDS = 2.0
+BUFFER_SETTLE_TIMEOUT_SECONDS = 180.0
+BUFFER_SETTLE_POLL_SECONDS = 2.0
 
 
 class ServerSettingsError(RuntimeError):
@@ -28,10 +28,10 @@ class ServerSettingsError(RuntimeError):
 
 def prepare_server(config: SimulatorConfig) -> dict[str, Any]:
     """Apply R/N from the config when both are set, then return the server settings."""
-    wanted = (config.experiment.pool_size, config.experiment.pool_total_max)
+    wanted = (config.experiment.buffer_reserve, config.experiment.buffer_capacity)
     apply_policy = None not in wanted
     if not apply_policy and wanted != (None, None):
-        print("R/N not applied: set both experiment.pool_size and experiment.pool_total_max")
+        print("R/N not applied: set both experiment.buffer_reserve and experiment.buffer_capacity")
 
     try:
         settings = read_server_settings()
@@ -42,21 +42,21 @@ def prepare_server(config: SimulatorConfig) -> dict[str, Any]:
         return {"error": str(exc)}
 
     if apply_policy:
-        if settings["pool_mode"] != "warm_pool":
-            print(f"R/N not applied: pool mode is {settings['pool_mode']}")
+        if settings["allocation_mode"] != "warm_buffer":
+            print(f"R/N not applied: allocation mode is {settings['allocation_mode']}")
         else:
             r, n = wanted
-            for pool in settings["pools"]:
-                if (pool["R"], pool["N"]) != (r, n):
-                    print(f"Pool policy {pool['deployment']}: R={pool['R']} N={pool['N']} -> R={r} N={n}")
+            for buffer in settings["buffers"]:
+                if (buffer["R"], buffer["N"]) != (r, n):
+                    print(f"Buffer policy {buffer['deployment']}: R={buffer['R']} N={buffer['N']} -> R={r} N={n}")
                     run_kubectl(
                         "annotate",
-                        f"deployment/{pool['deployment']}",
-                        f"{ANNOTATION_R}={r}",
-                        f"{ANNOTATION_N}={n}",
+                        f"deployment/{buffer['deployment']}",
+                        f"{BUFFER_RESERVE_ANNOTATION}={r}",
+                        f"{BUFFER_CAPACITY_ANNOTATION}={n}",
                         "--overwrite",
                     )
-            wait_for_pools(r, n)
+            wait_for_buffers(r, n)
             settings = read_server_settings()
 
     print(f"Server: {describe_settings(settings)}")
@@ -65,14 +65,14 @@ def prepare_server(config: SimulatorConfig) -> dict[str, Any]:
 
 def read_server_settings() -> dict[str, Any]:
     deployments = {item["metadata"]["name"]: item for item in _kubectl_json("get", "deployments")["items"]}
-    pods = _kubectl_json("get", "pods", "-l", "app=warm-pod-pool")["items"]
+    pods = _kubectl_json("get", "pods", "-l", "app=compute-pod")["items"]
     controller = deployments.get("controller")
     swlabssh = deployments.get("swlabssh")
 
-    pools = []
+    buffers = []
     for name, deployment in sorted(deployments.items()):
         labels = deployment["metadata"].get("labels") or {}
-        if labels.get("app") != "warm-pod-pool":
+        if labels.get("app") != "compute-pod":
             continue
         compute_type = labels.get("compute-type", "")
         annotations = deployment["metadata"].get("annotations") or {}
@@ -81,82 +81,82 @@ def read_server_settings() -> dict[str, Any]:
             if _labels(pod).get("compute-type") == compute_type
             and not pod["metadata"].get("deletionTimestamp")
         ]
-        available = [pod for pod in members if _labels(pod).get("pool-status") == "available"]
-        pools.append(
+        available = [pod for pod in members if _labels(pod).get("compute-status") == "available"]
+        buffers.append(
             {
                 "deployment": name,
                 "compute_type": compute_type,
-                "R": _int_or_none(annotations.get(ANNOTATION_R)),
-                "N": _int_or_none(annotations.get(ANNOTATION_N)),
+                "R": _int_or_none(annotations.get(BUFFER_RESERVE_ANNOTATION)),
+                "N": _int_or_none(annotations.get(BUFFER_CAPACITY_ANNOTATION)),
                 "available": len(available),
                 "available_ready": sum(1 for pod in available if _is_ready(pod)),
-                "assigned": sum(1 for pod in members if _labels(pod).get("pool-status") == "assigned"),
+                "assigned": sum(1 for pod in members if _labels(pod).get("compute-status") == "assigned"),
                 "image": _image(deployment),
             }
         )
 
-    pool_mode = None
+    allocation_mode = None
     if controller is not None:
-        # Same default and normalization as the controller's COMPUTE_POOL_MODE.
-        pool_mode = (_env(controller, "COMPUTE_POOL_MODE") or "warm_pool").strip().lower().replace("-", "_")
+        # Same default and normalization as the controller's COMPUTE_ALLOCATION_MODE.
+        allocation_mode = (_env(controller, "COMPUTE_ALLOCATION_MODE") or "warm_buffer").strip().lower().replace("-", "_")
 
     return {
         "namespace": KUBERNETES_NAMESPACE,
-        "pool_mode": pool_mode,
+        "allocation_mode": allocation_mode,
         "controller_replicas": _replicas(controller),
         "controller_image": _image(controller),
         "swlabssh_replicas": _replicas(swlabssh),
         "swlabssh_image": _image(swlabssh),
-        "pools": pools,
+        "buffers": buffers,
     }
 
 
-def wait_for_pools(r: int, n: int) -> None:
-    """Wait until every pool holds the ready warm pods R/N asks for."""
+def wait_for_buffers(r: int, n: int) -> None:
+    """Wait until every buffer holds the ready pods R/N asks for."""
     started = time.monotonic()
     while True:
-        pending = [pool for pool in read_server_settings()["pools"] if not _settled(pool, r, n)]
+        pending = [b for b in read_server_settings()["buffers"] if not _settled(b, r, n)]
         waited = time.monotonic() - started
         if not pending:
-            if waited >= POOL_SETTLE_POLL_SECONDS:
-                print(f"Warm pool ready after {waited:.0f}s")
+            if waited >= BUFFER_SETTLE_POLL_SECONDS:
+                print(f"Warm buffer ready after {waited:.0f}s")
             return
-        if waited >= POOL_SETTLE_TIMEOUT_SECONDS:
-            pool = pending[0]
+        if waited >= BUFFER_SETTLE_TIMEOUT_SECONDS:
+            buffer = pending[0]
             raise ServerSettingsError(
-                f"{pool['deployment']} did not reach {_desired(pool, r, n)} ready warm pods "
-                f"within {POOL_SETTLE_TIMEOUT_SECONDS:.0f}s "
-                f"(available={pool['available']}, ready={pool['available_ready']})"
+                f"{buffer['deployment']} did not reach {_desired(buffer, r, n)} ready pods "
+                f"within {BUFFER_SETTLE_TIMEOUT_SECONDS:.0f}s "
+                f"(available={buffer['available']}, ready={buffer['available_ready']})"
             )
-        time.sleep(POOL_SETTLE_POLL_SECONDS)
+        time.sleep(BUFFER_SETTLE_POLL_SECONDS)
 
 
-def _desired(pool: dict[str, Any], r: int, n: int) -> int:
+def _desired(buffer: dict[str, Any], r: int, n: int) -> int:
     # Same formula as the controller's capacity reconciler.
-    return min(r, max(0, n - pool["assigned"]))
+    return min(r, max(0, n - buffer["assigned"]))
 
 
-def _settled(pool: dict[str, Any], r: int, n: int) -> bool:
-    desired = _desired(pool, r, n)
-    return pool["available"] == desired and pool["available_ready"] == desired
+def _settled(buffer: dict[str, Any], r: int, n: int) -> bool:
+    desired = _desired(buffer, r, n)
+    return buffer["available"] == desired and buffer["available_ready"] == desired
 
 
 def wait_for_current_policy() -> None:
     """Wait using the R/N already on the server, for callers that change neither."""
-    pools = read_server_settings()["pools"]
-    policies = {(pool["R"], pool["N"]) for pool in pools if None not in (pool["R"], pool["N"])}
+    pools = read_server_settings()["buffers"]
+    policies = {(buffer["R"], buffer["N"]) for buffer in pools if None not in (buffer["R"], buffer["N"])}
     for r, n in policies:
-        wait_for_pools(r, n)
+        wait_for_buffers(r, n)
 
 
 def describe_settings(settings: dict[str, Any]) -> str:
-    pools = ", ".join(
-        f"{pool['deployment']} R={pool['R']} N={pool['N']} ready={pool['available_ready']}"
-        for pool in settings["pools"]
+    buffer_text = ", ".join(
+        f"{buffer['deployment']} R={buffer['R']} N={buffer['N']} ready={buffer['available_ready']}"
+        for buffer in settings["buffers"]
     )
     return (
-        f"mode={settings['pool_mode']} controllers={settings['controller_replicas']} "
-        f"swlabssh={settings['swlabssh_replicas']} {pools}"
+        f"mode={settings['allocation_mode']} controllers={settings['controller_replicas']} "
+        f"swlabssh={settings['swlabssh_replicas']} {buffer_text}"
     )
 
 

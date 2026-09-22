@@ -42,13 +42,13 @@ class SummaryCollector:
     status_counts: Counter[str] = field(default_factory=Counter)
     command_counts: Counter[str] = field(default_factory=Counter)
     durations_ms: list[float] = field(default_factory=list)
-    schedule_lag_ms: list[float] = field(default_factory=list)
-    client_queue_delay_ms: list[float] = field(default_factory=list)
-    per_user_queue_delay_ms: list[float] = field(default_factory=list)
-    until_ticket_ms: list[float] = field(default_factory=list)
-    until_allocated_ms: list[float] = field(default_factory=list)
-    until_start_ms: list[float] = field(default_factory=list)
-    command_ms: list[float] = field(default_factory=list)
+    schedule_delay_ms: list[float] = field(default_factory=list)
+    client_send_delay_ms: list[float] = field(default_factory=list)
+    user_concurrency_delay_ms: list[float] = field(default_factory=list)
+    since_send_to_ticket_ms: list[float] = field(default_factory=list)
+    since_send_to_assigned_ms: list[float] = field(default_factory=list)
+    since_send_to_start_ms: list[float] = field(default_factory=list)
+    command_duration_ms: list[float] = field(default_factory=list)
     ticket_missing: int = 0
     allocation_missing: int = 0
     ssh_retried: int = 0
@@ -63,14 +63,14 @@ class SummaryCollector:
         self.by_command_status[command_name][status] += 1
 
         for target, key in (
-            (self.durations_ms, "duration_ms"),
-            (self.schedule_lag_ms, "schedule_lag_ms"),
-            (self.client_queue_delay_ms, "client_queue_delay_ms"),
-            (self.per_user_queue_delay_ms, "per_user_queue_delay_ms"),
-            (self.until_ticket_ms, "until_ticket_ms"),
-            (self.until_allocated_ms, "until_allocated_ms"),
-            (self.until_start_ms, "until_start_ms"),
-            (self.command_ms, "command_ms"),
+            (self.durations_ms, "request_duration_ms"),
+            (self.schedule_delay_ms, "schedule_delay_ms"),
+            (self.client_send_delay_ms, "client_send_delay_ms"),
+            (self.user_concurrency_delay_ms, "user_concurrency_delay_ms"),
+            (self.since_send_to_ticket_ms, "since_send_to_ticket_ms"),
+            (self.since_send_to_assigned_ms, "since_send_to_assigned_ms"),
+            (self.since_send_to_start_ms, "since_send_to_start_ms"),
+            (self.command_duration_ms, "command_duration_ms"),
         ):
             value = record.get(key)
             if isinstance(value, (int, float)) and math.isfinite(value):
@@ -94,14 +94,14 @@ class SummaryCollector:
             "by_command_status": {
                 name: dict(counter) for name, counter in self.by_command_status.items()
             },
-            "duration_ms": summarize_values(self.durations_ms),
-            "schedule_lag_ms": summarize_values(self.schedule_lag_ms),
-            "client_queue_delay_ms": summarize_values(self.client_queue_delay_ms),
-            "per_user_queue_delay_ms": summarize_values(self.per_user_queue_delay_ms),
-            "until_ticket_ms": summarize_values(self.until_ticket_ms),
-            "until_allocated_ms": summarize_values(self.until_allocated_ms),
-            "until_start_ms": summarize_values(self.until_start_ms),
-            "command_ms": summarize_values(self.command_ms),
+            "request_duration_ms": summarize_values(self.durations_ms),
+            "schedule_delay_ms": summarize_values(self.schedule_delay_ms),
+            "client_send_delay_ms": summarize_values(self.client_send_delay_ms),
+            "user_concurrency_delay_ms": summarize_values(self.user_concurrency_delay_ms),
+            "since_send_to_ticket_ms": summarize_values(self.since_send_to_ticket_ms),
+            "since_send_to_assigned_ms": summarize_values(self.since_send_to_assigned_ms),
+            "since_send_to_start_ms": summarize_values(self.since_send_to_start_ms),
+            "command_duration_ms": summarize_values(self.command_duration_ms),
             "ticket_missing": self.ticket_missing,
             "allocation_missing": self.allocation_missing,
             "ssh_retried": self.ssh_retried,

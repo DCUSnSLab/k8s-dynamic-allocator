@@ -5,13 +5,13 @@
 experiment:
   # Used for the result directory name and request ids.
   name: example_smoke
-  # Label only (e.g. warm-pool, cold-start, baseline-direct). The pool mode the
+  # Label only (e.g. warm_buffer, cold_start, baseline_direct). The pool mode the
   # controller actually runs is read from the server into summary.json.
-  pool_policy: warm-pool
+  system: warm_buffer
   # R and N. When both are set, the run applies them to the compute Deployment
-  # and waits for the warm pool before starting. null leaves the server as is.
-  pool_size: null
-  pool_total_max: null
+  # and waits for the warm buffer before starting. null leaves the server as is.
+  buffer_reserve: null
+  buffer_capacity: null
 
 ssh:
   host: 203.250.35.87
@@ -47,7 +47,7 @@ workload:
   # random schedule each run.
   random_seed: 1
   # Optional CSV trace to replay. Prefer generating one trace and replaying it
-  # across baseline, warm_pool, and cold_start experiments.
+  # across baseline, warm_buffer, and cold_start experiments.
   trace_file: null
 
   # Only used when profile is nhpp_daily.
@@ -84,7 +84,7 @@ setup:
 execution:
   # mode choices:
   #   kda             -> run the command on a compute pod through `run`
-  #   baseline-direct -> run the command directly on the user pod
+  #   baseline_direct -> run the command directly on the user pod
   mode: kda
 
 output:
