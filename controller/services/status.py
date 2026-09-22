@@ -48,12 +48,12 @@ class ControllerStatus:
         except Exception as exc:
             response["policy_ready"] = False
             response["policy_ready_error"] = str(exc)
-        response["buffers"] = self._provider_policy_status(buffer_list)
+        response["buffers"] = self._buffer_policy_status(buffer_list)
         if self.capacity_reconciler is not None:
             response["leader_control"] = self.capacity_reconciler.get_status()
         return response
 
-    def _pool_policy_status(self, buffer_list) -> Dict:
+    def _buffer_policy_status(self, buffer_list) -> Dict:
         deployments_by_type = {}
         deployment_list_error = ""
         try:

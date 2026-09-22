@@ -436,7 +436,7 @@ class ComputeQueues:
         }
         client = self._redis_client()
         try:
-            client.hset(self._provider_policy_key(compute_type_value), mapping=payload)
+            client.hset(self._buffer_policy_key(compute_type_value), mapping=payload)
             return policy
         except RedisError as exc:
             raise QueueUnavailableError(
@@ -447,7 +447,7 @@ class ComputeQueues:
         compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()
         try:
-            raw = client.hgetall(self._provider_policy_key(compute_type_value))
+            raw = client.hgetall(self._buffer_policy_key(compute_type_value))
         except RedisError as exc:
             raise QueueUnavailableError(
                 f"Failed to read buffer policy for {compute_type_value}: {exc}"
@@ -487,7 +487,7 @@ class ComputeQueues:
         compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()
         try:
-            return bool(client.delete(self._provider_policy_key(compute_type_value)))
+            return bool(client.delete(self._buffer_policy_key(compute_type_value)))
         except RedisError as exc:
             raise QueueUnavailableError(
                 f"Failed to clear buffer policy for {compute_type_value}: {exc}"
@@ -501,7 +501,7 @@ class ComputeQueues:
         try:
             return bool(
                 client.set(
-                    self._provider_policy_ready_key(),
+                    self._buffer_policy_ready_key(),
                     token_value,
                     ex=max(1, int(self.provider_policy_ready_ttl_seconds)),
                 )
@@ -527,7 +527,7 @@ class ComputeQueues:
                 client.eval(
                     renew_script,
                     1,
-                    self._provider_policy_ready_key(),
+                    self._buffer_policy_ready_key(),
                     token_value,
                     max(1, int(self.provider_policy_ready_ttl_seconds)),
                 )
@@ -541,7 +541,7 @@ class ComputeQueues:
         client = self._redis_client()
         try:
             if not token:
-                return bool(client.delete(self._provider_policy_ready_key()))
+                return bool(client.delete(self._buffer_policy_ready_key()))
             release_script = """
             if redis.call("get", KEYS[1]) == ARGV[1] then
                 return redis.call("del", KEYS[1])
@@ -552,7 +552,7 @@ class ComputeQueues:
                 client.eval(
                     release_script,
                     1,
-                    self._provider_policy_ready_key(),
+                    self._buffer_policy_ready_key(),
                     token,
                 )
             )
@@ -564,7 +564,7 @@ class ComputeQueues:
     def is_buffer_policy_ready(self) -> bool:
         client = self._redis_client()
         try:
-            return bool(client.exists(self._provider_policy_ready_key()))
+            return bool(client.exists(self._buffer_policy_ready_key()))
         except RedisError as exc:
             raise QueueUnavailableError(
                 f"Failed to inspect buffer policy readiness: {exc}"
