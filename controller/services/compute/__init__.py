@@ -1,19 +1,19 @@
 """Compute pod and compute-agent services"""
 
 from .agent_client import ComputeAgent, ComputeAgentError
-from .cold_start_pool import ColdStartComputePool
+from .cold_start_provider import ColdStartProvider
 from .cleanup import ComputeCleanup
 from .manager import ComputeManager
-from .pool_capacity_reconciler import PoolCapacityReconciler
-from .warm_pod_pool import WarmPodPool, PodConflictError
+from .buffer_capacity_reconciler import BufferCapacityReconciler
+from .warm_buffer_provider import WarmBufferProvider, PodConflictError
 
 __all__ = [
     "ComputeAgent",
     "ComputeAgentError",
-    "ColdStartComputePool",
+    "ColdStartProvider",
     "ComputeCleanup",
-    "WarmPodPool",
+    "WarmBufferProvider",
     "ComputeManager",
-    "PoolCapacityReconciler",
+    "BufferCapacityReconciler",
     "PodConflictError",
 ]

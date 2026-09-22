@@ -20,7 +20,7 @@ from config import settings
 
 from ..infra.kubernetes_client import KubernetesClient
 from .manifest_images import override_compute_agent_image
-from .warm_pod_pool import POOL_TOTAL_MAX_ANNOTATION
+from .warm_buffer_provider import BUFFER_CAPACITY_ANNOTATION
 
 logger = logging.getLogger(__name__)
 
@@ -36,18 +36,18 @@ MANIFESTS_DIR = os.path.join(
 )
 
 
-class ColdStartComputePool(KubernetesClient):
-    """Create request-scoped compute pods instead of maintaining a warm pool."""
+class ColdStartProvider(KubernetesClient):
+    """Create request-scoped compute pods instead of maintaining a warm buffer."""
 
     allocation_mode = "cold_start"
     uses_availability_watch = False
 
     LABEL_APP = "app"
     LABEL_COMPUTE_TYPE = "compute-type"
-    LABEL_STATUS = "pool-status"
+    LABEL_STATUS = "compute-status"
     LABEL_USER = "assigned-user"
 
-    APP_WARM_POOL = "warm-pod-pool"
+    APP_COMPUTE_POD = "compute-pod"
 
     STATUS_AVAILABLE = "available"
     STATUS_ASSIGNED = "assigned"
@@ -55,14 +55,14 @@ class ColdStartComputePool(KubernetesClient):
     # Cold start has no R -- nothing is created ahead of a request -- but N is
     # read from the same Deployment annotation the warm buffer uses, so both
     # allocation modes run under one capacity and one source of truth.
-    ANNOTATION_POOL_TOTAL_MAX = POOL_TOTAL_MAX_ANNOTATION
+    ANNOTATION_BUFFER_CAPACITY = BUFFER_CAPACITY_ANNOTATION
 
     def __init__(self):
         super().__init__()
         self.apps_v1 = client.AppsV1Api()
         self._templates_by_type: Dict[str, Dict] = {}
 
-    def initialize_pool(self, *, log_existing: bool = True) -> Dict:
+    def initialize_buffer(self, *, log_existing: bool = True) -> Dict:
         """Load and validate cold-start pod templates without creating pods."""
         results = {"created": [], "existing": [], "failed": [], "templates": []}
         self._templates_by_type = {}
@@ -111,7 +111,7 @@ class ColdStartComputePool(KubernetesClient):
         metadata["namespace"] = self.namespace
 
         labels = metadata.setdefault("labels", {})
-        labels[self.LABEL_APP] = self.APP_WARM_POOL
+        labels[self.LABEL_APP] = self.APP_COMPUTE_POD
         labels[self.LABEL_COMPUTE_TYPE] = compute_type
         labels[self.LABEL_STATUS] = self.STATUS_ASSIGNED
         labels[self.LABEL_USER] = user_pod
@@ -184,7 +184,7 @@ class ColdStartComputePool(KubernetesClient):
                 return False
             raise
 
-    def list_pool_status(self, compute_type: Optional[str] = None) -> List[Dict]:
+    def list_buffer_status(self, compute_type: Optional[str] = None) -> List[Dict]:
         pods = self.v1.list_namespaced_pod(
             namespace=self.namespace,
             label_selector=self._compute_selector(compute_type=compute_type),
@@ -199,7 +199,7 @@ class ColdStartComputePool(KubernetesClient):
                     "phase": pod.status.phase,
                     "app": labels.get(self.LABEL_APP, "unknown"),
                     "compute_type": labels.get(self.LABEL_COMPUTE_TYPE, "unknown"),
-                    "pool_status": labels.get(self.LABEL_STATUS, "unknown"),
+                    "buffer_status": labels.get(self.LABEL_STATUS, "unknown"),
                     "assigned_user": labels.get(self.LABEL_USER, ""),
                     "ready": self._pod_is_ready(pod),
                     "not_ready_since": self._pod_not_ready_since(pod),
@@ -223,7 +223,7 @@ class ColdStartComputePool(KubernetesClient):
         values = []
         for deployment in deployments.items:
             raw = (getattr(deployment.metadata, "annotations", None) or {}).get(
-                self.ANNOTATION_POOL_TOTAL_MAX
+                self.ANNOTATION_BUFFER_CAPACITY
             )
             if raw is None:
                 continue
@@ -233,7 +233,7 @@ class ColdStartComputePool(KubernetesClient):
                 logger.warning(
                     "[Warning] operation=cold_start_capacity deployment=%s reason=%r",
                     deployment.metadata.name,
-                    f"{self.ANNOTATION_POOL_TOTAL_MAX} is not an integer: {raw!r}",
+                    f"{self.ANNOTATION_BUFFER_CAPACITY} is not an integer: {raw!r}",
                 )
         if not values:
             return None
@@ -245,11 +245,11 @@ class ColdStartComputePool(KubernetesClient):
         """Pods that still hold capacity. Terminating ones are already giving it back."""
         return sum(
             1
-            for pod in self.list_pool_status(compute_type=compute_type)
+            for pod in self.list_buffer_status(compute_type=compute_type)
             if not pod["terminating"]
         )
 
-    def drain_warm_deployments(self) -> int:
+    def drain_buffer_deployments(self) -> int:
         """Scale the warm Deployments to zero and report how many were scaled.
 
         Cold start never allocates those Pods, but nothing else scales them down
@@ -260,7 +260,7 @@ class ColdStartComputePool(KubernetesClient):
         scaled = 0
         deployments = self.apps_v1.list_namespaced_deployment(
             namespace=self.namespace,
-            label_selector=f"{self.LABEL_APP}={self.APP_WARM_POOL}",
+            label_selector=f"{self.LABEL_APP}={self.APP_COMPUTE_POD}",
             _request_timeout=self.api_request_timeout,
         )
         for deployment in deployments.items:
@@ -287,7 +287,7 @@ class ColdStartComputePool(KubernetesClient):
 
     def _template_for_compute_type(self, compute_type: str) -> Dict:
         if compute_type not in self._templates_by_type:
-            self.initialize_pool(log_existing=False)
+            self.initialize_buffer(log_existing=False)
         template = self._templates_by_type.get(compute_type)
         if not template:
             raise ValueError(f"No cold-start compute pod template for compute_type={compute_type}")
@@ -300,15 +300,15 @@ class ColdStartComputePool(KubernetesClient):
             raise ValueError("Cold-start compute manifest must be kind=Pod")
 
         labels = spec.get("metadata", {}).get("labels", {})
-        if labels.get(self.LABEL_APP) != self.APP_WARM_POOL:
-            raise ValueError("Cold-start compute pod template must set app=warm-pod-pool")
+        if labels.get(self.LABEL_APP) != self.APP_COMPUTE_POD:
+            raise ValueError("Cold-start compute pod template must set app=compute-pod")
 
         compute_type = labels.get(self.LABEL_COMPUTE_TYPE)
         if not compute_type:
             raise ValueError("Cold-start compute pod template must set compute-type")
 
         if labels.get(self.LABEL_STATUS) != self.STATUS_ASSIGNED:
-            raise ValueError("Cold-start compute pod template must set pool-status=assigned")
+            raise ValueError("Cold-start compute pod template must set compute-status=assigned")
 
         if self.LABEL_USER not in labels:
             raise ValueError("Cold-start compute pod template must define assigned-user")
@@ -319,7 +319,7 @@ class ColdStartComputePool(KubernetesClient):
         return self._normalize_compute_type(compute_type)
 
     def _compute_selector(self, compute_type: Optional[str] = None) -> str:
-        parts = [f"{self.LABEL_APP}={self.APP_WARM_POOL}"]
+        parts = [f"{self.LABEL_APP}={self.APP_COMPUTE_POD}"]
         if compute_type:
             parts.append(f"{self.LABEL_COMPUTE_TYPE}={self._normalize_compute_type(compute_type)}")
         return ",".join(parts)

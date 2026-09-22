@@ -6,10 +6,10 @@ namespace="${DEPLOY_NAMESPACE}"
 storage_class="${DEPLOY_STORAGE_CLASS}"
 overlay="${DEPLOY_OVERLAY}"
 stage_label="${DEPLOY_STAGE_LABEL}"
-pool_available_min="${POOL_AVAILABLE_MIN}"
-pool_total_max="${POOL_TOTAL_MAX}"
-pool_annotation_r='k8s-dynamic-allocator/pool-available-min'
-pool_annotation_n='k8s-dynamic-allocator/pool-total-max'
+buffer_reserve="${BUFFER_RESERVE}"
+buffer_capacity="${BUFFER_CAPACITY}"
+buffer_reserve_annotation='k8s-dynamic-allocator/buffer-reserve'
+buffer_capacity_annotation='k8s-dynamic-allocator/buffer-capacity'
 rendered="${WORKSPACE}/.kda-deploy-${BUILD_NUMBER}.yaml"
 kustomization="${overlay}/kustomization.yaml"
 kustomization_backup="${WORKSPACE}/.kda-deploy-kustomization-${BUILD_NUMBER}.bak"
@@ -25,16 +25,16 @@ done
 
 # Mirror the controller's own fail-closed rule (0 <= R <= N) so a bad build
 # parameter is rejected before anything is applied to the cluster.
-for policy_value in "${pool_available_min}" "${pool_total_max}"; do
+for policy_value in "${buffer_reserve}" "${buffer_capacity}"; do
     case "${policy_value}" in
         ''|*[!0-9]*)
-            echo "[PreflightFailed] pool policy must be non-negative integers: R=${pool_available_min} N=${pool_total_max}"
+            echo "[PreflightFailed] buffer policy must be non-negative integers: R=${buffer_reserve} N=${buffer_capacity}"
             exit 1
             ;;
     esac
 done
-if [ "${pool_available_min}" -gt "${pool_total_max}" ]; then
-    echo "[PreflightFailed] pool policy must satisfy R <= N: R=${pool_available_min} N=${pool_total_max}"
+if [ "${buffer_reserve}" -gt "${buffer_capacity}" ]; then
+    echo "[PreflightFailed] buffer policy must satisfy R <= N: R=${buffer_reserve} N=${buffer_capacity}"
     exit 1
 fi
 
@@ -230,10 +230,10 @@ done
 # R/N live on the Deployment's metadata annotations. The controller watches
 # them and never overwrites an operator-supplied value, so applying the build
 # parameters here is enough - no controller restart and no pod churn.
-echo "[Deploy] Apply pool policy R=${pool_available_min} N=${pool_total_max}"
+echo "[Deploy] Apply buffer policy R=${buffer_reserve} N=${buffer_capacity}"
 kubectl annotate deployment/compute-general \
-    "${pool_annotation_r}=${pool_available_min}" \
-    "${pool_annotation_n}=${pool_total_max}" \
+    "${buffer_reserve_annotation}=${buffer_reserve}" \
+    "${buffer_capacity_annotation}=${buffer_capacity}" \
     -n "${namespace}" --overwrite
 
 # The controller creates compute-general from its manifest only when it is
@@ -256,7 +256,7 @@ kubectl patch deployment/compute-general -n "${namespace}" --type=strategic \
 kubectl rollout status deployment/compute-general \
     -n "${namespace}" --timeout=5m
 
-echo '[Smoke] Wait for shared pool policy to become active'
+echo '[Smoke] Wait for shared buffer policy to become active'
 attempt=0
 until kubectl exec -n "${namespace}" deployment/controller -- \
     python -c '
@@ -268,12 +268,12 @@ expected_r = int(sys.argv[1])
 expected_n = int(sys.argv[2])
 
 with urllib.request.urlopen(
-    "http://127.0.0.1:9001/api/pool/status/",
+    "http://127.0.0.1:9001/api/compute/status/",
     timeout=5,
 ) as response:
     status = json.load(response)
 
-general = (status.get("pools") or {}).get("general") or {}
+general = (status.get("buffers") or {}).get("general") or {}
 ready = (
     status.get("policy_ready") is True
     and general.get("policy_valid") is True
@@ -282,18 +282,18 @@ ready = (
     and general.get("N") == expected_n
 )
 sys.exit(0 if ready else 1)
-' "${pool_available_min}" "${pool_total_max}" >/dev/null
+' "${buffer_reserve}" "${buffer_capacity}" >/dev/null
 do
     attempt=$((attempt + 1))
     if [ "${attempt}" -ge 40 ]; then
-        echo '[SmokeFailed] shared pool policy was not active within 120 seconds'
+        echo '[SmokeFailed] shared buffer policy was not active within 120 seconds'
         kubectl exec -n "${namespace}" deployment/controller -- \
             python -c '
 import json
 import urllib.request
 
 with urllib.request.urlopen(
-    "http://127.0.0.1:9001/api/pool/status/",
+    "http://127.0.0.1:9001/api/compute/status/",
     timeout=5,
 ) as response:
     print(json.dumps(json.load(response), sort_keys=True))
@@ -322,14 +322,14 @@ test "${actual_controller_image}" = "${CONTROLLER_IMAGE}"
 test "${actual_compute_image}" = "${COMPUTE_POD_IMAGE}"
 test "${actual_swlabssh_image}" = "${SWLABSSH_IMAGE}"
 
-actual_pool_available_min=$(kubectl get deployment/compute-general \
+actual_buffer_reserve=$(kubectl get deployment/compute-general \
     -n "${namespace}" \
-    -o go-template="{{index .metadata.annotations \"${pool_annotation_r}\"}}")
-actual_pool_total_max=$(kubectl get deployment/compute-general \
+    -o go-template="{{index .metadata.annotations \"${buffer_reserve_annotation}\"}}")
+actual_buffer_capacity=$(kubectl get deployment/compute-general \
     -n "${namespace}" \
-    -o go-template="{{index .metadata.annotations \"${pool_annotation_n}\"}}")
-test "${actual_pool_available_min}" = "${pool_available_min}"
-test "${actual_pool_total_max}" = "${pool_total_max}"
+    -o go-template="{{index .metadata.annotations \"${buffer_capacity_annotation}\"}}")
+test "${actual_buffer_reserve}" = "${buffer_reserve}"
+test "${actual_buffer_capacity}" = "${buffer_capacity}"
 
 runtime_compute_image=$(kubectl exec -n "${namespace}" \
     deployment/controller -- \
@@ -377,5 +377,5 @@ test "${fluent_bit_desired}" -gt 0
 test "${fluent_bit_ready}" -eq "${fluent_bit_desired}"
 
 echo "[Success] image tag=${IMAGE_TAG}"
-echo "[Success] pool policy R=${pool_available_min} N=${pool_total_max}"
+echo "[Success] buffer policy R=${buffer_reserve} N=${buffer_capacity}"
 echo "[Success] SSH endpoint=${DEPLOY_SSH_HOST}:${DEPLOY_SSH_PORT}"

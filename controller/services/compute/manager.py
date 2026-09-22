@@ -14,14 +14,14 @@ from .releaser import ComputeReleaser
 class ComputeManager:
     """Public facade for compute-pod allocation, release, and queue dispatch."""
 
-    def __init__(self, pool, queues, tickets):
-        self.pool = pool
+    def __init__(self, provider, queues, tickets):
+        self.provider = provider
         self.queues = queues
         self.tickets = tickets
-        self.allocator = ComputeAllocator(pool, queues, tickets)
-        self.releaser = ComputeReleaser(pool, queues, tickets)
+        self.allocator = ComputeAllocator(provider, queues, tickets)
+        self.releaser = ComputeReleaser(provider, queues, tickets)
         self.queue_processor = ComputeQueueProcessor(
-            pool,
+            provider,
             queues,
             tickets,
             allocator=self.allocator,
@@ -36,7 +36,7 @@ class ComputeManager:
         user_pod_ip: str,
         user_pod: str = "",
         compute_type: Optional[str] = None,
-        ingress_ts_ms: Optional[int] = None,
+        request_at_ms: Optional[int] = None,
         ticket_id: Optional[str] = None,
     ) -> Dict:
         try:
@@ -55,7 +55,7 @@ class ComputeManager:
                 user_pod_ip=user_pod_ip,
                 compute_type=compute_type_value,
                 request_id=get_request_label(),
-                ingress_ts_ms=ingress_ts_ms,
+                request_at_ms=request_at_ms,
                 ticket_id=ticket_id,
             )
 
@@ -66,7 +66,7 @@ class ComputeManager:
                 ticket=ticket,
                 include_ticket_fields=(),
                 queue_position=ticket.get("queue_position"),
-                ingress_ts_ms=ticket.get("ingress_ts_ms"),
+                request_at_ms=ticket.get("request_at_ms"),
             )
 
             self.queue_processor.kick_wait_queue_worker(compute_type_value)
@@ -149,14 +149,14 @@ class ComputeManager:
             cancelled = self.tickets.cancel_ticket(ticket_id, reason=reason)
             final_ticket = cancelled or self.tickets.get_ticket(ticket_id) or current
             if final_ticket and str(final_ticket.get("status") or "").lower() == "cancelled":
-                queue_wait_ms = ticket_format.elapsed_since_ingress_ms(final_ticket, "cancelled_at")
+                since_request_to_claim_ms = ticket_format.elapsed_since_ingress_ms(final_ticket, "cancelled_at")
                 ticket_format.log_queue_event(
                     "info",
                     "Cancelled",
                     final_ticket,
                     include_ticket_fields=(),
                     reason=reason or final_ticket.get("error") or "user_cancel",
-                    queue_wait_ms=queue_wait_ms,
+                    since_request_to_claim_ms=since_request_to_claim_ms,
                 )
             elif final_ticket:
                 ticket_format.log_queue_event(
@@ -169,7 +169,7 @@ class ComputeManager:
             compute_pod = final_ticket.get("compute_pod") or ""
             if compute_pod and final_ticket.get("status") in {"cancelled", "failed"}:
                 try:
-                    self.pool.release_pod(compute_pod)
+                    self.provider.release_pod(compute_pod)
                 except Exception as exc:
                     ticket_format.log_queue_event(
                         "warning",

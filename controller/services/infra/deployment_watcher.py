@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class DeploymentPolicyWatcher:
-    """Watch warm-pool Deployments and report policy or lifecycle changes."""
+    """Watch warm-buffer Deployments and report policy or lifecycle changes."""
 
     def __init__(
         self,
@@ -19,7 +19,7 @@ class DeploymentPolicyWatcher:
         apps_v1,
         namespace: str,
         on_policy_event: Optional[Callable[[str, object, str], None]] = None,
-        label_selector: str = "app=warm-pod-pool",
+        label_selector: str = "app=compute-pod",
         enabled: bool = True,
         timeout_seconds: int = 60,
         retry_seconds: float = 1.0,

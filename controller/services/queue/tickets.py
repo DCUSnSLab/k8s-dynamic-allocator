@@ -86,7 +86,7 @@ class Tickets:
         ticket["ticket_id"] = ticket_id
         ticket["retry_count"] = safe_int(ticket.get("retry_count"), 0)
         ticket["max_retries"] = safe_int(ticket.get("max_retries"), self.queue.max_retries)
-        ticket["ingress_ts_ms"] = safe_int(ticket.get("ingress_ts_ms"), 0)
+        ticket["request_at_ms"] = safe_int(ticket.get("request_at_ms"), 0)
         ticket["last_poll_ms"] = safe_int(ticket.get("last_poll_ms"), 0)
         for field in (
             "created_at",
@@ -122,7 +122,7 @@ class Tickets:
             "request_id": "",
             "request_label": "",
             "ticket_short": "",
-            "ingress_ts_ms": "0",
+            "request_at_ms": "0",
             "last_poll_ms": "0",
             "claimed_by": "",
             "claim_token": "",
@@ -153,7 +153,7 @@ class Tickets:
         user_pod_ip: str,
         compute_type: Optional[str] = None,
         request_id: Optional[str] = None,
-        ingress_ts_ms: Optional[int] = None,
+        request_at_ms: Optional[int] = None,
         ticket_id: Optional[str] = None,
     ) -> Dict[str, object]:
         compute_type_value = self.queue.normalize_compute_type(compute_type)
@@ -170,7 +170,7 @@ class Tickets:
             request_id=request_id or "",
             request_label=request_label,
             ticket_short=ticket_short,
-            ingress_ts_ms=ingress_ts_ms or 0,
+            request_at_ms=request_at_ms or 0,
         )
         client = self.queue._redis_client()
         try:

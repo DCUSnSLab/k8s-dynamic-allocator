@@ -3,9 +3,9 @@ kind: Pod
 metadata:
   name: compute-general-cold-template
   labels:
-    app: warm-pod-pool
+    app: compute-pod
     compute-type: general
-    pool-status: assigned
+    compute-status: assigned
     assigned-user: ""
 spec:
   restartPolicy: Always

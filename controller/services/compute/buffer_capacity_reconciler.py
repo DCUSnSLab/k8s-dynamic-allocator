@@ -12,45 +12,45 @@ from ..queue import QueueUnavailableError
 logger = logging.getLogger(__name__)
 
 
-class PoolCapacityReconciler:
+class BufferCapacityReconciler:
     """Leader-only R/N policy cache and Deployment scale reconciler."""
 
     def __init__(
         self,
-        pool,
+        provider,
         queues,
         on_capacity_available: Optional[Callable[[Optional[str]], None]] = None,
         on_periodic_cleanup: Optional[Callable[[], Dict]] = None,
     ):
-        self.pool = pool
+        self.provider = provider
         self.queues = queues
         self.on_capacity_available = on_capacity_available
         self.on_periodic_cleanup = on_periodic_cleanup
 
         self.debounce_seconds = max(
             0.0,
-            float(settings.POOL_RECONCILE_DEBOUNCE_SECONDS),
+            float(settings.BUFFER_RECONCILE_DEBOUNCE_SECONDS),
         )
         self.resync_seconds = max(
             1.0,
-            float(settings.POOL_RECONCILE_RESYNC_SECONDS),
+            float(settings.BUFFER_RECONCILE_RESYNC_SECONDS),
         )
         self.wait_timeout_seconds = max(
             0.1,
-            float(settings.POOL_SCALE_DOWN_WAIT_TIMEOUT_SECONDS),
+            float(settings.BUFFER_SCALE_DOWN_WAIT_TIMEOUT_SECONDS),
         )
         self.gate_renew_seconds = max(
             0.1,
             min(
-                float(settings.POOL_SCALE_DOWN_GATE_RENEW_SECONDS),
-                max(0.1, float(settings.POOL_SCALE_DOWN_GATE_TTL_SECONDS) / 2.0),
+                float(settings.BUFFER_SCALE_DOWN_GATE_RENEW_SECONDS),
+                max(0.1, float(settings.BUFFER_SCALE_DOWN_GATE_TTL_SECONDS) / 2.0),
             ),
         )
         self.policy_ready_renew_seconds = max(
             0.1,
             min(
-                float(settings.POOL_POLICY_READY_RENEW_SECONDS),
-                max(0.1, float(settings.POOL_POLICY_READY_TTL_SECONDS) / 2.0),
+                float(settings.BUFFER_POLICY_READY_RENEW_SECONDS),
+                max(0.1, float(settings.BUFFER_POLICY_READY_TTL_SECONDS) / 2.0),
             ),
         )
 
@@ -72,10 +72,10 @@ class PoolCapacityReconciler:
         self._status: Dict[str, Dict] = {}
 
     @staticmethod
-    def desired_replicas(pool_available_min: int, pool_total_max: int, assigned: int) -> int:
+    def desired_replicas(buffer_reserve: int, buffer_capacity: int, assigned: int) -> int:
         return min(
-            int(pool_available_min),
-            max(0, int(pool_total_max) - int(assigned)),
+            int(buffer_reserve),
+            max(0, int(buffer_capacity) - int(assigned)),
         )
 
     def set_leadership_validator(self, validator: Callable[[], bool]) -> None:
@@ -111,7 +111,7 @@ class PoolCapacityReconciler:
             self._policy_ready = False
             self._last_policy_sync_succeeded = False
             try:
-                self.queues.clear_pool_policy_ready()
+                self.queues.clear_buffer_policy_ready()
             except QueueUnavailableError as exc:
                 logger.warning(
                     "[Warning] operation=pool_policy_ready_invalidate reason=%r",
@@ -152,7 +152,7 @@ class PoolCapacityReconciler:
         token = self._policy_ready_token
         if token:
             try:
-                self.queues.clear_pool_policy_ready(token)
+                self.queues.clear_buffer_policy_ready(token)
             except QueueUnavailableError as exc:
                 logger.warning(
                     "[Warning] operation=pool_policy_ready_clear reason=%r",
@@ -161,11 +161,11 @@ class PoolCapacityReconciler:
         self._policy_ready = False
         logger.info("[PoolCapacityReconcilerStopped]")
 
-    def on_pool_event(self, event_type: str, pod, source: str = "watch") -> None:
+    def on_buffer_event(self, event_type: str, pod, source: str = "watch") -> None:
         del event_type, source
         metadata = getattr(pod, "metadata", None)
         labels = getattr(metadata, "labels", None) or {}
-        compute_type = labels.get(self.pool.LABEL_COMPUTE_TYPE)
+        compute_type = labels.get(self.provider.LABEL_COMPUTE_TYPE)
         if compute_type:
             self.request_reconcile(compute_type)
 
@@ -181,7 +181,7 @@ class PoolCapacityReconciler:
         metadata = getattr(deployment, "metadata", None)
         labels = getattr(metadata, "labels", None) or {}
         compute_type = self.queues.normalize_compute_type(
-            labels.get(self.pool.LABEL_COMPUTE_TYPE)
+            labels.get(self.provider.LABEL_COMPUTE_TYPE)
         )
         self.request_reconcile(compute_type)
         self.request_policy_refresh()
@@ -306,7 +306,7 @@ class PoolCapacityReconciler:
                         next_ready_renew_at = float("inf")
                         continue
                     try:
-                        renewed = self.queues.renew_pool_policy_ready(
+                        renewed = self.queues.renew_buffer_policy_ready(
                             self._policy_ready_token
                         )
                     except QueueUnavailableError as exc:
@@ -351,7 +351,7 @@ class PoolCapacityReconciler:
                         self.request_policy_refresh(retry=True)
                     else:
                         try:
-                            self.queues.publish_pool_policy_ready(
+                            self.queues.publish_buffer_policy_ready(
                                 self._policy_ready_token
                             )
                             self._policy_ready = True
@@ -386,7 +386,7 @@ class PoolCapacityReconciler:
                             self.request_policy_refresh(retry=True)
         except Exception as exc:
             logger.exception(
-                "[Failed] operation=pool_capacity_reconciler reason=%r",
+                "[Failed] operation=buffer_capacity_reconciler reason=%r",
                 str(exc),
             )
         finally:
@@ -401,7 +401,7 @@ class PoolCapacityReconciler:
         if self._stop_event.is_set() or not self._has_write_authority():
             return set()
         try:
-            deployments = self.pool.list_pool_deployments()
+            deployments = self.provider.list_buffer_deployments()
         except Exception as exc:
             logger.warning(
                 "[Warning] operation=pool_policy_sync reason=%r",
@@ -416,7 +416,7 @@ class PoolCapacityReconciler:
             metadata = getattr(deployment, "metadata", None)
             labels = getattr(metadata, "labels", None) or {}
             compute_type = self.queues.normalize_compute_type(
-                labels.get(self.pool.LABEL_COMPUTE_TYPE)
+                labels.get(self.provider.LABEL_COMPUTE_TYPE)
             )
             deployments_by_type.setdefault(compute_type, []).append(deployment)
 
@@ -424,11 +424,11 @@ class PoolCapacityReconciler:
         for compute_type, matching in deployments_by_type.items():
             if len(matching) != 1:
                 invalid_by_type[compute_type] = (
-                    "Exactly one warm-pool Deployment is required per compute-type"
+                    "Exactly one warm-buffer Deployment is required per compute-type"
                 )
                 continue
             try:
-                valid_policies[compute_type] = self.pool.parse_deployment_policy(
+                valid_policies[compute_type] = self.provider.parse_deployment_policy(
                     matching[0]
                 )
             except ValueError as exc:
@@ -458,7 +458,7 @@ class PoolCapacityReconciler:
                 )
             error = invalid_by_type.get(
                 compute_type,
-                "No warm-pool Deployment exists for this compute-type",
+                "No warm-buffer Deployment exists for this compute-type",
             )
             self._record_status(
                 compute_type,
@@ -538,7 +538,7 @@ class PoolCapacityReconciler:
         compute_type_value = self.queues.normalize_compute_type(compute_type)
         if self._stop_event.is_set() or not self._has_write_authority():
             return False
-        current = self.queues.get_pool_policy(compute_type_value)
+        current = self.queues.get_buffer_policy(compute_type_value)
         if self._same_policy(current, policy):
             return True
 
@@ -563,14 +563,14 @@ class PoolCapacityReconciler:
 
             if self._stop_event.is_set() or not self._has_write_authority():
                 return False
-            current = self.queues.get_pool_policy(compute_type_value)
+            current = self.queues.get_buffer_policy(compute_type_value)
             if self._same_policy(current, policy):
                 return True
 
             if policy is None:
-                self.queues.clear_pool_policy(compute_type_value)
+                self.queues.clear_buffer_policy(compute_type_value)
             else:
-                self.queues.set_pool_policy(
+                self.queues.set_buffer_policy(
                     compute_type=compute_type_value,
                     deployment_name=policy["deployment_name"],
                     R=policy["R"],
@@ -605,7 +605,7 @@ class PoolCapacityReconciler:
         if not token:
             return
         try:
-            self.queues.clear_pool_policy_ready(token)
+            self.queues.clear_buffer_policy_ready(token)
         except QueueUnavailableError as exc:
             logger.warning(
                 "[Warning] operation=pool_policy_ready_clear reason=%r",
@@ -622,7 +622,7 @@ class PoolCapacityReconciler:
                 "reason": "leadership_not_valid",
             }
         try:
-            policy = self.queues.get_pool_policy(compute_type_value)
+            policy = self.queues.get_buffer_policy(compute_type_value)
             if not policy:
                 result = {
                     "compute_type": compute_type_value,
@@ -632,13 +632,13 @@ class PoolCapacityReconciler:
                 self._record_status(compute_type_value, **result)
                 return result
 
-            snapshot = self.pool.list_pool_snapshot(compute_type_value)
+            snapshot = self.provider.list_buffer_snapshot(compute_type_value)
             desired = self.desired_replicas(
                 policy["R"],
                 policy["N"],
-                snapshot["pool_assigned"],
+                snapshot["buffer_assigned"],
             )
-            current = self.pool.read_deployment_replicas(
+            current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]
             )
 
@@ -648,8 +648,8 @@ class PoolCapacityReconciler:
                 "R": policy["R"],
                 "N": policy["N"],
                 "pool_total": snapshot["pool_total"],
-                "pool_available": snapshot["pool_available"],
-                "pool_assigned": snapshot["pool_assigned"],
+                "buffer_available": snapshot["buffer_available"],
+                "buffer_assigned": snapshot["buffer_assigned"],
                 "current_replicas": current,
                 "desired_replicas": desired,
             }
@@ -671,7 +671,7 @@ class PoolCapacityReconciler:
                 self._record_status(compute_type_value, **result)
                 return result
 
-            if snapshot["pool_available"] > desired:
+            if snapshot["buffer_available"] > desired:
                 result = self._scale_down(
                     compute_type_value,
                     policy,
@@ -714,20 +714,20 @@ class PoolCapacityReconciler:
             }
 
         try:
-            policy = self.queues.get_pool_policy(compute_type)
+            policy = self.queues.get_buffer_policy(compute_type)
             if not policy:
                 return {
                     **base_result,
                     "status": "blocked",
                     "reason": "policy_unavailable",
                 }
-            snapshot = self.pool.list_pool_snapshot(compute_type)
+            snapshot = self.provider.list_buffer_snapshot(compute_type)
             desired = self.desired_replicas(
                 policy["R"],
                 policy["N"],
-                snapshot["pool_assigned"],
+                snapshot["buffer_assigned"],
             )
-            current = self.pool.read_deployment_replicas(
+            current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]
             )
             refreshed = {
@@ -735,12 +735,12 @@ class PoolCapacityReconciler:
                 "R": policy["R"],
                 "N": policy["N"],
                 "pool_total": snapshot["pool_total"],
-                "pool_available": snapshot["pool_available"],
-                "pool_assigned": snapshot["pool_assigned"],
+                "buffer_available": snapshot["buffer_available"],
+                "buffer_assigned": snapshot["buffer_assigned"],
                 "current_replicas": current,
                 "desired_replicas": desired,
             }
-            if current > desired or snapshot["pool_available"] > desired:
+            if current > desired or snapshot["buffer_available"] > desired:
                 return {
                     **refreshed,
                     "status": "deferred",
@@ -757,7 +757,7 @@ class PoolCapacityReconciler:
                     "retry": True,
                 }
 
-            patched = self.pool.patch_deployment_replicas(
+            patched = self.provider.patch_deployment_replicas(
                 policy["deployment_name"],
                 desired,
             )
@@ -767,7 +767,7 @@ class PoolCapacityReconciler:
                 compute_type,
                 current,
                 desired,
-                snapshot["pool_assigned"],
+                snapshot["buffer_assigned"],
                 policy["R"],
                 policy["N"],
             )
@@ -857,7 +857,7 @@ class PoolCapacityReconciler:
                         "retry": True,
                     }
 
-                policy = self.queues.get_pool_policy(compute_type)
+                policy = self.queues.get_buffer_policy(compute_type)
                 if not policy:
                     return {
                         **base_result,
@@ -865,13 +865,13 @@ class PoolCapacityReconciler:
                         "reason": "policy_unavailable",
                     }
 
-                snapshot = self.pool.list_pool_snapshot(compute_type)
+                snapshot = self.provider.list_buffer_snapshot(compute_type)
                 desired = self.desired_replicas(
                     policy["R"],
                     policy["N"],
-                    snapshot["pool_assigned"],
+                    snapshot["buffer_assigned"],
                 )
-                current = self.pool.read_deployment_replicas(
+                current = self.provider.read_deployment_replicas(
                     policy["deployment_name"]
                 )
                 refreshed_result = {
@@ -880,8 +880,8 @@ class PoolCapacityReconciler:
                     "R": policy["R"],
                     "N": policy["N"],
                     "pool_total": snapshot["pool_total"],
-                    "pool_available": snapshot["pool_available"],
-                    "pool_assigned": snapshot["pool_assigned"],
+                    "buffer_available": snapshot["buffer_available"],
+                    "buffer_assigned": snapshot["buffer_assigned"],
                     "current_replicas": current,
                     "desired_replicas": desired,
                 }
@@ -893,7 +893,7 @@ class PoolCapacityReconciler:
                         "retry": True,
                     }
 
-                if current == desired and snapshot["pool_available"] <= desired:
+                if current == desired and snapshot["buffer_available"] <= desired:
                     return {
                         **refreshed_result,
                         "status": "converged",
@@ -907,7 +907,7 @@ class PoolCapacityReconciler:
                             "reason": "leadership_or_gate_lost",
                             "retry": True,
                         }
-                    self.pool.patch_deployment_replicas(
+                    self.provider.patch_deployment_replicas(
                         policy["deployment_name"],
                         desired,
                     )
@@ -1054,7 +1054,7 @@ class PoolCapacityReconciler:
             and not gate_lost.is_set()
             and time.monotonic() < deadline
         ):
-            snapshot = self.pool.list_pool_snapshot(compute_type)
+            snapshot = self.provider.list_buffer_snapshot(compute_type)
             if snapshot["assigned_with_replicaset_owner"] == 0:
                 return True
             self._wait_for_event(min(0.5, max(0.0, deadline - time.monotonic())))
@@ -1073,8 +1073,8 @@ class PoolCapacityReconciler:
             and not gate_lost.is_set()
             and time.monotonic() < deadline
         ):
-            snapshot = self.pool.list_pool_snapshot(compute_type)
-            if snapshot["pool_available"] <= desired:
+            snapshot = self.provider.list_buffer_snapshot(compute_type)
+            if snapshot["buffer_available"] <= desired:
                 return True
             self._wait_for_event(min(0.5, max(0.0, deadline - time.monotonic())))
         return False

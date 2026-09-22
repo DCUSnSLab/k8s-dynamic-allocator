@@ -18,12 +18,12 @@ class ComputeReleaser:
 
     def __init__(
         self,
-        pool,
+        provider,
         queues,
         tickets,
         on_released: Optional[Callable[[Optional[str]], None]] = None,
     ):
-        self.pool = pool
+        self.provider = provider
         self.queues = queues
         self.tickets = tickets
         self._on_released = on_released or (lambda compute_type: None)
@@ -32,7 +32,7 @@ class ComputeReleaser:
         self._on_released = on_released
 
     def release_compute_pod(self, compute_pod: str, request_context: Optional[Dict[str, object]] = None) -> Dict:
-        """Release a Compute Pod back to the pool."""
+        """Release a Compute Pod back to the buffer."""
         return self._release(compute_pod, request_context, unmount=True)
 
     def release_unreachable_compute_pod(
@@ -76,9 +76,9 @@ class ComputeReleaser:
             release_started = time.perf_counter()
             compute_type = self.queues.default_compute_type
             try:
-                pod = self.pool.v1.read_namespaced_pod(compute_pod, self.pool.namespace)
+                pod = self.provider.v1.read_namespaced_pod(compute_pod, self.provider.namespace)
                 labels = pod.metadata.labels or {}
-                compute_type = self.queues.normalize_compute_type(labels.get(self.pool.LABEL_COMPUTE_TYPE))
+                compute_type = self.queues.normalize_compute_type(labels.get(self.provider.LABEL_COMPUTE_TYPE))
             except ApiException as exc:
                 if exc.status != 404:
                     raise
@@ -114,7 +114,7 @@ class ComputeReleaser:
                 )
             released_compute_type = compute_type
 
-            compute_pod_ip = self.pool.get_pod_ip(compute_pod)
+            compute_pod_ip = self.provider.get_pod_ip(compute_pod)
             if compute_pod_ip and not compute_unmounted:
                 # Best effort: the Pod is deleted right after and takes the mount
                 # namespace with it, so a silent agent must not block the release.
@@ -129,7 +129,7 @@ class ComputeReleaser:
                         str(exc),
                     )
 
-            released_now = self.pool.release_pod(compute_pod)
+            released_now = self.provider.release_pod(compute_pod)
             if not released_now:
                 logger.debug("[Released] compute_pod=%s status=already_released_or_terminating", compute_pod)
                 cleanup_context = True
@@ -234,7 +234,7 @@ class ComputeReleaser:
         if not compute_pod:
             return True
         try:
-            self.pool.release_pod(compute_pod)
+            self.provider.release_pod(compute_pod)
             return True
         except Exception as exc:
             logger.warning(

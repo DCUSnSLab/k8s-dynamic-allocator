@@ -53,7 +53,7 @@ class ComputeQueues:
         max_retries: Optional[int] = None,
         worker_identity: Optional[str] = None,
         scale_down_gate_ttl_seconds: Optional[int] = None,
-        pool_policy_ready_ttl_seconds: Optional[int] = None,
+        buffer_policy_ready_ttl_seconds: Optional[int] = None,
     ):
         self.redis_url = redis_url or settings.REDIS_URL
         self.prefix = prefix or settings.WAIT_QUEUE_PREFIX
@@ -62,11 +62,11 @@ class ComputeQueues:
         )
         self.lock_ttl_seconds = lock_ttl_seconds or settings.WAIT_QUEUE_LOCK_TTL_SECONDS
         self.scale_down_gate_ttl_seconds = (
-            scale_down_gate_ttl_seconds or settings.POOL_SCALE_DOWN_GATE_TTL_SECONDS
+            scale_down_gate_ttl_seconds or settings.BUFFER_SCALE_DOWN_GATE_TTL_SECONDS
         )
-        self.pool_policy_ready_ttl_seconds = (
-            pool_policy_ready_ttl_seconds
-            or settings.POOL_POLICY_READY_TTL_SECONDS
+        self.provider_policy_ready_ttl_seconds = (
+            buffer_policy_ready_ttl_seconds
+            or settings.BUFFER_POLICY_READY_TTL_SECONDS
         )
         self.wait_timeout_seconds = wait_timeout_seconds or settings.WAIT_QUEUE_TIMEOUT_SECONDS
         self.ticket_ttl_seconds = ticket_ttl_seconds or settings.WAIT_QUEUE_TICKET_TTL_SECONDS
@@ -142,14 +142,14 @@ class ComputeQueues:
     def _lock_key(self, compute_type: str) -> str:
         return f"{self.prefix}:lock:{compute_type}"
 
-    def _pool_policy_key(self, compute_type: str) -> str:
-        return f"{self.prefix}:pool-policy:{compute_type}"
+    def _buffer_policy_key(self, compute_type: str) -> str:
+        return f"{self.prefix}:buffer-policy:{compute_type}"
 
     def _scale_down_gate_key(self, compute_type: str) -> str:
         return f"{self.prefix}:scale-down-gate:{compute_type}"
 
-    def _pool_policy_ready_key(self) -> str:
-        return f"{self.prefix}:pool-policy-ready"
+    def _buffer_policy_ready_key(self) -> str:
+        return f"{self.prefix}:buffer-policy-ready"
 
     def _assigned_request_key(self, compute_pod: str) -> str:
         return f"{self.prefix}:assigned-request:{compute_pod}"
@@ -296,10 +296,10 @@ class ComputeQueues:
         A missing timestamp falls back to now instead of 0, which would sort
         ahead of everyone forever.
         """
-        ingress_ts_ms = safe_int((raw or {}).get("ingress_ts_ms"), 0)
-        if ingress_ts_ms <= 0:
-            ingress_ts_ms = int(time.time() * 1000)
-        return float(ingress_ts_ms)
+        request_at_ms = safe_int((raw or {}).get("request_at_ms"), 0)
+        if request_at_ms <= 0:
+            request_at_ms = int(time.time() * 1000)
+        return float(request_at_ms)
 
     def _queue_ids(self, compute_type: str) -> List[str]:
         client = self._redis_client()
@@ -371,8 +371,8 @@ class ComputeQueues:
                 continue
 
             queue_position += 1
-            ingress_ts_ms = safe_int(raw.get("ingress_ts_ms"), 0)
-            created_ms = ingress_ts_ms
+            request_at_ms = safe_int(raw.get("request_at_ms"), 0)
+            created_ms = request_at_ms
             if not created_ms:
                 created_at = parse_datetime(raw.get("created_at"))
                 if created_at:
@@ -394,7 +394,7 @@ class ComputeQueues:
             "waiting_users": waiting_users,
         }
 
-    def set_pool_policy(
+    def set_buffer_policy(
         self,
         compute_type: str,
         deployment_name: str,
@@ -405,113 +405,113 @@ class ComputeQueues:
         compute_type_value = self.normalize_compute_type(compute_type)
         deployment_name_value = (deployment_name or "").strip()
         try:
-            pool_available_min = int(R)
-            pool_total_max = int(N)
+            buffer_reserve = int(R)
+            buffer_capacity = int(N)
         except (TypeError, ValueError) as exc:
             raise QueueUnavailableError(
-                f"Invalid pool policy for {compute_type_value}: R and N must be integers"
+                f"Invalid buffer policy for {compute_type_value}: R and N must be integers"
             ) from exc
 
         if not deployment_name_value:
             raise QueueUnavailableError(
-                f"Invalid pool policy for {compute_type_value}: deployment_name is required"
+                f"Invalid buffer policy for {compute_type_value}: deployment_name is required"
             )
-        if pool_available_min < 0 or pool_total_max < 0 or pool_available_min > pool_total_max:
+        if buffer_reserve < 0 or buffer_capacity < 0 or buffer_reserve > buffer_capacity:
             raise QueueUnavailableError(
-                f"Invalid pool policy for {compute_type_value}: require 0 <= R <= N"
+                f"Invalid buffer policy for {compute_type_value}: require 0 <= R <= N"
             )
 
         policy = {
             "compute_type": compute_type_value,
             "deployment_name": deployment_name_value,
-            "R": pool_available_min,
-            "N": pool_total_max,
+            "R": buffer_reserve,
+            "N": buffer_capacity,
             "resource_version": (resource_version or "").strip(),
         }
         payload = {
             "deployment_name": deployment_name_value,
-            "R": str(pool_available_min),
-            "N": str(pool_total_max),
+            "R": str(buffer_reserve),
+            "N": str(buffer_capacity),
             "resource_version": policy["resource_version"],
         }
         client = self._redis_client()
         try:
-            client.hset(self._pool_policy_key(compute_type_value), mapping=payload)
+            client.hset(self._provider_policy_key(compute_type_value), mapping=payload)
             return policy
         except RedisError as exc:
             raise QueueUnavailableError(
-                f"Failed to store pool policy for {compute_type_value}: {exc}"
+                f"Failed to store buffer policy for {compute_type_value}: {exc}"
             ) from exc
 
-    def get_pool_policy(self, compute_type: str) -> Optional[Dict[str, object]]:
+    def get_buffer_policy(self, compute_type: str) -> Optional[Dict[str, object]]:
         compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()
         try:
-            raw = client.hgetall(self._pool_policy_key(compute_type_value))
+            raw = client.hgetall(self._provider_policy_key(compute_type_value))
         except RedisError as exc:
             raise QueueUnavailableError(
-                f"Failed to read pool policy for {compute_type_value}: {exc}"
+                f"Failed to read buffer policy for {compute_type_value}: {exc}"
             ) from exc
 
         if not raw:
             return None
 
         try:
-            pool_available_min = int(raw["R"])
-            pool_total_max = int(raw["N"])
+            buffer_reserve = int(raw["R"])
+            buffer_capacity = int(raw["N"])
             deployment_name = (raw["deployment_name"] or "").strip()
         except (KeyError, TypeError, ValueError) as exc:
             raise QueueUnavailableError(
-                f"Invalid stored pool policy for {compute_type_value}"
+                f"Invalid stored buffer policy for {compute_type_value}"
             ) from exc
 
         if (
             not deployment_name
-            or pool_available_min < 0
-            or pool_total_max < 0
-            or pool_available_min > pool_total_max
+            or buffer_reserve < 0
+            or buffer_capacity < 0
+            or buffer_reserve > buffer_capacity
         ):
             raise QueueUnavailableError(
-                f"Invalid stored pool policy for {compute_type_value}"
+                f"Invalid stored buffer policy for {compute_type_value}"
             )
 
         return {
             "compute_type": compute_type_value,
             "deployment_name": deployment_name,
-            "R": pool_available_min,
-            "N": pool_total_max,
+            "R": buffer_reserve,
+            "N": buffer_capacity,
             "resource_version": (raw.get("resource_version") or "").strip(),
         }
 
-    def clear_pool_policy(self, compute_type: str) -> bool:
+    def clear_buffer_policy(self, compute_type: str) -> bool:
         compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()
         try:
-            return bool(client.delete(self._pool_policy_key(compute_type_value)))
+            return bool(client.delete(self._provider_policy_key(compute_type_value)))
         except RedisError as exc:
             raise QueueUnavailableError(
-                f"Failed to clear pool policy for {compute_type_value}: {exc}"
+                f"Failed to clear buffer policy for {compute_type_value}: {exc}"
             ) from exc
 
-    def publish_pool_policy_ready(self, token: str) -> bool:
+    def publish_buffer_policy_ready(self, token: str) -> bool:
         token_value = (token or "").strip()
         if not token_value:
-            raise QueueUnavailableError("Pool policy readiness token is required")
+            raise QueueUnavailableError("Buffer policy readiness token is required")
         client = self._redis_client()
         try:
             return bool(
                 client.set(
-                    self._pool_policy_ready_key(),
+                    self._provider_policy_ready_key(),
                     token_value,
-                    ex=max(1, int(self.pool_policy_ready_ttl_seconds)),
+                    ex=max(1, int(self.provider_policy_ready_ttl_seconds)),
                 )
             )
         except RedisError as exc:
             raise QueueUnavailableError(
-                f"Failed to publish pool policy readiness: {exc}"
+                f"Failed to publish buffer policy readiness: {exc}"
             ) from exc
 
-    def renew_pool_policy_ready(self, token: str) -> bool:
+    def renew_buffer_policy_ready(self, token: str) -> bool:
         token_value = (token or "").strip()
         if not token_value:
             return False
@@ -527,21 +527,21 @@ class ComputeQueues:
                 client.eval(
                     renew_script,
                     1,
-                    self._pool_policy_ready_key(),
+                    self._provider_policy_ready_key(),
                     token_value,
-                    max(1, int(self.pool_policy_ready_ttl_seconds)),
+                    max(1, int(self.provider_policy_ready_ttl_seconds)),
                 )
             )
         except RedisError as exc:
             raise QueueUnavailableError(
-                f"Failed to renew pool policy readiness: {exc}"
+                f"Failed to renew buffer policy readiness: {exc}"
             ) from exc
 
-    def clear_pool_policy_ready(self, token: Optional[str] = None) -> bool:
+    def clear_buffer_policy_ready(self, token: Optional[str] = None) -> bool:
         client = self._redis_client()
         try:
             if not token:
-                return bool(client.delete(self._pool_policy_ready_key()))
+                return bool(client.delete(self._provider_policy_ready_key()))
             release_script = """
             if redis.call("get", KEYS[1]) == ARGV[1] then
                 return redis.call("del", KEYS[1])
@@ -552,22 +552,22 @@ class ComputeQueues:
                 client.eval(
                     release_script,
                     1,
-                    self._pool_policy_ready_key(),
+                    self._provider_policy_ready_key(),
                     token,
                 )
             )
         except RedisError as exc:
             raise QueueUnavailableError(
-                f"Failed to clear pool policy readiness: {exc}"
+                f"Failed to clear buffer policy readiness: {exc}"
             ) from exc
 
-    def is_pool_policy_ready(self) -> bool:
+    def is_buffer_policy_ready(self) -> bool:
         client = self._redis_client()
         try:
-            return bool(client.exists(self._pool_policy_ready_key()))
+            return bool(client.exists(self._provider_policy_ready_key()))
         except RedisError as exc:
             raise QueueUnavailableError(
-                f"Failed to inspect pool policy readiness: {exc}"
+                f"Failed to inspect buffer policy readiness: {exc}"
             ) from exc
 
     def acquire_allocator_lock(self, compute_type: str, owner: Optional[str] = None) -> Optional[str]:

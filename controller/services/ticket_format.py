@@ -57,7 +57,7 @@ DEFAULT_TICKET_EVENT_FIELDS = (
     "queue_position",
     "retry_count",
     "ticket_short",
-    "ingress_ts_ms",
+    "request_at_ms",
 )
 
 
@@ -114,18 +114,18 @@ def log_queue_event(
             "compute_pod_ip",
             "retry_count",
             "ticket_short",
-            "ingress_ts_ms",
+            "request_at_ms",
             "compute_available_ts_ms",
             "reason",
             "available_ready_compute_pods",
             "leader",
             "attempt",
             "max_attempts",
-            "queue_wait_ms",
-            "compute_wait_ms",
-            "controller_claim_delay_ms",
-            "allocation_ms",
-            "total_assignment_ms",
+            "since_request_to_claim_ms",
+            "since_request_to_compute_ready_ms",
+            "claim_delay_ms",
+            "allocation_duration_ms",
+            "since_request_to_assigned_ms",
             "session_ms",
             "release_ms",
         ]
@@ -158,15 +158,15 @@ def ingress_epoch_ms(ticket: Optional[Dict]) -> int:
     """
     Get request ingress timestamp in epoch milliseconds.
 
-    Prefers explicit ingress_ts_ms field, falls back to created_at timestamp.
+    Prefers explicit request_at_ms field, falls back to created_at timestamp.
     Returns 0 if neither is available.
     """
     if not ticket:
         return 0
 
-    ingress_ts_ms = safe_int(ticket.get("ingress_ts_ms"), 0)
-    if ingress_ts_ms:
-        return ingress_ts_ms
+    request_at_ms = safe_int(ticket.get("request_at_ms"), 0)
+    if request_at_ms:
+        return request_at_ms
     return datetime_to_epoch_ms(ticket.get("created_at"))
 
 
@@ -175,40 +175,40 @@ def assignment_timing_fields(ticket: Optional[Dict]) -> Dict[str, int]:
     Calculate timing metrics for ticket assignment flow.
 
     Returns dict with timing fields (only includes fields where all required timestamps are available):
-    - queue_wait_ms: Time from ingress to claim
-    - compute_wait_ms: Time from ingress to controller-observed compute availability
-    - controller_claim_delay_ms: Time from controller-observed compute availability to claim
-    - allocation_ms: Time from claim to assignment
-    - total_assignment_ms: Time from ingress to assignment
+    - since_request_to_claim_ms: Time from ingress to claim
+    - since_request_to_compute_ready_ms: Time from ingress to controller-observed compute availability
+    - claim_delay_ms: Time from controller-observed compute availability to claim
+    - allocation_duration_ms: Time from claim to assignment
+    - since_request_to_assigned_ms: Time from ingress to assignment
 
     Missing timestamps result in omitted fields, not zero values, for clearer logs.
     """
     if not ticket:
         return {}
 
-    ingress_ts_ms = ingress_epoch_ms(ticket)
+    request_at_ms = ingress_epoch_ms(ticket)
     claimed_at_ms = datetime_to_epoch_ms(ticket.get("claimed_at"))
     assigned_at_ms = datetime_to_epoch_ms(ticket.get("assigned_at"))
     fields: Dict[str, int] = {}
 
     # Only calculate metrics where all required timestamps are available
-    if ingress_ts_ms and claimed_at_ms:
-        fields["queue_wait_ms"] = max(0, claimed_at_ms - ingress_ts_ms)
+    if request_at_ms and claimed_at_ms:
+        fields["since_request_to_claim_ms"] = max(0, claimed_at_ms - request_at_ms)
     compute_available_at_ms = datetime_to_epoch_ms(ticket.get("compute_available_at"))
     if not compute_available_at_ms:
         compute_available_at_ms = datetime_to_epoch_ms(ticket.get("compute_ready_at"))
-    if ingress_ts_ms and compute_available_at_ms:
-        fields["compute_wait_ms"] = max(0, compute_available_at_ms - ingress_ts_ms)
+    if request_at_ms and compute_available_at_ms:
+        fields["since_request_to_compute_ready_ms"] = max(0, compute_available_at_ms - request_at_ms)
     if compute_available_at_ms and claimed_at_ms:
-        available_or_ingress_ms = max(compute_available_at_ms, ingress_ts_ms or 0)
-        fields["controller_claim_delay_ms"] = max(
+        available_or_ingress_ms = max(compute_available_at_ms, request_at_ms or 0)
+        fields["claim_delay_ms"] = max(
             0,
             claimed_at_ms - available_or_ingress_ms,
         )
     if claimed_at_ms and assigned_at_ms:
-        fields["allocation_ms"] = max(0, assigned_at_ms - claimed_at_ms)
-    if ingress_ts_ms and assigned_at_ms:
-        fields["total_assignment_ms"] = max(0, assigned_at_ms - ingress_ts_ms)
+        fields["allocation_duration_ms"] = max(0, assigned_at_ms - claimed_at_ms)
+    if request_at_ms and assigned_at_ms:
+        fields["since_request_to_assigned_ms"] = max(0, assigned_at_ms - request_at_ms)
     return fields
 
 
@@ -216,11 +216,11 @@ def elapsed_since_ingress_ms(ticket: Optional[Dict], field_name: str) -> Optiona
     if not ticket:
         return None
 
-    ingress_ts_ms = ingress_epoch_ms(ticket)
+    request_at_ms = ingress_epoch_ms(ticket)
     end_ms = datetime_to_epoch_ms(ticket.get(field_name))
-    if not ingress_ts_ms or not end_ms:
+    if not request_at_ms or not end_ms:
         return None
-    return max(0, end_ms - ingress_ts_ms)
+    return max(0, end_ms - request_at_ms)
 
 
 def assigned_request_context(ticket: Optional[Dict]) -> Dict[str, object]:

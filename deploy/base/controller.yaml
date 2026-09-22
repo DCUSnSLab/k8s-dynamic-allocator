@@ -46,8 +46,8 @@ spec:
         env:
         - name: REDIS_URL
           value: redis://controller-queue-redis:6379/0
-        - name: COMPUTE_POOL_MODE
-          value: warm_pool
+        - name: COMPUTE_ALLOCATION_MODE
+          value: warm_buffer
         resources:
           requests:
             cpu: "100m"

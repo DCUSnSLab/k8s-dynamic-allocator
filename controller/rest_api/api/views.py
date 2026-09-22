@@ -90,15 +90,15 @@ def execute_command(request: HttpRequest) -> HttpResponse:
             return _error_response("user_pod_ip is required")
 
         ticket_id = uuid.uuid4().hex
-        ingress_ts_ms = int(time.time() * 1000)
+        request_at_ms = int(time.time() * 1000)
         set_request_label(build_request_label(username, ticket_id[:10]))
         logger.info(
-            "[Request] ticket_id=%s user_pod=%s user_pod_ip=%s compute_type=%s ingress_ts_ms=%s command=%r",
+            "[Request] ticket_id=%s user_pod=%s user_pod_ip=%s compute_type=%s request_at_ms=%s command=%r",
             ticket_id,
             user_pod or user_pod_ip,
             user_pod_ip,
             compute_type,
-            ingress_ts_ms,
+            request_at_ms,
             command,
         )
 
@@ -108,7 +108,7 @@ def execute_command(request: HttpRequest) -> HttpResponse:
             user_pod_ip=user_pod_ip,
             user_pod=user_pod,
             compute_type=compute_type,
-            ingress_ts_ms=ingress_ts_ms,
+            request_at_ms=request_at_ms,
             ticket_id=ticket_id,
         )
 
@@ -175,15 +175,15 @@ def queue_status(request: HttpRequest) -> HttpResponse:
 
 
 @csrf_exempt
-def pool_status(request: HttpRequest) -> HttpResponse:
+def buffer_status(request: HttpRequest) -> HttpResponse:
     if request.method != "GET":
         return _method_not_allowed("GET")
 
     try:
-        result = _get_orchestrator().get_pool_status()
+        result = _get_orchestrator().get_buffer_status()
         return json_response(result)
     except Exception as exc:
-        logger.error("[Failed] operation=pool_status reason=%r", str(exc), exc_info=True)
+        logger.error("[Failed] operation=buffer_status reason=%r", str(exc), exc_info=True)
         return _error_response(str(exc), status=500)
 
 
@@ -237,15 +237,15 @@ def cancel_ticket(request: HttpRequest, ticket_id: str) -> HttpResponse:
 
 
 @csrf_exempt
-def initialize_pool(request: HttpRequest) -> HttpResponse:
+def initialize_buffer(request: HttpRequest) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed("POST")
 
     try:
-        result = _get_orchestrator().initialize_pool()
-        return json_response({"status": "success", "message": "Pool initialized", "result": result})
+        result = _get_orchestrator().initialize_buffer()
+        return json_response({"status": "success", "message": "Buffer initialized", "result": result})
     except Exception as exc:
-        logger.error("[Failed] operation=pool_init reason=%r", str(exc), exc_info=True)
+        logger.error("[Failed] operation=buffer_init reason=%r", str(exc), exc_info=True)
         return _error_response(str(exc), status=500)
 
 

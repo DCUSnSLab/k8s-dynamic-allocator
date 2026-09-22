@@ -3,7 +3,7 @@ Compute pool manager
 
 - Creates compute Deployments from manifests
 - Allocates warm compute pods to user pods
-- Uses pool-status to control warm-pool Deployment membership
+- Uses compute-status to control warm-buffer Deployment membership
 """
 
 import glob
@@ -20,12 +20,12 @@ from config import settings
 from ..infra.kubernetes_client import KubernetesClient
 from .manifest_images import override_compute_agent_image
 
-# The pool policy lives on the compute Deployment and is read by both allocation
+# The buffer policy lives on the compute Deployment and is read by both allocation
 # modes -- the warm buffer keeps R Pods available under a total of N, and cold
 # start creates Pods on demand under the same N. Defined once so the two cannot
 # drift apart.
-POOL_AVAILABLE_MIN_ANNOTATION = "k8s-dynamic-allocator/pool-available-min"
-POOL_TOTAL_MAX_ANNOTATION = "k8s-dynamic-allocator/pool-total-max"
+BUFFER_RESERVE_ANNOTATION = "k8s-dynamic-allocator/buffer-reserve"
+BUFFER_CAPACITY_ANNOTATION = "k8s-dynamic-allocator/buffer-capacity"
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +37,12 @@ class PodConflictError(Exception):
     """Raised when another controller replica already took the same pod."""
 
 
-class WarmPodPool(KubernetesClient):
+class WarmBufferProvider(KubernetesClient):
     """
     Compute pod pool manager.
 
     `app` identifies compute pods managed by this controller.
-    `pool-status` is part of the Deployment selector, so changing it from
+    `compute-status` is part of the Deployment selector, so changing it from
     available -> assigned removes a pod from warm-pool membership while keeping
     the compute identity labels intact. Released assigned pods are deleted so
     the Deployment can backfill a new Ready warm pod.
@@ -50,16 +50,16 @@ class WarmPodPool(KubernetesClient):
 
     LABEL_APP = "app"
     LABEL_COMPUTE_TYPE = "compute-type"
-    LABEL_STATUS = "pool-status"
+    LABEL_STATUS = "compute-status"
     LABEL_USER = "assigned-user"
 
-    APP_WARM_POOL = "warm-pod-pool"
+    APP_COMPUTE_POD = "compute-pod"
 
     STATUS_AVAILABLE = "available"
     STATUS_ASSIGNED = "assigned"
 
-    ANNOTATION_POOL_AVAILABLE_MIN = POOL_AVAILABLE_MIN_ANNOTATION
-    ANNOTATION_POOL_TOTAL_MAX = POOL_TOTAL_MAX_ANNOTATION
+    ANNOTATION_BUFFER_RESERVE = BUFFER_RESERVE_ANNOTATION
+    ANNOTATION_BUFFER_CAPACITY = BUFFER_CAPACITY_ANNOTATION
     ANNOTATION_ALLOCATION_TICKET = "k8s-dynamic-allocator/allocation-ticket-id"
     ANNOTATION_ALLOCATION_CLAIM = "k8s-dynamic-allocator/allocation-claim-token"
 
@@ -72,7 +72,7 @@ class WarmPodPool(KubernetesClient):
         self.owner_ref = self._get_owner_deployment()
 
     def _compute_selector(self, compute_type: Optional[str] = None) -> str:
-        parts = [f"{self.LABEL_APP}={self.APP_WARM_POOL}"]
+        parts = [f"{self.LABEL_APP}={self.APP_COMPUTE_POD}"]
         if compute_type:
             parts.append(f"{self.LABEL_COMPUTE_TYPE}={compute_type}")
         return ",".join(parts)
@@ -124,9 +124,9 @@ class WarmPodPool(KubernetesClient):
         deployment_app = deployment_labels.get(self.LABEL_APP)
         deployment_compute_type = deployment_labels.get(self.LABEL_COMPUTE_TYPE)
 
-        if selector_app != self.APP_WARM_POOL or template_app != self.APP_WARM_POOL:
+        if selector_app != self.APP_COMPUTE_POD or template_app != self.APP_COMPUTE_POD:
             raise ValueError(
-                "Every compute manifest must set app=warm-pod-pool in both "
+                "Every compute manifest must set app=compute-pod in both "
                 "spec.selector.matchLabels and spec.template.metadata.labels"
             )
 
@@ -143,19 +143,19 @@ class WarmPodPool(KubernetesClient):
 
         if selector_status != self.STATUS_AVAILABLE:
             raise ValueError(
-                "Every compute manifest must set pool-status=available in "
+                "Every compute manifest must set compute-status=available in "
                 "spec.selector.matchLabels"
             )
 
         if template_status != self.STATUS_AVAILABLE:
             raise ValueError(
-                "Every compute manifest must set pool-status=available in "
+                "Every compute manifest must set compute-status=available in "
                 "spec.template.metadata.labels"
             )
 
-        if deployment_app != self.APP_WARM_POOL:
+        if deployment_app != self.APP_COMPUTE_POD:
             raise ValueError(
-                "Every compute manifest must set app=warm-pod-pool in metadata.labels"
+                "Every compute manifest must set app=compute-pod in metadata.labels"
             )
 
         if deployment_compute_type != template_compute_type:
@@ -175,32 +175,32 @@ class WarmPodPool(KubernetesClient):
     @classmethod
     def _parse_policy_values(cls, annotations: Dict) -> tuple[int, int]:
         annotations = annotations or {}
-        raw_r = annotations.get(cls.ANNOTATION_POOL_AVAILABLE_MIN)
-        raw_n = annotations.get(cls.ANNOTATION_POOL_TOTAL_MAX)
+        raw_r = annotations.get(cls.ANNOTATION_BUFFER_RESERVE)
+        raw_n = annotations.get(cls.ANNOTATION_BUFFER_CAPACITY)
         if raw_r is None or raw_n is None:
             raise ValueError(
                 "Pool policy annotations are required: "
-                f"{cls.ANNOTATION_POOL_AVAILABLE_MIN}, "
-                f"{cls.ANNOTATION_POOL_TOTAL_MAX}"
+                f"{cls.ANNOTATION_BUFFER_RESERVE}, "
+                f"{cls.ANNOTATION_BUFFER_CAPACITY}"
             )
 
         try:
-            pool_available_min = int(str(raw_r).strip())
-            pool_total_max = int(str(raw_n).strip())
+            buffer_reserve = int(str(raw_r).strip())
+            buffer_capacity = int(str(raw_n).strip())
         except (TypeError, ValueError) as exc:
             raise ValueError("Pool policy annotations must be integers") from exc
 
         if (
-            pool_available_min < 0
-            or pool_total_max < 0
-            or pool_available_min > pool_total_max
+            buffer_reserve < 0
+            or buffer_capacity < 0
+            or buffer_reserve > buffer_capacity
         ):
             raise ValueError("Pool policy must satisfy 0 <= R <= N")
 
-        return pool_available_min, pool_total_max
+        return buffer_reserve, buffer_capacity
 
     def parse_deployment_policy(self, deployment) -> Dict:
-        """Parse and validate R/N from a warm-pool Deployment."""
+        """Parse and validate R/N from a warm-buffer Deployment."""
         metadata = getattr(deployment, "metadata", None)
         if metadata is None:
             raise ValueError("Deployment metadata is missing")
@@ -210,8 +210,8 @@ class WarmPodPool(KubernetesClient):
         deployment_name = (getattr(metadata, "name", None) or "").strip()
         compute_type = (labels.get(self.LABEL_COMPUTE_TYPE) or "").strip().lower()
 
-        if labels.get(self.LABEL_APP) != self.APP_WARM_POOL:
-            raise ValueError("Deployment must set app=warm-pod-pool")
+        if labels.get(self.LABEL_APP) != self.APP_COMPUTE_POD:
+            raise ValueError("Deployment must set app=compute-pod")
         if not deployment_name:
             raise ValueError("Deployment name is missing")
         if not compute_type:
@@ -226,38 +226,38 @@ class WarmPodPool(KubernetesClient):
             getattr(getattr(template, "metadata", None), "labels", None) or {}
         )
         if (
-            selector_labels.get(self.LABEL_APP) != self.APP_WARM_POOL
+            selector_labels.get(self.LABEL_APP) != self.APP_COMPUTE_POD
             or selector_labels.get(self.LABEL_COMPUTE_TYPE) != compute_type
             or selector_labels.get(self.LABEL_STATUS) != self.STATUS_AVAILABLE
-            or template_labels.get(self.LABEL_APP) != self.APP_WARM_POOL
+            or template_labels.get(self.LABEL_APP) != self.APP_COMPUTE_POD
             or template_labels.get(self.LABEL_COMPUTE_TYPE) != compute_type
             or template_labels.get(self.LABEL_STATUS) != self.STATUS_AVAILABLE
             or self.LABEL_USER not in template_labels
         ):
             raise ValueError(
-                "Deployment selector/template labels do not match the warm-pool policy"
+                "Deployment selector/template labels do not match the warm-buffer policy"
             )
 
-        pool_available_min, pool_total_max = self._parse_policy_values(annotations)
+        buffer_reserve, buffer_capacity = self._parse_policy_values(annotations)
         return {
             "compute_type": compute_type,
             "deployment_name": deployment_name,
-            "R": pool_available_min,
-            "N": pool_total_max,
+            "R": buffer_reserve,
+            "N": buffer_capacity,
             "resource_version": (
                 getattr(metadata, "resource_version", None) or ""
             ),
         }
 
-    def list_pool_deployments(self) -> List:
+    def list_buffer_deployments(self) -> List:
         deployments = self.apps_v1.list_namespaced_deployment(
             namespace=self.namespace,
-            label_selector=f"{self.LABEL_APP}={self.APP_WARM_POOL}",
+            label_selector=f"{self.LABEL_APP}={self.APP_COMPUTE_POD}",
             _request_timeout=self.api_request_timeout,
         )
         return list(deployments.items)
 
-    def initialize_pool(self, *, log_existing: bool = True) -> Dict:
+    def initialize_buffer(self, *, log_existing: bool = True) -> Dict:
         """
         Create compute Deployments defined in the manifests directory.
         Safe to call multiple times because existing Deployments are skipped.
@@ -356,8 +356,8 @@ class WarmPodPool(KubernetesClient):
         legacy = (
             self.LABEL_APP not in labels
             and self.LABEL_COMPUTE_TYPE not in labels
-            and self.ANNOTATION_POOL_AVAILABLE_MIN not in annotations
-            and self.ANNOTATION_POOL_TOTAL_MAX not in annotations
+            and self.ANNOTATION_BUFFER_RESERVE not in annotations
+            and self.ANNOTATION_BUFFER_CAPACITY not in annotations
         )
         if not legacy:
             return False
@@ -378,12 +378,12 @@ class WarmPodPool(KubernetesClient):
             or {}
         )
         live_identity_matches = (
-            live_selector.get(self.LABEL_APP) == self.APP_WARM_POOL
+            live_selector.get(self.LABEL_APP) == self.APP_COMPUTE_POD
             and live_selector.get(self.LABEL_COMPUTE_TYPE)
             == expected_compute_type
             and live_selector.get(self.LABEL_STATUS) == self.STATUS_AVAILABLE
             and live_template_labels.get(self.LABEL_APP)
-            == self.APP_WARM_POOL
+            == self.APP_COMPUTE_POD
             and live_template_labels.get(self.LABEL_COMPUTE_TYPE)
             == expected_compute_type
             and live_template_labels.get(self.LABEL_STATUS)
@@ -406,11 +406,11 @@ class WarmPodPool(KubernetesClient):
                 ],
             },
             "annotations": {
-                self.ANNOTATION_POOL_AVAILABLE_MIN: manifest_annotations[
-                    self.ANNOTATION_POOL_AVAILABLE_MIN
+                self.ANNOTATION_BUFFER_RESERVE: manifest_annotations[
+                    self.ANNOTATION_BUFFER_RESERVE
                 ],
-                self.ANNOTATION_POOL_TOTAL_MAX: manifest_annotations[
-                    self.ANNOTATION_POOL_TOTAL_MAX
+                self.ANNOTATION_BUFFER_CAPACITY: manifest_annotations[
+                    self.ANNOTATION_BUFFER_CAPACITY
                 ],
             },
         }
@@ -428,9 +428,9 @@ class WarmPodPool(KubernetesClient):
             "[PoolPolicyMigrated] deployment=%s R=%s N=%s",
             metadata.name,
             body["metadata"]["annotations"][
-                self.ANNOTATION_POOL_AVAILABLE_MIN
+                self.ANNOTATION_BUFFER_RESERVE
             ],
-            body["metadata"]["annotations"][self.ANNOTATION_POOL_TOTAL_MAX],
+            body["metadata"]["annotations"][self.ANNOTATION_BUFFER_CAPACITY],
         )
         return True
 
@@ -439,14 +439,14 @@ class WarmPodPool(KubernetesClient):
         Resolve the controller Deployment that owns this controller pod.
         Cached so the lookup only happens once per process.
         """
-        if WarmPodPool._owner_ref_resolved:
-            return WarmPodPool._cached_owner_ref
+        if WarmBufferProvider._owner_ref_resolved:
+            return WarmBufferProvider._cached_owner_ref
 
         try:
             pod_name = os.getenv("HOSTNAME")
             if not pod_name:
                 logger.warning("[Warning] operation=owner_ref reason=%r", "HOSTNAME not set")
-                WarmPodPool._owner_ref_resolved = True
+                WarmBufferProvider._owner_ref_resolved = True
                 return None
 
             pod = self.v1.read_namespaced_pod(
@@ -456,7 +456,7 @@ class WarmPodPool(KubernetesClient):
             )
             if not pod.metadata.owner_references:
                 logger.warning("[Warning] operation=owner_ref pod=%s reason=%r", pod_name, "pod has no ownerReferences")
-                WarmPodPool._owner_ref_resolved = True
+                WarmBufferProvider._owner_ref_resolved = True
                 return None
 
             rs_ref = pod.metadata.owner_references[0]
@@ -467,7 +467,7 @@ class WarmPodPool(KubernetesClient):
             )
             if not rs.metadata.owner_references:
                 logger.warning("[Warning] operation=owner_ref replicaset=%s reason=%r", rs_ref.name, "replicaset has no ownerReferences")
-                WarmPodPool._owner_ref_resolved = True
+                WarmBufferProvider._owner_ref_resolved = True
                 return None
 
             deploy_ref = rs.metadata.owner_references[0]
@@ -480,13 +480,13 @@ class WarmPodPool(KubernetesClient):
             }
 
             logger.info("OwnerRef resolved: %s (uid=%s)", deploy_ref.name, deploy_ref.uid)
-            WarmPodPool._cached_owner_ref = owner_ref
-            WarmPodPool._owner_ref_resolved = True
+            WarmBufferProvider._cached_owner_ref = owner_ref
+            WarmBufferProvider._owner_ref_resolved = True
             return owner_ref
 
         except Exception as e:
             logger.warning("[Warning] operation=owner_ref reason=%r", str(e))
-            WarmPodPool._owner_ref_resolved = True
+            WarmBufferProvider._owner_ref_resolved = True
             return None
 
     def get_pod_ready_at(self, pod_name: str):
@@ -515,7 +515,7 @@ class WarmPodPool(KubernetesClient):
             return True
         return False
 
-    def list_pool_snapshot(self, compute_type: Optional[str] = None) -> Dict:
+    def list_buffer_snapshot(self, compute_type: Optional[str] = None) -> Dict:
         """
         Return one API-list based snapshot for allocation and capacity control.
 
@@ -529,8 +529,8 @@ class WarmPodPool(KubernetesClient):
         )
 
         pool_total = 0
-        pool_available = 0
-        pool_assigned = 0
+        buffer_available = 0
+        buffer_assigned = 0
         terminating = 0
         ready_available = 0
         assigned_with_replicaset_owner = 0
@@ -541,20 +541,20 @@ class WarmPodPool(KubernetesClient):
             metadata = getattr(pod, "metadata", None)
             status = getattr(pod, "status", None)
             labels = getattr(metadata, "labels", None) or {}
-            pool_status = labels.get(self.LABEL_STATUS)
+            buffer_status = labels.get(self.LABEL_STATUS)
             deletion_timestamp = getattr(metadata, "deletion_timestamp", None)
             counted = (
                 deletion_timestamp is None
-                and pool_status in {self.STATUS_AVAILABLE, self.STATUS_ASSIGNED}
+                and buffer_status in {self.STATUS_AVAILABLE, self.STATUS_ASSIGNED}
             )
 
             if deletion_timestamp is not None:
                 terminating += 1
-            elif pool_status == self.STATUS_AVAILABLE:
-                pool_available += 1
+            elif buffer_status == self.STATUS_AVAILABLE:
+                buffer_available += 1
                 pool_total += 1
-            elif pool_status == self.STATUS_ASSIGNED:
-                pool_assigned += 1
+            elif buffer_status == self.STATUS_ASSIGNED:
+                buffer_assigned += 1
                 pool_total += 1
                 if self._has_controller_owner(pod, "ReplicaSet"):
                     assigned_with_replicaset_owner += 1
@@ -562,7 +562,7 @@ class WarmPodPool(KubernetesClient):
             ready = self._pod_is_ready(pod)
             if (
                 counted
-                and pool_status == self.STATUS_AVAILABLE
+                and buffer_status == self.STATUS_AVAILABLE
                 and ready
                 and getattr(status, "pod_ip", None)
             ):
@@ -591,7 +591,7 @@ class WarmPodPool(KubernetesClient):
                     "name": getattr(metadata, "name", "") or "",
                     "phase": getattr(status, "phase", None) or "Unknown",
                     "compute_type": labels.get(self.LABEL_COMPUTE_TYPE, "unknown"),
-                    "pool_status": pool_status or "unknown",
+                    "buffer_status": buffer_status or "unknown",
                     "assigned_user": labels.get(self.LABEL_USER, ""),
                     "ready": ready,
                     "not_ready_since": self._pod_not_ready_since(pod),
@@ -619,8 +619,8 @@ class WarmPodPool(KubernetesClient):
         return {
             "compute_type": (compute_type or "").strip().lower(),
             "pool_total": pool_total,
-            "pool_available": pool_available,
-            "pool_assigned": pool_assigned,
+            "buffer_available": buffer_available,
+            "buffer_assigned": buffer_assigned,
             "ready_available": ready_available,
             "terminating": terminating,
             "physical_total": len(pods.items),
@@ -639,10 +639,10 @@ class WarmPodPool(KubernetesClient):
         ticket_id_value = (ticket_id or "").strip()
         if not ticket_id_value:
             return None
-        for pod in self.list_pool_snapshot(compute_type)["pods"]:
+        for pod in self.list_buffer_snapshot(compute_type)["pods"]:
             if pod.get("terminating"):
                 continue
-            if pod.get("pool_status") != self.STATUS_ASSIGNED:
+            if pod.get("buffer_status") != self.STATUS_ASSIGNED:
                 continue
             if pod.get("allocation_ticket_id") != ticket_id_value:
                 continue
@@ -686,7 +686,7 @@ class WarmPodPool(KubernetesClient):
         """
         Mark an available warm pod as assigned.
 
-        Because pool-status=available is part of the Deployment selector,
+        Because compute-status=available is part of the Deployment selector,
         changing it to assigned removes the pod from warm-pool membership and
         lets the Deployment backfill a new warm pod.
         """
@@ -712,15 +712,15 @@ class WarmPodPool(KubernetesClient):
                     }
                 )
             patch.extend([
-                {"op": "test", "path": "/metadata/labels/app", "value": self.APP_WARM_POOL},
+                {"op": "test", "path": "/metadata/labels/app", "value": self.APP_COMPUTE_POD},
                 {
                     "op": "test",
-                    "path": "/metadata/labels/pool-status",
+                    "path": "/metadata/labels/compute-status",
                     "value": self.STATUS_AVAILABLE,
                 },
                 {
                     "op": "replace",
-                    "path": "/metadata/labels/pool-status",
+                    "path": "/metadata/labels/compute-status",
                     "value": self.STATUS_ASSIGNED,
                 },
                 {
@@ -768,15 +768,15 @@ class WarmPodPool(KubernetesClient):
                 return False
             raise
 
-    def list_pool_status(self, compute_type: Optional[str] = None) -> List[Dict]:
+    def list_buffer_status(self, compute_type: Optional[str] = None) -> List[Dict]:
         """
         List compute pods managed by this controller.
         """
-        snapshot = self.list_pool_snapshot(compute_type=compute_type)
+        snapshot = self.list_buffer_snapshot(compute_type=compute_type)
         return [
             {
                 **pod,
-                "app": self.APP_WARM_POOL,
+                "app": self.APP_COMPUTE_POD,
             }
             for pod in snapshot["pods"]
         ]
