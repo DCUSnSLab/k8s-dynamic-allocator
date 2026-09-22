@@ -92,12 +92,20 @@ spec:
             failureThreshold: 6
           securityContext:
             privileged: true
+          # Every user SSH session is held here, so memory scales with how many
+          # are open at once rather than with the request rate. A queued request
+          # keeps its session alive, so a slow queue multiplies them: measured
+          # 2 sessions per Pod at 16 requests/min but 19 at 24/min, where 500Mi
+          # was exceeded and Pods were OOM killed, dropping every session they
+          # held. About 20Mi per session over an 84Mi base, and the worst case
+          # here is 100 users x 3 concurrent over 7 Pods, so 2Gi leaves room for
+          # that plus the load a failed Pod hands to the survivors.
           resources:
             requests:
-              memory: "256Mi"
+              memory: "512Mi"
               cpu: "500m"
             limits:
-              memory: "500Mi"
+              memory: "2Gi"
               cpu: "600m"
 ---
 apiVersion: v1
