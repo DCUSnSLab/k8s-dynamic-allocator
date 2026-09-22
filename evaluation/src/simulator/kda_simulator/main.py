@@ -520,6 +520,13 @@ def classify_result(result: Any) -> str:
         return "ssh_error"
     if result.error:
         return "error"
+    if result.command_delivered and result.since_send_to_end_ms is None:
+        # The command was sent and the Compute Pod picked it up, but the run
+        # never printed its end marker. Something cut the session short - a
+        # Pod that died, a dropped connection - so the work did not finish.
+        # Reporting this as a success would hide the failure behind a healthy
+        # looking count, which is how a killed Compute Pod used to be recorded.
+        return "incomplete"
     if result.exit_status == 0:
         return "success"
     return "exit_nonzero"
