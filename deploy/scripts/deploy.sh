@@ -12,6 +12,11 @@ kustomization="${overlay}/kustomization.yaml"
 kustomization_backup="${WORKSPACE}/.kda-deploy-kustomization-${BUILD_NUMBER}.bak"
 all_resources="${WORKSPACE}/.kda-deploy-resources-${BUILD_NUMBER}.txt"
 staged_resources="${WORKSPACE}/.kda-deploy-staged-resources-${BUILD_NUMBER}.txt"
+applied_stages="${WORKSPACE}/.kda-deploy-applied-stages-${BUILD_NUMBER}.txt"
+# The ordered rollout below must cover every one of these. Dropping a stage
+# from the rollout used to pass silently: the coverage check only asserted
+# that each resource carries a stage label, not that its stage is applied.
+deploy_stages="bootstrap logging redis controller swlabssh"
 
 for required_command in kubectl sed grep sort diff wc tr; do
     if ! command -v "${required_command}" >/dev/null 2>&1; then
@@ -35,6 +40,7 @@ cleanup_workspace() {
     fi
     rm -f \
         "${rendered}" \
+        "${applied_stages}" \
         "${all_resources}" \
         "${staged_resources}"
 }
@@ -69,6 +75,7 @@ apply_stage() {
         -n "${namespace}" \
         -f "${rendered}" \
         -l "${stage_label}=${stage}"
+    echo "${stage}" >> "${applied_stages}"
 }
 
 echo '[Preflight] Verify cluster prerequisites'
@@ -162,7 +169,7 @@ fi
 # This is the invariant that matters: a newly added resource without a stage
 # label would silently never be applied.
 : > "${staged_resources}"
-for stage in bootstrap logging redis controller swlabssh; do
+for stage in ${deploy_stages}; do
     kubectl apply --dry-run=client \
         -n "${namespace}" \
         -f "${rendered}" \
@@ -256,6 +263,20 @@ with urllib.request.urlopen(
         exit 1
     fi
     sleep 2
+done
+
+apply_stage swlabssh
+kubectl rollout status deployment/swlabssh \
+    -n "${namespace}" --timeout=5m
+
+# A stage whose resources were rendered but never applied leaves the
+# cluster on the previous build with no error until something downstream
+# notices - which is how the swlabssh rollout went missing once.
+for stage in ${deploy_stages}; do
+    if ! grep -Fxq "${stage}" "${applied_stages}"; then
+        echo "[DeployFailed] stage was never applied: ${stage}"
+        exit 1
+    fi
 done
 
 echo '[Smoke] Verify deployed images and service readiness'
