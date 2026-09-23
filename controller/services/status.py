@@ -38,9 +38,6 @@ class ControllerStatus:
             "pods": buffer_list,
         }
 
-        if not hasattr(self.provider, "list_buffer_deployments"):
-            return response
-
         response["physical_total"] = len(buffer_list)
         response["terminating"] = terminating_count
         try:

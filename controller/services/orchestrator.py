@@ -6,7 +6,6 @@ from config import settings
 from config.settings import set_request_label
 
 from .compute import (
-    ColdStartProvider,
     ComputeCleanup,
     ComputeManager,
     BufferCapacityReconciler,
@@ -22,41 +21,30 @@ from .status import ControllerStatus
 
 logger = logging.getLogger(__name__)
 
-# How often the cold-start cleanup worker checks whether it should stop while
-# waiting for its next sweep.
-CLEANUP_STOP_POLL_SECONDS = 1.0
-
-
 class Orchestrator:
     def __init__(self):
-        if settings.COMPUTE_ALLOCATION_MODE == "cold_start":
-            self.provider = ColdStartProvider()
-        else:
-            self.provider = WarmBufferProvider()
+        self.provider = WarmBufferProvider()
         self.queues = ComputeQueues()
         self.tickets = self.queues.tickets
         self.compute_manager = ComputeManager(self.provider, self.queues, self.tickets)
         self.cleanup = ComputeCleanup(self.provider, self.queues, self.compute_manager)
-        self.capacity_reconciler = None
-        self.deployment_watcher = None
-        if isinstance(self.provider, WarmBufferProvider):
-            self.capacity_reconciler = BufferCapacityReconciler(
-                self.provider,
-                self.queues,
-                on_capacity_available=self.compute_manager.kick_wait_queue_worker,
-                # Full sweep; it calls recover_journaled_orphans itself.
-                on_periodic_cleanup=self.cleanup.check_stale_allocations,
-            )
-            self.deployment_watcher = DeploymentPolicyWatcher(
-                apps_v1=self.provider.apps_v1,
-                namespace=self.provider.namespace,
-                on_policy_event=self.capacity_reconciler.on_deployment_event,
-                label_selector=(
-                    f"{self.provider.LABEL_APP}={self.provider.APP_COMPUTE_POD}"
-                ),
-                timeout_seconds=settings.COMPUTE_AVAILABILITY_WATCH_TIMEOUT_SECONDS,
-                retry_seconds=settings.COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS,
-            )
+        self.capacity_reconciler = BufferCapacityReconciler(
+            self.provider,
+            self.queues,
+            on_capacity_available=self.compute_manager.kick_wait_queue_worker,
+            # Full sweep; it calls recover_journaled_orphans itself.
+            on_periodic_cleanup=self.cleanup.check_stale_allocations,
+        )
+        self.deployment_watcher = DeploymentPolicyWatcher(
+            apps_v1=self.provider.apps_v1,
+            namespace=self.provider.namespace,
+            on_policy_event=self.capacity_reconciler.on_deployment_event,
+            label_selector=(
+                f"{self.provider.LABEL_APP}={self.provider.APP_COMPUTE_POD}"
+            ),
+            timeout_seconds=settings.COMPUTE_AVAILABILITY_WATCH_TIMEOUT_SECONDS,
+            retry_seconds=settings.COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS,
+        )
         self.status = ControllerStatus(
             self.provider,
             self.queues,
@@ -73,11 +61,7 @@ class Orchestrator:
             namespace=self.provider.namespace,
             label_selector=f"{self.provider.LABEL_APP}={self.provider.APP_COMPUTE_POD}",
             on_compute_available=self.compute_manager.notify_compute_available,
-            on_buffer_event=(
-                self.capacity_reconciler.on_buffer_event
-                if self.capacity_reconciler
-                else None
-            ),
+            on_buffer_event=self.capacity_reconciler.on_buffer_event,
             enabled=watch_enabled,
             availability_notifications_enabled=(
                 settings.COMPUTE_AVAILABILITY_WATCH_ENABLED
@@ -95,8 +79,6 @@ class Orchestrator:
         self.queue_worker_stop_event = threading.Event()
         # Cold start has no capacity reconciler to carry the periodic sweep, so
         # the leader runs it on a thread of its own.
-        self.cleanup_thread: Optional[threading.Thread] = None
-        self.cleanup_stop_event = threading.Event()
         self.startup_completed = False
         self._initial_buffer_result: Optional[Dict] = None
 
@@ -105,34 +87,8 @@ class Orchestrator:
 
     def initialize_buffer(self) -> Dict:
         result = self.provider.initialize_buffer()
-        drained = self._drain_warm_deployments()
-        if drained is not None:
-            result["warm_deployments_drained"] = drained
         self.compute_manager.refresh_compute_types(force=True)
         return result
-
-    def _drain_warm_deployments(self) -> Optional[int]:
-        """Hold the cold-start invariant: no warm buffer replicas.
-
-        Warm Deployments are never allocated from in cold-start mode, so their
-        Pods would sit idle while still counting toward this run's occupancy
-        numbers - which would make cold start look more expensive than it is.
-
-        This has to be re-applied rather than done once at startup. During a
-        mode switch the outgoing warm-mode leader still holds the lease for a
-        few seconds after the new controllers have drained, and its reconciler
-        scales the Deployment straight back to R. Nothing then brought it down
-        again, so the replicas survived for the whole run.
-        """
-        if self.capacity_reconciler is not None:
-            return None
-        if not hasattr(self.provider, "drain_buffer_deployments"):
-            return None
-        try:
-            return self.provider.drain_buffer_deployments()
-        except Exception as exc:
-            logger.warning("[Warning] operation=drain_buffer_deployments reason=%r", str(exc))
-            return None
 
     def start(self) -> Dict:
         if self.startup_completed:
@@ -146,10 +102,9 @@ class Orchestrator:
             on_started_leading=self._start_leader_services,
             on_stopped_leading=self._stop_leader_services,
         )
-        if self.capacity_reconciler:
-            self.capacity_reconciler.set_leadership_validator(
-                self.leader_elector.has_valid_leadership
-            )
+        self.capacity_reconciler.set_leadership_validator(
+            self.leader_elector.has_valid_leadership
+        )
         self.leader_elector.start()
         logger.info("Leader election initialized")
 
@@ -163,9 +118,6 @@ class Orchestrator:
         self.queue_worker_stop_event.set()
         if self.queue_worker_thread and self.queue_worker_thread.is_alive():
             self.queue_worker_thread.join(timeout=5)
-        self.cleanup_stop_event.set()
-        if self.cleanup_thread and self.cleanup_thread.is_alive():
-            self.cleanup_thread.join(timeout=5)
 
     def _queue_worker_loop(self) -> None:
         while not self.queue_worker_stop_event.wait(settings.WAIT_QUEUE_WORKER_INTERVAL_SECONDS):
@@ -190,71 +142,15 @@ class Orchestrator:
         self.queue_worker_thread.start()
         logger.info("Queue worker started")
 
-    def _sleep_until_cleanup_due(self, interval: int) -> bool:
-        """Wait out one interval. False once the worker has been told to stop.
-
-        Waiting in short steps rather than one long one keeps a leadership
-        change from being held up by a sweep that is not due yet.
-        """
-        remaining = float(interval)
-        while remaining > 0:
-            step = min(CLEANUP_STOP_POLL_SECONDS, remaining)
-            if self.cleanup_stop_event.wait(step):
-                return False
-            remaining -= step
-        return True
-
-    def _cleanup_loop(self) -> None:
-        interval = max(1, int(settings.BUFFER_RECONCILE_RESYNC_SECONDS))
-        while self._sleep_until_cleanup_due(interval):
-            set_request_label("-")
-            try:
-                self.cleanup.check_stale_allocations()
-                self._drain_warm_deployments()
-            except Exception as exc:
-                logger.exception("[Failed] operation=periodic_cleanup reason=%r", str(exc))
-            finally:
-                set_request_label("-")
-        logger.info("Cleanup worker stopped")
-
-    def _start_cleanup_worker(self) -> None:
-        if self.cleanup_thread and self.cleanup_thread.is_alive():
-            # A thread from a previous term may still be winding down. Let it
-            # finish first, or this term would be left with no sweep at all.
-            self.cleanup_stop_event.set()
-            self.cleanup_thread.join(timeout=CLEANUP_STOP_POLL_SECONDS * 3)
-            if self.cleanup_thread.is_alive():
-                logger.warning("[Warning] operation=cleanup_worker_restart reason='previous thread still running'")
-                return
-        self.cleanup_stop_event.clear()
-        self.cleanup_thread = threading.Thread(
-            target=self._cleanup_loop,
-            name="cleanup-worker",
-            daemon=True,
-        )
-        self.cleanup_thread.start()
-        logger.info("Cleanup worker started")
-
     def _start_leader_services(self) -> None:
-        if self.capacity_reconciler:
-            self.capacity_reconciler.start()
-        else:
-            # The reconciler carries the sweep for the warm buffer; without it
-            # a Compute Pod whose client died would never be reclaimed.
-            self._drain_warm_deployments()
-            self._start_cleanup_worker()
-        if self.deployment_watcher:
-            self.deployment_watcher.start()
+        self.capacity_reconciler.start()
+        self.deployment_watcher.start()
         self.compute_watcher.start()
 
     def _stop_leader_services(self) -> None:
-        if self.deployment_watcher:
-            self.deployment_watcher.stop()
+        self.deployment_watcher.stop()
         self.compute_watcher.stop()
-        if self.capacity_reconciler:
-            self.capacity_reconciler.stop()
-        else:
-            self.cleanup_stop_event.set()
+        self.capacity_reconciler.stop()
 
     def execute_command(
         self,

@@ -15,6 +15,11 @@ kustomization="${overlay}/kustomization.yaml"
 kustomization_backup="${WORKSPACE}/.kda-deploy-kustomization-${BUILD_NUMBER}.bak"
 all_resources="${WORKSPACE}/.kda-deploy-resources-${BUILD_NUMBER}.txt"
 staged_resources="${WORKSPACE}/.kda-deploy-staged-resources-${BUILD_NUMBER}.txt"
+applied_stages="${WORKSPACE}/.kda-deploy-applied-stages-${BUILD_NUMBER}.txt"
+# The ordered rollout below must cover every one of these. The coverage
+# check only asserts that each resource carries a stage label, not that
+# its stage is applied, so a stage dropped from the rollout would pass.
+deploy_stages="bootstrap logging redis controller swlabssh"
 
 for required_command in kubectl sed grep sort diff wc tr; do
     if ! command -v "${required_command}" >/dev/null 2>&1; then
@@ -44,6 +49,7 @@ cleanup_workspace() {
     fi
     rm -f \
         "${rendered}" \
+        "${applied_stages}" \
         "${all_resources}" \
         "${staged_resources}"
 }
@@ -78,6 +84,7 @@ apply_stage() {
         -n "${namespace}" \
         -f "${rendered}" \
         -l "${stage_label}=${stage}"
+    echo "${stage}" >> "${applied_stages}"
 }
 
 echo '[Preflight] Verify cluster prerequisites'
@@ -171,7 +178,7 @@ fi
 # This is the invariant that matters: a newly added resource without a stage
 # label would silently never be applied.
 : > "${staged_resources}"
-for stage in bootstrap logging redis controller swlabssh; do
+for stage in ${deploy_stages}; do
     kubectl apply --dry-run=client \
         -n "${namespace}" \
         -f "${rendered}" \
@@ -306,6 +313,16 @@ done
 apply_stage swlabssh
 kubectl rollout status deployment/swlabssh \
     -n "${namespace}" --timeout=5m
+
+# A stage whose resources were rendered but never applied leaves that
+# workload on the previous build with no error until something
+# downstream notices.
+for stage in ${deploy_stages}; do
+    if ! grep -Fxq "${stage}" "${applied_stages}"; then
+        echo "[DeployFailed] stage was never applied: ${stage}"
+        exit 1
+    fi
+done
 
 echo '[Smoke] Verify deployed images and service readiness'
 actual_controller_image=$(kubectl get deployment/controller \
