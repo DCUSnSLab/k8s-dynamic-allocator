@@ -81,6 +81,12 @@ jobs:
             파일이 서브모듈에 있다는 점을 밝힐 것 — 인라인 코멘트는 상위
             저장소 파일에만 달 수 있으므로, 서브모듈 지적은 요약 코멘트에
             파일과 줄 번호를 적어 남긴다.
+
+            하위 에이전트를 백그라운드로 띄우지 말 것. 이 실행은 턴이 끝나면
+            프로세스가 종료되므로, 결과를 기다린다고 말한 뒤 턴을 끝내면
+            대기 중인 에이전트가 함께 죽고 리뷰가 아무 흔적 없이 끝난다.
+            하위 에이전트가 필요하면 전경으로 돌려 결과를 받고, 지적을
+            정리해 코멘트를 남기는 것까지 한 턴 안에서 끝낼 것.
           # 지적이 0건이어도 Actions 실행 요약 페이지에 결과를 남긴다 (PR 코멘트는 아니다)
           display_report: true
           # Read·Grep·Glob 이 없으면 프롬프트에 실린 diff 만 보고 판단한다.
@@ -90,8 +96,15 @@ jobs:
           # 지적 0건인 PR 에서 리뷰가 아무 흔적 없이 끝난다.
           # 통짜 Bash 는 열지 않는다 — public 저장소라 외부 기여자 PR 에서 임의 명령이
           # 도는 위험은 만들지 않는다. gh 의 읽기·코멘트 하위 명령만 연다.
+          #
+          # 플러그인의 기본 흐름은 diff 를 파일로 받아 읽는 것이다. 리다이렉션과
+          # wc 가 막혀 있으면 그 흐름이 통째로 거부되고, 우회하느라 턴을 소모한
+          # 끝에 리뷰가 미완으로 끝난다. acceptEdits 는 작업 디렉터리 안의 파일
+          # 쓰기만 허용하며, 어떤 명령을 돌릴 수 있는지는 위 allowlist 가 그대로
+          # 결정한다.
           claude_args: >-
             --model claude-opus-5
-            --allowedTools "Read,Grep,Glob,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),mcp__github_inline_comment__create_inline_comment"
+            --permission-mode acceptEdits
+            --allowedTools "Read,Grep,Glob,Write,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(wc:*),mcp__github_inline_comment__create_inline_comment"
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
