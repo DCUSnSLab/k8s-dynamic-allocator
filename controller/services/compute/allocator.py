@@ -129,6 +129,20 @@ class ComputeAllocator:
         remaining = max(0, capacity - active)
         if remaining == 0:
             result["capacity_blocked"] = "capacity"
+            if active == 0:
+                # Being at the cap is ordinary backpressure, but only while
+                # something is running that can finish and free a slot. With
+                # nothing active the cap itself is the blocker and the queue
+                # will never drain - tickets just accumulate with no error
+                # anywhere. That needs a line in the log, because the symptom
+                # is otherwise silence.
+                logger.warning(
+                    "[Warning] operation=cold_start_capacity_deadlock "
+                    "compute_type=%s capacity=%s reason=%r",
+                    compute_type,
+                    capacity,
+                    "capacity is not positive, so no ticket can ever be served",
+                )
         return min(effective_batch, remaining)
 
     def _compute_wait_queue_batch_plan(self) -> Tuple[int, int]:

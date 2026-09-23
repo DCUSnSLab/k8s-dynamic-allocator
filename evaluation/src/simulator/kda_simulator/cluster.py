@@ -100,6 +100,32 @@ def read_server_settings() -> dict[str, Any]:
         # Same default and normalization as the controller's COMPUTE_ALLOCATION_MODE.
         allocation_mode = (_env(controller, "COMPUTE_ALLOCATION_MODE") or "warm_buffer").strip().lower().replace("-", "_")
 
+    if allocation_mode == "cold_start":
+        # Cold start creates a pod per request and allocates from no
+        # Deployment at all. A compute Deployment still sitting in the
+        # namespace is a leftover from a warm run: its annotations describe a
+        # policy that is not in force and its image is not the one these pods
+        # ran. Recording those would put the wrong N - and N=0 in particular,
+        # which reads as the value that blocks every request - into the run's
+        # provenance. Both facts come from the controller instead, which is
+        # where this arm actually reads them.
+        live = [
+            pod for pod in pods
+            if not pod["metadata"].get("deletionTimestamp")
+        ]
+        buffers = [
+            {
+                "deployment": None,
+                "compute_type": "",
+                "R": None,
+                "N": _int_or_none(_env(controller, "BUFFER_CAPACITY")),
+                "available": 0,
+                "available_ready": 0,
+                "assigned": len(live),
+                "image": _cold_start_compute_image(),
+            }
+        ]
+
     return {
         "namespace": KUBERNETES_NAMESPACE,
         "allocation_mode": allocation_mode,
@@ -150,14 +176,44 @@ def wait_for_current_policy() -> None:
 
 
 def describe_settings(settings: dict[str, Any]) -> str:
-    buffer_text = ", ".join(
-        f"{buffer['deployment']} R={buffer['R']} N={buffer['N']} ready={buffer['available_ready']}"
-        for buffer in settings["buffers"]
-    )
+    # Cold start has no Deployment and no R, so the warm line would read
+    # "None R=None" for both. Only N is meaningful here.
+    if settings["allocation_mode"] == "cold_start":
+        buffer_text = ", ".join(
+            f"N={buffer['N']}" for buffer in settings["buffers"]
+        )
+    else:
+        buffer_text = ", ".join(
+            f"{buffer['deployment']} R={buffer['R']} N={buffer['N']} ready={buffer['available_ready']}"
+            for buffer in settings["buffers"]
+        )
     return (
         f"mode={settings['allocation_mode']} controllers={settings['controller_replicas']} "
         f"swlabssh={settings['swlabssh_replicas']} {buffer_text}"
     )
+
+
+def _cold_start_compute_image() -> str | None:
+    """The compute image this arm creates pods from.
+
+    It is baked into the controller image rather than set on the Deployment,
+    so it cannot be read from the spec the way other fields are; the deploy's
+    own verification reads it the same way, through the running container.
+    Provenance should not fail a run, so an unreadable value is recorded as
+    unknown rather than raised.
+    """
+    try:
+        value = run_kubectl(
+            "exec",
+            "deployment/controller",
+            "--",
+            "sh",
+            "-c",
+            'printf "%s" "$COMPUTE_POD_IMAGE"',
+        )
+    except ServerSettingsError:
+        return None
+    return value.strip() or None
 
 
 def run_kubectl(

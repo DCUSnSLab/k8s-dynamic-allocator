@@ -29,10 +29,19 @@ done
 # parameter is rejected before anything is applied to the cluster.
 case "${buffer_capacity}" in
     '' | *[!0-9]*)
-        echo "[PreflightFailed] capacity must be a non-negative integer: N=${buffer_capacity}"
+        echo "[PreflightFailed] capacity must be a positive integer: N=${buffer_capacity}"
         exit 1
         ;;
 esac
+
+# N=0 is accepted by the warm arm, where it simply means no buffer is kept.
+# Here it means no pod may ever be created, so every request queues and the
+# run produces nothing - with no error anywhere to say why. Refuse it here
+# rather than let a build spend an hour discovering it.
+if [ "${buffer_capacity}" -lt 1 ]; then
+    echo "[PreflightFailed] cold start needs N>=1; N=0 would block every request: N=${buffer_capacity}"
+    exit 1
+fi
 
 cleanup_workspace() {
     if [ -f "${kustomization_backup}" ]; then
