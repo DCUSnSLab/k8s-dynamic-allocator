@@ -46,8 +46,11 @@ spec:
         env:
         - name: REDIS_URL
           value: redis://controller-queue-redis:6379/0
+        # The controller ignores this on this branch - the mode is pinned in
+        # settings - but the load generator reads it off the Deployment to
+        # decide whether R/N apply, so it has to say what is actually running.
         - name: COMPUTE_ALLOCATION_MODE
-          value: warm_buffer
+          value: cold_start
         resources:
           requests:
             cpu: "100m"

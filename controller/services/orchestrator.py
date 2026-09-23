@@ -29,10 +29,9 @@ CLEANUP_STOP_POLL_SECONDS = 1.0
 
 class Orchestrator:
     def __init__(self):
-        if settings.COMPUTE_ALLOCATION_MODE == "cold_start":
-            self.provider = ColdStartProvider()
-        else:
-            self.provider = WarmBufferProvider()
+        # Cold start arm: a pod per request, created on demand and discarded
+        # after. There is no warm path on this branch to fall back to.
+        self.provider = ColdStartProvider()
         self.queues = ComputeQueues()
         self.tickets = self.queues.tickets
         self.compute_manager = ComputeManager(self.provider, self.queues, self.tickets)

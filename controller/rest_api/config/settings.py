@@ -139,7 +139,12 @@ CACHES = {
 REDIS_URL = _env_first(('REDIS_URL',), 'redis://localhost:6379/0')
 WAIT_QUEUE_PREFIX = _env_first(('WAIT_QUEUE_PREFIX',), 'kda:waitq')
 DEFAULT_COMPUTE_TYPE = _env_first(('DEFAULT_COMPUTE_TYPE',), 'general')
-COMPUTE_ALLOCATION_MODE = _env_first(('COMPUTE_ALLOCATION_MODE',), 'warm_buffer').strip().lower().replace("-", "_")
+# Fixed for this comparison arm. develop reads this from the environment and
+# falls back to warm_buffer on an unrecognised value, so a typo there yields a
+# warm run wearing a cold label. The branch is the arm, so the value is not
+# configurable here; the Deployment still carries a matching env var for
+# outside observers such as the load generator.
+COMPUTE_ALLOCATION_MODE = 'cold_start'
 COMPUTE_POD_IMAGE = _env_first(
     ('COMPUTE_POD_IMAGE',),
     'harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:latest',
