@@ -254,6 +254,13 @@ COMPUTE_AGENT_UNMOUNT_TIMEOUT_SECONDS = _env_float_any(
     ('COMPUTE_AGENT_UNMOUNT_TIMEOUT_SECONDS',),
     COMPUTE_AGENT_TIMEOUT_SECONDS,
 )
+# Cap on pods in flight, the same N the warm arm enforces through its
+# Deployment annotation. This arm has no Deployment to carry it, so it is
+# supplied at deploy time; the value must match the other arm or the two are
+# not running under the same constraint. Empty or unset means no cap, which
+# is reported at startup rather than assumed to be intentional.
+COLD_START_CAPACITY = _env_first(('BUFFER_CAPACITY', 'COLD_START_CAPACITY'), '').strip()
+
 COLD_START_POD_READY_TIMEOUT_SECONDS = _env_float_any(
     ('COLD_START_POD_READY_TIMEOUT_SECONDS',),
     300.0,

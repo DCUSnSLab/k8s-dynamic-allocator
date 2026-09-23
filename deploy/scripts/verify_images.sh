@@ -35,7 +35,6 @@ expected_image = os.environ["EXPECTED_COMPUTE_POD_IMAGE"]
 assert settings.COMPUTE_POD_IMAGE == expected_image
 
 for path in (
-    "/app/manifests/compute-general.yaml",
     "/app/manifests/cold_start/compute-general-pod.yaml",
 ):
     with open(path, encoding="utf-8") as manifest_file:

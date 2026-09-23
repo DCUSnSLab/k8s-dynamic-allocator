@@ -6,10 +6,7 @@ namespace="${DEPLOY_NAMESPACE}"
 storage_class="${DEPLOY_STORAGE_CLASS}"
 overlay="${DEPLOY_OVERLAY}"
 stage_label="${DEPLOY_STAGE_LABEL}"
-buffer_reserve="${BUFFER_RESERVE}"
 buffer_capacity="${BUFFER_CAPACITY}"
-buffer_reserve_annotation='k8s-dynamic-allocator/buffer-reserve'
-buffer_capacity_annotation='k8s-dynamic-allocator/buffer-capacity'
 rendered="${WORKSPACE}/.kda-deploy-${BUILD_NUMBER}.yaml"
 kustomization="${overlay}/kustomization.yaml"
 kustomization_backup="${WORKSPACE}/.kda-deploy-kustomization-${BUILD_NUMBER}.bak"
@@ -25,18 +22,12 @@ done
 
 # Mirror the controller's own fail-closed rule (0 <= R <= N) so a bad build
 # parameter is rejected before anything is applied to the cluster.
-for policy_value in "${buffer_reserve}" "${buffer_capacity}"; do
-    case "${policy_value}" in
-        ''|*[!0-9]*)
-            echo "[PreflightFailed] buffer policy must be non-negative integers: R=${buffer_reserve} N=${buffer_capacity}"
-            exit 1
-            ;;
-    esac
-done
-if [ "${buffer_reserve}" -gt "${buffer_capacity}" ]; then
-    echo "[PreflightFailed] buffer policy must satisfy R <= N: R=${buffer_reserve} N=${buffer_capacity}"
-    exit 1
-fi
+case "${buffer_capacity}" in
+    '' | *[!0-9]*)
+        echo "[PreflightFailed] capacity must be a non-negative integer: N=${buffer_capacity}"
+        exit 1
+        ;;
+esac
 
 cleanup_workspace() {
     if [ -f "${kustomization_backup}" ]; then
@@ -216,47 +207,17 @@ apply_stage controller
 kubectl rollout status deployment/controller \
     -n "${namespace}" --timeout=5m
 
-echo '[Deploy] Wait for controller-managed compute-general Deployment'
-attempt=0
-while ! kubectl get deployment/compute-general -n "${namespace}" >/dev/null 2>&1; do
-    attempt=$((attempt + 1))
-    if [ "${attempt}" -ge 60 ]; then
-        echo '[DeployFailed] deployment/compute-general was not created within 120 seconds'
-        exit 1
-    fi
-    sleep 2
-done
-
-# R/N live on the Deployment's metadata annotations. The controller watches
-# them and never overwrites an operator-supplied value, so applying the build
-# parameters here is enough - no controller restart and no pod churn.
-echo "[Deploy] Apply buffer policy R=${buffer_reserve} N=${buffer_capacity}"
-kubectl annotate deployment/compute-general \
-    "${buffer_reserve_annotation}=${buffer_reserve}" \
-    "${buffer_capacity_annotation}=${buffer_capacity}" \
-    -n "${namespace}" --overwrite
-
-# The controller creates compute-general from its manifest only when it is
-# missing, so node placement and resources changed in the manifest later have
-# to be carried onto the live Deployment here. Same rollout as the image change.
-compute_manifest="${WORKSPACE}/controller/manifests/compute-general.yaml"
-compute_node_selector=$(kubectl create --dry-run=client -f "${compute_manifest}" \
-    -o jsonpath='{.spec.template.spec.nodeSelector}')
-compute_resources=$(kubectl create --dry-run=client -f "${compute_manifest}" \
-    -o jsonpath='{.spec.template.spec.containers[?(@.name=="compute-agent")].resources}')
-if [ -z "${compute_node_selector}" ] || [ -z "${compute_resources}" ]; then
-    echo "[DeployFailed] ${compute_manifest} must set nodeSelector and compute-agent resources"
-    exit 1
-fi
-echo "[Deploy] Sync compute-general image, nodeSelector=${compute_node_selector} resources=${compute_resources}"
-# Image, placement and resources in one patch, so the Deployment rolls out once.
-kubectl patch deployment/compute-general -n "${namespace}" --type=strategic \
-    -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":${compute_node_selector},\"containers\":[{\"name\":\"compute-agent\",\"image\":\"${COMPUTE_POD_IMAGE}\",\"resources\":${compute_resources}}]}}}}"
-
-kubectl rollout status deployment/compute-general \
+# The cap cannot ride on a Deployment annotation here: this arm creates a pod
+# per request and never creates compute-general. It goes on the controller
+# instead, which reads it at startup, so the value is set before the rollout
+# above rather than annotated after it.
+echo "[Deploy] Apply capacity N=${buffer_capacity}"
+kubectl set env deployment/controller -n "${namespace}" \
+    "BUFFER_CAPACITY=${buffer_capacity}"
+kubectl rollout status deployment/controller \
     -n "${namespace}" --timeout=5m
 
-echo '[Smoke] Wait for shared buffer policy to become active'
+echo '[Smoke] Wait for the cold-start controller to report its capacity'
 attempt=0
 until kubectl exec -n "${namespace}" deployment/controller -- \
     python -c '
@@ -264,34 +225,28 @@ import json
 import sys
 import urllib.request
 
-expected_r = int(sys.argv[1])
-expected_n = int(sys.argv[2])
-
+expected_n = int(sys.argv[1])
 with urllib.request.urlopen(
     "http://127.0.0.1:9001/api/compute/status/",
     timeout=5,
 ) as response:
     status = json.load(response)
 
-general = (status.get("buffers") or {}).get("general") or {}
+# Cold start reports no buffers at all; what has to be true is that the
+# controller is serving, is on the cold arm, and took the cap it was given.
 ready = (
-    status.get("policy_ready") is True
-    and general.get("policy_valid") is True
-    and general.get("policy_cached") is True
-    and general.get("R") == expected_r
-    and general.get("N") == expected_n
+    status.get("allocation_mode") == "cold_start"
+    and status.get("capacity") == expected_n
 )
 sys.exit(0 if ready else 1)
-' "${buffer_reserve}" "${buffer_capacity}" >/dev/null
-do
+' "${buffer_capacity}" >/dev/null 2>&1; do
     attempt=$((attempt + 1))
-    if [ "${attempt}" -ge 40 ]; then
-        echo '[SmokeFailed] shared buffer policy was not active within 120 seconds'
+    if [ "${attempt}" -ge 60 ]; then
+        echo "[SmokeFailed] cold-start capacity was not active within 120 seconds"
         kubectl exec -n "${namespace}" deployment/controller -- \
             python -c '
 import json
 import urllib.request
-
 with urllib.request.urlopen(
     "http://127.0.0.1:9001/api/compute/status/",
     timeout=5,
@@ -300,36 +255,28 @@ with urllib.request.urlopen(
 ' || true
         exit 1
     fi
-    sleep 3
+    sleep 2
 done
-
-apply_stage swlabssh
-kubectl rollout status deployment/swlabssh \
-    -n "${namespace}" --timeout=5m
 
 echo '[Smoke] Verify deployed images and service readiness'
 actual_controller_image=$(kubectl get deployment/controller \
     -n "${namespace}" \
     -o jsonpath='{.spec.template.spec.containers[?(@.name=="controller")].image}')
-actual_compute_image=$(kubectl get deployment/compute-general \
-    -n "${namespace}" \
-    -o jsonpath='{.spec.template.spec.containers[?(@.name=="compute-agent")].image}')
 actual_swlabssh_image=$(kubectl get deployment/swlabssh \
     -n "${namespace}" \
     -o jsonpath='{.spec.template.spec.containers[?(@.name=="swlabssh")].image}')
 
 test "${actual_controller_image}" = "${CONTROLLER_IMAGE}"
-test "${actual_compute_image}" = "${COMPUTE_POD_IMAGE}"
+# The compute image never reaches a Deployment on this arm; the controller
+# creates pods from it directly, so its own environment is the source.
 test "${actual_swlabssh_image}" = "${SWLABSSH_IMAGE}"
 
-actual_buffer_reserve=$(kubectl get deployment/compute-general \
-    -n "${namespace}" \
-    -o go-template="{{index .metadata.annotations \"${buffer_reserve_annotation}\"}}")
-actual_buffer_capacity=$(kubectl get deployment/compute-general \
-    -n "${namespace}" \
-    -o go-template="{{index .metadata.annotations \"${buffer_capacity_annotation}\"}}")
-test "${actual_buffer_reserve}" = "${buffer_reserve}"
-test "${actual_buffer_capacity}" = "${buffer_capacity}"
+# No Deployment carries the policy here, so the cap is read back from the
+# controller that is running. R has no meaning on this arm: there is no
+# buffer to keep warm.
+actual_capacity=$(kubectl exec -n "${namespace}" deployment/controller -- \
+    sh -c 'printf "%s" "$BUFFER_CAPACITY"')
+test "${actual_capacity}" = "${buffer_capacity}"
 
 runtime_compute_image=$(kubectl exec -n "${namespace}" \
     deployment/controller -- \
@@ -377,5 +324,5 @@ test "${fluent_bit_desired}" -gt 0
 test "${fluent_bit_ready}" -eq "${fluent_bit_desired}"
 
 echo "[Success] image tag=${IMAGE_TAG}"
-echo "[Success] buffer policy R=${buffer_reserve} N=${buffer_capacity}"
+echo "[Success] cold start capacity N=${buffer_capacity}"
 echo "[Success] SSH endpoint=${DEPLOY_SSH_HOST}:${DEPLOY_SSH_PORT}"

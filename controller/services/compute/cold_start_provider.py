@@ -20,7 +20,6 @@ from config import settings
 
 from ..infra.kubernetes_client import KubernetesClient
 from .manifest_images import override_compute_agent_image
-from .warm_buffer_provider import BUFFER_CAPACITY_ANNOTATION
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +54,6 @@ class ColdStartProvider(KubernetesClient):
     # Cold start has no R -- nothing is created ahead of a request -- but N is
     # read from the same Deployment annotation the warm buffer uses, so both
     # allocation modes run under one capacity and one source of truth.
-    ANNOTATION_BUFFER_CAPACITY = BUFFER_CAPACITY_ANNOTATION
 
     def __init__(self):
         super().__init__()
@@ -210,36 +208,24 @@ class ColdStartProvider(KubernetesClient):
         return status_list
 
     def read_capacity(self, compute_type: Optional[str] = None) -> Optional[int]:
-        """N for this compute type, or None when no Deployment declares one.
+        """N for this arm, or None when no cap was configured.
 
-        None means "no cap", which is how the run behaves if the annotation is
-        missing; a capped run is the comparable one, so the caller logs it.
+        The warm arm keeps this on its Deployment annotation. This arm has no
+        Deployment, so the value comes from the environment and applies to every
+        compute type. None means "no cap"; the caller logs that, because an
+        uncapped cold run is not comparable with a capped warm one.
         """
-        deployments = self.apps_v1.list_namespaced_deployment(
-            namespace=self.namespace,
-            label_selector=self._compute_selector(compute_type=compute_type),
-            _request_timeout=self.api_request_timeout,
-        )
-        values = []
-        for deployment in deployments.items:
-            raw = (getattr(deployment.metadata, "annotations", None) or {}).get(
-                self.ANNOTATION_BUFFER_CAPACITY
-            )
-            if raw is None:
-                continue
-            try:
-                values.append(int(str(raw).strip()))
-            except (TypeError, ValueError):
-                logger.warning(
-                    "[Warning] operation=cold_start_capacity deployment=%s reason=%r",
-                    deployment.metadata.name,
-                    f"{self.ANNOTATION_BUFFER_CAPACITY} is not an integer: {raw!r}",
-                )
-        if not values:
+        raw = settings.COLD_START_CAPACITY
+        if not raw:
             return None
-        # One Deployment per compute type is the rule; the lowest value is the
-        # safe reading if a migration ever leaves two behind.
-        return max(0, min(values))
+        try:
+            return max(0, int(str(raw).strip()))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[Warning] operation=cold_start_capacity reason=%r",
+                f"capacity is not an integer: {raw!r}",
+            )
+            return None
 
     def count_active_pods(self, compute_type: Optional[str] = None) -> int:
         """Pods that still hold capacity. Terminating ones are already giving it back."""

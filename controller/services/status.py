@@ -39,6 +39,15 @@ class ControllerStatus:
         }
 
         if not hasattr(self.provider, "list_buffer_deployments"):
+            # Cold start: no Deployment, so none of the buffer policy fields
+            # below exist. What a caller still needs is which arm is running and
+            # under what cap, both for the deploy smoke check and so a collected
+            # run can be attributed to an arm afterwards.
+            response["allocation_mode"] = getattr(
+                self.provider, "allocation_mode", ""
+            )
+            response["capacity"] = self.provider.read_capacity()
+            response["active"] = self.provider.count_active_pods()
             return response
 
         response["physical_total"] = len(buffer_list)

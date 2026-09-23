@@ -9,12 +9,9 @@ from .compute import (
     ColdStartProvider,
     ComputeCleanup,
     ComputeManager,
-    BufferCapacityReconciler,
-    WarmBufferProvider,
 )
 from .infra import (
     ComputeAvailabilityWatcher,
-    DeploymentPolicyWatcher,
     LeaseLeaderElector,
 )
 from .queue import ComputeQueues
@@ -36,26 +33,11 @@ class Orchestrator:
         self.tickets = self.queues.tickets
         self.compute_manager = ComputeManager(self.provider, self.queues, self.tickets)
         self.cleanup = ComputeCleanup(self.provider, self.queues, self.compute_manager)
+        # Both belong to the warm buffer, which this arm does not run. They
+        # stay as None rather than disappearing: every use below is already
+        # guarded, and keeping the shape lets fixes cherry-pick from develop.
         self.capacity_reconciler = None
         self.deployment_watcher = None
-        if isinstance(self.provider, WarmBufferProvider):
-            self.capacity_reconciler = BufferCapacityReconciler(
-                self.provider,
-                self.queues,
-                on_capacity_available=self.compute_manager.kick_wait_queue_worker,
-                # Full sweep; it calls recover_journaled_orphans itself.
-                on_periodic_cleanup=self.cleanup.check_stale_allocations,
-            )
-            self.deployment_watcher = DeploymentPolicyWatcher(
-                apps_v1=self.provider.apps_v1,
-                namespace=self.provider.namespace,
-                on_policy_event=self.capacity_reconciler.on_deployment_event,
-                label_selector=(
-                    f"{self.provider.LABEL_APP}={self.provider.APP_COMPUTE_POD}"
-                ),
-                timeout_seconds=settings.COMPUTE_AVAILABILITY_WATCH_TIMEOUT_SECONDS,
-                retry_seconds=settings.COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS,
-            )
         self.status = ControllerStatus(
             self.provider,
             self.queues,

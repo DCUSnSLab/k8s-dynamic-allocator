@@ -51,6 +51,12 @@ spec:
         # decide whether R/N apply, so it has to say what is actually running.
         - name: COMPUTE_ALLOCATION_MODE
           value: cold_start
+        # N for this arm. The warm arm keeps it on the compute Deployment's
+        # annotation; this arm has no Deployment, so deploy.sh patches the
+        # build parameter in here. Both arms have to run the same N or the
+        # comparison is not under one constraint.
+        - name: BUFFER_CAPACITY
+          value: ""
         resources:
           requests:
             cpu: "100m"
