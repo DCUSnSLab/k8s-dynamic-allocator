@@ -29,6 +29,39 @@ jobs:
         with:
           ref: refs/pull/${{ github.event.issue.number }}/head
           fetch-depth: 0
+          # 서브모듈 없이 받으면 dcusshk8s 가 빈 디렉터리로 남아 리뷰가 그 안을
+          # 읽지 못한다. dcusshk8s 도 public 이라 기본 토큰으로 받아진다.
+          submodules: recursive
+
+      # 상위 레포의 diff 에서 서브모듈 변경은 포인터 해시 한 줄로만 보인다.
+      # 그대로 두면 run 의 실제 변경이 리뷰에 전혀 노출되지 않으므로, 이전
+      # 포인터와 현재 포인터 사이의 diff 를 파일로 풀어 두고 프롬프트에서
+      # 읽게 한다.
+      - name: Expand submodule diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          out=SUBMODULE_CHANGES.diff
+          : > "$out"
+          base=$(gh pr view "${{ github.event.issue.number }}"                    --repo "${{ github.repository }}"                    --json baseRefOid --jq .baseRefOid)
+          # 포인터가 바뀐 서브모듈만 추린다.
+          git diff "$base" HEAD --submodule=short             | grep -E '^(-|\+)Subproject commit' || true
+          changed=$(git diff --name-only "$base" HEAD -- $(git config -f .gitmodules --get-regexp path | awk '{print $2}') || true)
+          for path in $changed; do
+            old=$(git rev-parse "$base:$path" 2>/dev/null || true)
+            new=$(git rev-parse "HEAD:$path" 2>/dev/null || true)
+            [ -n "$old" ] && [ -n "$new" ] && [ "$old" != "$new" ] || continue
+            echo "===== submodule $path: $old -> $new =====" >> "$out"
+            git -C "$path" fetch --quiet origin "$old" "$new" 2>/dev/null ||               git -C "$path" fetch --quiet --unshallow origin 2>/dev/null || true
+            git -C "$path" diff "$old" "$new" >> "$out" 2>/dev/null               || echo "(diff 실패: $path)" >> "$out"
+            echo >> "$out"
+          done
+          if [ -s "$out" ]; then
+            echo "서브모듈 변경을 $out 에 펼쳤다 ($(wc -l < "$out") 줄)"
+          else
+            echo "서브모듈 변경 없음"
+          fi
 
       - name: Run Claude Code Review
         id: claude-review
@@ -37,7 +70,17 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.issue.number }}'
+          prompt: >-
+            /code-review:code-review --comment
+            ${{ github.repository }}/pull/${{ github.event.issue.number }}
+
+            이 저장소는 dcusshk8s 를 서브모듈로 쓴다. PR diff 에서 서브모듈
+            변경은 포인터 해시 한 줄로만 보이지만, 실제 코드 변경은 그 안에
+            있다. 저장소 루트에 SUBMODULE_CHANGES.diff 가 있으면 반드시 읽고,
+            거기 담긴 변경도 PR 의 일부로 함께 리뷰할 것. 지적을 달 때는 해당
+            파일이 서브모듈에 있다는 점을 밝힐 것 — 인라인 코멘트는 상위
+            저장소 파일에만 달 수 있으므로, 서브모듈 지적은 요약 코멘트에
+            파일과 줄 번호를 적어 남긴다.
           # 지적이 0건이어도 Actions 실행 요약 페이지에 결과를 남긴다 (PR 코멘트는 아니다)
           display_report: true
           # Read·Grep·Glob 이 없으면 프롬프트에 실린 diff 만 보고 판단한다.
