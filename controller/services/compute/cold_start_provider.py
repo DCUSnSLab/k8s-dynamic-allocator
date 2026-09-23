@@ -69,14 +69,19 @@ class ColdStartProvider(KubernetesClient):
         # written down here: no Deployment carries it on this arm. An absent
         # cap is the case worth saying out loud - the run still completes, but
         # it was not held to the same constraint as the arm it is compared to.
-        capacity = self.read_capacity()
-        if capacity is None:
-            logger.warning(
-                "[Warning] operation=cold_start_capacity reason=%r",
-                "no capacity configured; this run is uncapped",
-            )
-        else:
-            logger.info("Cold-start capacity: N=%s", capacity)
+        # This method doubles as the template refresh and is re-entered on an
+        # interval, which is what log_existing distinguishes; the capacity is a
+        # startup fact and repeating it would turn the uncapped warning into a
+        # recurring one.
+        if log_existing:
+            capacity = self.read_capacity()
+            if capacity is None:
+                logger.warning(
+                    "[Warning] operation=cold_start_capacity reason=%r",
+                    "no capacity configured; this run is uncapped",
+                )
+            else:
+                logger.info("Cold-start capacity: N=%s", capacity)
 
         yaml_files = glob.glob(os.path.join(MANIFESTS_DIR, "*.yaml"))
         if not yaml_files:
