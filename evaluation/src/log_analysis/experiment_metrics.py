@@ -18,6 +18,7 @@ import argparse
 import gzip
 import json
 import re
+import statistics
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -32,7 +33,9 @@ from kda_simulator.config import SUMMARY_SCHEMA_VERSION  # noqa: E402
 from kda_simulator.metrics import summarize_values  # noqa: E402
 
 GIB = 2**30
-CONTROLLER_EVENT_RE = re.compile(r"\] \[(?P<label>[^\]]+)\] \[(?P<event>Request|Assigned)\] (?P<rest>.*)")
+CONTROLLER_EVENT_RE = re.compile(
+    r"\] \[(?P<label>[^\]]+)\] \[(?P<event>Request|Assigned|Released)\] (?P<rest>.*)"
+)
 REQUEST_ID_RE = re.compile(r"request_id=(?P<request_id>[^\s;'\"]+)")
 KEY_VALUE_RE = re.compile(r"(?P<key>[a-z_]+)=(?P<value>\S+)")
 
@@ -136,7 +139,7 @@ def window_metrics(
         r for r in requests
         if window[0] <= run_start + timedelta(seconds=float(r["planned_offset_seconds"])) < window[1]
     ]
-    result: dict[str, Any] = {"requests": request_metrics(in_window)}
+    result: dict[str, Any] = {"requests": request_metrics(in_window, assignments)}
     if assignments is not None:
         result["controller"] = assignment_metrics([assignments[r["request_id"]] for r in in_window
                                                    if r["request_id"] in assignments])
@@ -145,16 +148,78 @@ def window_metrics(
     return result
 
 
-def request_metrics(requests: list[dict[str, Any]]) -> dict[str, Any]:
+def command_baselines(requests: list[dict[str, Any]]) -> dict[str, float]:
+    """How long each command takes, measured by this run's own successes.
+
+    A fixed threshold would have to be guessed and would not survive a change
+    of workload; the successful requests already measure it.
+    """
+    by_command: dict[str, list[float]] = {}
+    for r in requests:
+        if r.get("status") == "success" and r.get("command_duration_ms"):
+            by_command.setdefault(r.get("command_name") or "", []).append(r["command_duration_ms"])
+    return {name: statistics.median(values) for name, values in by_command.items() if values}
+
+
+def split_incomplete(
+    requests: list[dict[str, Any]],
+    assignments: dict[str, dict[str, float]] | None,
+) -> tuple[int, int, int]:
+    """Return (server_failed, output_lost, unclassified) among incompletes.
+
+    An incomplete request is one whose command was delivered with no completion
+    signal coming back. The pod vanishing mid-command produces that, and so does
+    the server finishing the work while the output is lost on the way back. Only
+    the first is a server failure, and calling both one overstates the figure the
+    comparison rests on.
+
+    The controller writes a single [Released] per session with no reason field,
+    so its presence decides nothing on its own. Its session_ms does: a session
+    that lasted at least as long as the command takes is one where the command
+    ran to the end.
+    """
+    baselines = command_baselines(requests)
+    server_failed = output_lost = unclassified = 0
+    for r in requests:
+        if r.get("status") != "incomplete":
+            continue
+        timings = (assignments or {}).get(r.get("request_id")) or {}
+        session_ms = timings.get("session_ms")
+        baseline = baselines.get(r.get("command_name") or "")
+        if session_ms is None:
+            # No controller logs exported, or no release recorded. Either way
+            # there is nothing to clear the server with, so it stays charged.
+            server_failed += 1
+        elif baseline is None:
+            unclassified += 1
+        elif session_ms >= baseline:
+            output_lost += 1
+        else:
+            server_failed += 1
+    return server_failed, output_lost, unclassified
+
+
+def request_metrics(
+    requests: list[dict[str, Any]],
+    assignments: dict[str, dict[str, float]] | None = None,
+) -> dict[str, Any]:
     statuses: dict[str, int] = {}
     for r in requests:
         statuses[r.get("status") or "unknown"] = statuses.get(r.get("status") or "unknown", 0) + 1
     success = [r for r in requests if r.get("status") == "success"]
+    # ssh_error never reached the server, so it is not a server failure.
+    charged = sum(n for s, n in statuses.items() if s not in ("success", "ssh_error", "incomplete"))
+    incomplete_server, incomplete_output_lost, incomplete_unclassified = split_incomplete(
+        requests, assignments
+    )
     return {
         "count": len(requests),
         "status": statuses,
-        # ssh_error never reached the server, so it is not a server failure.
-        "server_failures": sum(n for s, n in statuses.items() if s not in ("success", "ssh_error")),
+        "server_failures": charged + incomplete_server + incomplete_unclassified,
+        # Work the server completed and the client never saw. Not a server
+        # failure, but not a success either, so it is reported on its own.
+        "output_lost": incomplete_output_lost,
+        "incomplete_unclassified": incomplete_unclassified,
         "start_delay_s": summarize_values([r["since_send_to_start_ms"] / 1000.0 for r in success if r.get("since_send_to_start_ms") is not None]),
         "command_s": summarize_values([r["command_duration_ms"] / 1000.0 for r in success if r.get("command_duration_ms") is not None]),
         "ssh_retried": sum(1 for r in requests if (r.get("ssh_attempts") or 1) > 1),
@@ -251,14 +316,20 @@ def build_pod_lives(records: Iterable[dict[str, Any]], run_end: datetime) -> lis
 
 
 def read_assignments(logs_dir: Path, request_ids: set[str]) -> dict[str, dict[str, float]]:
-    """Controller [Assigned] fields per simulator request_id."""
+    """Controller [Assigned] and [Released] fields per simulator request_id.
+
+    [Released] carries session_ms, which is how long the controller held the
+    compute pod for that request. It is the only server-side measure of whether
+    the command ran to the end, and classifying an incomplete request needs it.
+    """
     label_to_request: dict[str, str] = {}
-    assigned: dict[str, dict[str, float]] = {}
+    timings: dict[str, dict[str, float]] = {}
+    events = ("[Request]", "[Assigned]", "[Released]")
     for path in sorted(logs_dir.glob("*.jsonl")) + sorted(logs_dir.glob("*.jsonl.gz")):
         opener = gzip.open if path.name.endswith(".gz") else open
         with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
             for line in handle:
-                if '"controller"' not in line or ("[Request]" not in line and "[Assigned]" not in line):
+                if '"controller"' not in line or not any(e in line for e in events):
                     continue
                 try:
                     record = json.loads(line)
@@ -272,13 +343,15 @@ def read_assignments(logs_dir: Path, request_ids: set[str]) -> dict[str, dict[st
                     found = REQUEST_ID_RE.search(rest)
                     if found and found.group("request_id") in request_ids:
                         label_to_request[label] = found.group("request_id")
-                else:
-                    assigned[label] = {
-                        key: float(value)
-                        for key, value in KEY_VALUE_RE.findall(rest)
-                        if key.endswith("_ms") and _is_number(value)
-                    }
-    return {request: assigned[label] for label, request in label_to_request.items() if label in assigned}
+                    continue
+                # Assigned and Released describe one session between them, so
+                # their fields are merged rather than overwriting each other.
+                timings.setdefault(label, {}).update({
+                    key: float(value)
+                    for key, value in KEY_VALUE_RE.findall(rest)
+                    if key.endswith("_ms") and _is_number(value)
+                })
+    return {request: timings[label] for label, request in label_to_request.items() if label in timings}
 
 
 def print_report(metrics: dict[str, Any]) -> None:
@@ -286,7 +359,14 @@ def print_report(metrics: dict[str, Any]) -> None:
     req = overall["requests"]
     print(f"run {metrics['run']}  {metrics['window']['minutes']:.1f} min  users={metrics['users']}  "
           f"buffers={metrics['server_buffers']}")
-    print(f"requests {req['count']}  status={req['status']}  server_failures={req['server_failures']}")
+    line = f"requests {req['count']}  status={req['status']}  server_failures={req['server_failures']}"
+    if req.get("output_lost"):
+        # Named separately because the server did the work; counting it as a
+        # server failure would understate the system being measured.
+        line += f"  output_lost={req['output_lost']}"
+    if req.get("incomplete_unclassified"):
+        line += f"  unclassified={req['incomplete_unclassified']}"
+    print(line)
     print(f"start delay s  {_fmt(req['start_delay_s'])}")
     if "controller" in overall:
         ctl = overall["controller"]
