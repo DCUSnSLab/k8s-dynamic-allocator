@@ -139,7 +139,10 @@ CACHES = {
 REDIS_URL = _env_first(('REDIS_URL',), 'redis://localhost:6379/0')
 WAIT_QUEUE_PREFIX = _env_first(('WAIT_QUEUE_PREFIX',), 'kda:waitq')
 DEFAULT_COMPUTE_TYPE = _env_first(('DEFAULT_COMPUTE_TYPE',), 'general')
-COMPUTE_ALLOCATION_MODE = _env_first(('COMPUTE_ALLOCATION_MODE',), 'warm_buffer').strip().lower().replace("-", "_")
+# This branch is the proposal system and carries no other allocation path,
+# so the mode is a constant rather than a switch: reading it from the
+# environment would let a typo silently deploy an arm that is not here.
+COMPUTE_ALLOCATION_MODE = 'warm_buffer'
 COMPUTE_POD_IMAGE = _env_first(
     ('COMPUTE_POD_IMAGE',),
     'harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:latest',
@@ -248,14 +251,6 @@ COMPUTE_AGENT_MOUNT_TIMEOUT_SECONDS = _env_float_any(
 COMPUTE_AGENT_UNMOUNT_TIMEOUT_SECONDS = _env_float_any(
     ('COMPUTE_AGENT_UNMOUNT_TIMEOUT_SECONDS',),
     COMPUTE_AGENT_TIMEOUT_SECONDS,
-)
-COLD_START_POD_READY_TIMEOUT_SECONDS = _env_float_any(
-    ('COLD_START_POD_READY_TIMEOUT_SECONDS',),
-    300.0,
-)
-COLD_START_POD_READY_POLL_SECONDS = _env_float_any(
-    ('COLD_START_POD_READY_POLL_SECONDS',),
-    1.0,
 )
 
 LANGUAGE_CODE = 'ko-kr'

@@ -46,6 +46,10 @@ spec:
         env:
         - name: REDIS_URL
           value: redis://controller-queue-redis:6379/0
+        # The controller no longer reads this: the branch carries one
+        # allocation path and pins the mode in settings. It stays because the
+        # evaluation harness reads it off this Deployment to label which arm a
+        # run measured, and a run with the wrong label is worse than no run.
         - name: COMPUTE_ALLOCATION_MODE
           value: warm_buffer
         resources:
