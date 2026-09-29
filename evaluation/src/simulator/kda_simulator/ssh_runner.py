@@ -102,7 +102,7 @@ class _TimedOutput:
     def add_line(self, line: str) -> None:
         elapsed_ms = (time.monotonic() - self._started) * 1000.0
         self._lines.append(line)
-        text = strip_ansi(line).strip()
+        text = visible_text(line)
         for name, pattern in MILESTONES:
             if name not in self.seen_ms and pattern.search(text):
                 self.seen_ms[name] = elapsed_ms
@@ -110,6 +110,24 @@ class _TimedOutput:
 
 def strip_ansi(value: str) -> str:
     return ANSI_RE.sub("", value)
+
+def visible_text(line: str) -> str:
+    """What a terminal would actually show for this line.
+
+    swlabssh prints a spinner while it builds a user pod, and it prints no
+    newline, so the first real line of output arrives with the spinner still
+    on the front: backspaces, then a carriage return, then the text. The
+    marker patterns are anchored to the line start and have to stay that way,
+    because `run` echoes the whole command back, markers included. Dropping
+    the backspaces and keeping only what follows the last carriage return
+    leaves the text the spinner overwrote itself with, which is what the
+    anchor should be tested against.
+    """
+    text = strip_ansi(line).replace("\x08", "")
+    # The trailing newline goes first: otherwise the last carriage-return
+    # segment is just that newline and the line looks empty.
+    text = text.rstrip("\r\n")
+    return text.split("\r")[-1].strip()
 
 
 def parse_run_output(stdout: str, stderr: str) -> dict[str, str | None]:
