@@ -127,7 +127,28 @@ async def stop_background_activity(config: SimulatorConfig, sessions: Any) -> No
         return
 
     print("Stopping background activity...")
-    results = await _run_for_users(config, sessions, build_stop_command(), return_exceptions=True)
+    # A culled user has no pod and no process. Sending the stop command would
+    # reconnect, which makes swlabssh build the pod again just to stop something
+    # that is not running - and leaves a burst of pod creations in the records
+    # right after the experiment ended.
+    remaining = [
+        username
+        for username in config.user_names()
+        if not getattr(sessions.get(username), "culled", False)
+    ]
+    culled = config.users.count - len(remaining)
+    if culled:
+        print(f"  skipping {culled} culled users: their pod and process are gone")
+    if not remaining:
+        print("Background activity stopped")
+        return
+    results = await _run_for_users(
+        config,
+        sessions,
+        build_stop_command(),
+        usernames=remaining,
+        return_exceptions=True,
+    )
     failed = []
     for username, result in results:
         if isinstance(result, BaseException):

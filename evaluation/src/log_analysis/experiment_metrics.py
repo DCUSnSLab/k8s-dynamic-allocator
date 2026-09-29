@@ -225,6 +225,17 @@ def request_metrics(
         "output_lost": incomplete_output_lost + statuses.get("output_lost", 0),
         "incomplete_unclassified": incomplete_unclassified,
         "start_delay_s": summarize_values([r["since_send_to_start_ms"] / 1000.0 for r in success if r.get("since_send_to_start_ms") is not None]),
+        # idle-baseline only. A resume happens before the command is sent, so it
+        # is invisible to start_delay_s; count is how many requests paid one.
+        "resumed": sum(1 for r in requests if r.get("resumed_from_cull")),
+        "resume_s": summarize_values([r["resume_latency_ms"] / 1000.0 for r in requests if isinstance(r.get("resume_latency_ms"), (int, float))]),
+        # The whole wait before the command starts, resume included. This is the
+        # figure to compare across arms: for every arm but idle-baseline it is
+        # just start_delay_s.
+        "user_wait_s": summarize_values([
+            (r["since_send_to_start_ms"] + (r.get("resume_latency_ms") or 0.0)) / 1000.0
+            for r in success if r.get("since_send_to_start_ms") is not None
+        ]),
         "command_s": summarize_values([r["command_duration_ms"] / 1000.0 for r in success if r.get("command_duration_ms") is not None]),
         "ssh_retried": sum(1 for r in requests if (r.get("ssh_attempts") or 1) > 1),
     }
@@ -372,6 +383,11 @@ def print_report(metrics: dict[str, Any]) -> None:
         line += f"  unclassified={req['incomplete_unclassified']}"
     print(line)
     print(f"start delay s  {_fmt(req['start_delay_s'])}")
+    # Only idle-baseline culls, so this stays quiet for every other arm.
+    if req.get("resumed"):
+        share = 100.0 * req["resumed"] / req["count"] if req["count"] else 0.0
+        print(f"resumed from cull  {req['resumed']} ({share:.1f}%)  {_fmt(req['resume_s'])}")
+        print(f"user wait s  {_fmt(req['user_wait_s'])}")
     if "controller" in overall:
         ctl = overall["controller"]
         ratio = ctl["compute_wait_ratio"]
