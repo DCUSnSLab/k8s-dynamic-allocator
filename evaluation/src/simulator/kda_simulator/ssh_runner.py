@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import AsyncIterator
 
 import asyncssh
 
@@ -36,6 +38,14 @@ MILESTONES = (
     ("end", END_RE),
 )
 SSH_RUN_ATTEMPTS = 2
+# Authenticating does not build a user pod. swlabssh creates it when a shell
+# is requested, so a resume is only over once a command has run, and this is
+# the cheapest one that forces it.
+RESUME_PROBE_COMMAND = "pwd"
+# Measured at 6-9s on an idle cluster. The cluster is shared and pod readiness
+# has been seen to vary by nearly an order of magnitude, so this is generous:
+# a slow resume is a number worth having, a timed-out one is a lost request.
+RESUME_TIMEOUT_SECONDS = 300.0
 SSH_RETRY_MAX_ELAPSED_SECONDS = 3.0
 TRANSIENT_SSH_ERRORS = (
     "SSH connection closed",
@@ -70,6 +80,25 @@ class CommandResult:
     ssh_attempts: int = 1
     # Time lost on attempts that failed before the last one started.
     ssh_retry_delay_ms: float = 0.0
+
+
+@dataclass
+class ResumeTiming:
+    """What it cost to bring a culled user's pod back.
+
+    resume_latency_ms is the part a real user would feel: the SSH connect
+    that made swlabssh recreate the pod. background_restore_ms is the
+    simulator putting its own idle-load process back, which a user would
+    never wait for, so the two are kept apart rather than summed into the
+    request.
+    """
+
+    resume_latency_ms: float
+    background_restore_ms: float | None = None
+    # True when another request for this user was already bringing the pod back
+    # and this one only waited for it. The wait was real; the work was not ours.
+    waited_for_peer: bool = False
+    error: str | None = None
 
 
 class _CommandTimeout(Exception):
@@ -111,6 +140,7 @@ class _TimedOutput:
 def strip_ansi(value: str) -> str:
     return ANSI_RE.sub("", value)
 
+
 def visible_text(line: str) -> str:
     """What a terminal would actually show for this line.
 
@@ -147,7 +177,16 @@ class SSHUserSession:
         self.username = username
         self._connection: asyncssh.SSHClientConnection | None = None
         self._connect_lock = asyncio.Lock()
-        self._run_lock = asyncio.Semaphore(config.users.max_concurrent_requests)
+        self._max_concurrent = config.users.max_concurrent_requests
+        self._run_lock = asyncio.Semaphore(self._max_concurrent)
+        # Last time this user did anything at all. Set now rather than at the
+        # first request so a user who is never scheduled still ages out.
+        self._idle_since = time.monotonic()
+        self._culled = False
+        # One resume per user at a time. Without this, concurrent requests each
+        # wait for the pod to go and then race to recreate it, and the losers
+        # wait out the full timeout against a pod the winner just created.
+        self._resume_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         if self._connection is not None and self._connection_is_closed():
@@ -174,6 +213,10 @@ class SSHUserSession:
         return await self.run_remote("pwd", timeout=SETUP_COMMAND_TIMEOUT_SECONDS)
 
     async def run_remote(self, remote_command: str, timeout: float) -> CommandResult:
+        # Marked on arrival, not just on completion: a request queued behind
+        # another one has already made this user active, and the culler must not
+        # delete the pod out from under it.
+        self._idle_since = time.monotonic()
         lock_wait_started = time.monotonic()
         async with self._run_lock:
             user_concurrency_delay_ms = (time.monotonic() - lock_wait_started) * 1000.0
@@ -193,6 +236,7 @@ class SSHUserSession:
                 error = str(exc)
 
             parsed = parse_run_output(output.stdout, output.stderr)
+            self._idle_since = time.monotonic()
             return CommandResult(
                 exit_status=exit_status,
                 stdout=output.stdout,
@@ -275,6 +319,127 @@ class SSHUserSession:
         finally:
             process.close()
 
+    @property
+    def culled(self) -> bool:
+        return self._culled
+
+    def mark_culled(self) -> None:
+        self._culled = True
+
+    def unmark_culled(self) -> None:
+        """Undo mark_culled when the delete it was set for did not happen."""
+        self._culled = False
+
+    def idle_seconds(self) -> float:
+        return time.monotonic() - self._idle_since
+
+    @asynccontextmanager
+    async def offline(self, slot_timeout: float) -> AsyncIterator[None]:
+        """Hold every request slot for this user and drop the connection.
+
+        Raises asyncio.TimeoutError when the slots do not come free in time,
+        which means a command is in flight and the user is not idle after
+        all.
+        """
+        acquired = 0
+        try:
+            for _ in range(self._max_concurrent):
+                await asyncio.wait_for(self._run_lock.acquire(), slot_timeout)
+                acquired += 1
+            # The pod is about to go. Leaving the connection open would have
+            # the next request try to use a tunnel into a pod that no longer
+            # exists and take the retry path instead of a clean reconnect.
+            await self.close()
+            yield
+        finally:
+            for _ in range(acquired):
+                self._run_lock.release()
+
+    async def resume_if_culled(
+        self,
+        restore_command: str | None = None,
+    ) -> ResumeTiming | None:
+        """Bring a culled user's pod back before their next command is sent.
+
+        Returns None when this user was not culled. This sits outside
+        run_remote on purpose: the pod recreation and the background-load
+        restart would otherwise land inside the measured command.
+        """
+        if not self._culled:
+            return None
+        # Resuming is activity, so the culler leaves this user alone now.
+        self._idle_since = time.monotonic()
+        started = time.monotonic()
+        async with self._resume_lock:
+            if not self._culled:
+                # Another request for this user got here first and the pod is
+                # back. Nothing to do, but the time spent waiting for it is this
+                # request's to report.
+                self._idle_since = time.monotonic()
+                return ResumeTiming(
+                    resume_latency_ms=(time.monotonic() - started) * 1000.0,
+                    waited_for_peer=True,
+                )
+            # A request slot as well, so this cannot run while the culler holds
+            # them all to delete the pod. offline() never takes the resume lock,
+            # so taking them in this order cannot deadlock.
+            async with self._run_lock:
+                return await self._resume(started, restore_command)
+
+    async def _resume(
+        self,
+        started: float,
+        restore_command: str | None,
+    ) -> ResumeTiming:
+        try:
+            # No check that the old pod has gone. If it has, kubessh builds a new
+            # one; if it has not, the attach fails and run_remote's retry
+            # reconnects. Both happen in a real deployment when a user comes back
+            # exactly as their pod is being reclaimed.
+            await self.connect()
+            # The pod does not exist yet: authentication alone did not ask for a
+            # shell. This probe is what makes swlabssh build it, so it is part of
+            # the resume rather than something to leave in the next command.
+            await self._run_unlocked(RESUME_PROBE_COMMAND, RESUME_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001 - reported on the request
+            self._connection = None
+            return ResumeTiming(
+                resume_latency_ms=(time.monotonic() - started) * 1000.0,
+                error=str(exc),
+            )
+        resume_latency_ms = (time.monotonic() - started) * 1000.0
+        self._culled = False
+
+        error: str | None = None
+        restore_ms: float | None = None
+        if restore_command is not None:
+            restore_started = time.monotonic()
+            try:
+                await self._run_unlocked(
+                    restore_command,
+                    SETUP_COMMAND_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:  # noqa: BLE001 - the request can still run
+                error = f"background restore failed: {exc}"
+            restore_ms = (time.monotonic() - restore_started) * 1000.0
+        self._idle_since = time.monotonic()
+        # Keyword arguments on purpose: the field order here has changed once
+        # already, and a positional call silently put a duration into a bool.
+        return ResumeTiming(
+            resume_latency_ms=resume_latency_ms,
+            background_restore_ms=restore_ms,
+            error=error,
+        )
+
+    async def _run_unlocked(self, remote_command: str, timeout: float) -> None:
+        """Run a command without taking a request slot.
+
+        Only resume_if_culled uses this. It runs before its caller asks for a
+        slot, so taking one here would deadlock a user limited to one.
+        """
+        output = _TimedOutput(time.monotonic())
+        await asyncio.wait_for(self._stream(remote_command, output), timeout)
+
     async def close(self) -> None:
         if self._connection is None:
             return
@@ -299,6 +464,9 @@ class SSHSessionPool:
 
     def get(self, username: str) -> SSHUserSession:
         return self._sessions[username]
+
+    def all(self) -> list[SSHUserSession]:
+        return list(self._sessions.values())
 
     async def close(self) -> None:
         await asyncio.gather(*(session.close() for session in self._sessions.values()), return_exceptions=True)
