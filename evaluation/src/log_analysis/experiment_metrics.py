@@ -234,6 +234,11 @@ def request_metrics(
         ]),
         "command_s": summarize_values([r["command_duration_ms"] / 1000.0 for r in success if r.get("command_duration_ms") is not None]),
         "ssh_retried": sum(1 for r in requests if (r.get("ssh_attempts") or 1) > 1),
+        # Requests that needed another attempt because one left nothing to
+        # measure - the user came back as their pod was being reclaimed. Not a
+        # failure, but it says how often the threshold and the arrivals collide.
+        "rerun": sum(1 for r in requests if r.get("reruns")),
+        "rerun_attempts": sum(int(r.get("reruns") or 0) for r in requests),
     }
 
 
@@ -379,6 +384,12 @@ def print_report(metrics: dict[str, Any]) -> None:
         line += f"  unclassified={req['incomplete_unclassified']}"
     print(line)
     print(f"start delay s  {_fmt(req['start_delay_s'])}")
+    if req.get("rerun"):
+        share = 100.0 * req["rerun"] / req["count"] if req["count"] else 0.0
+        print(
+            f"re-run for want of a measurement  {req['rerun']} ({share:.1f}%)"
+            f"  attempts {req['rerun_attempts']}"
+        )
     # Only idle-baseline culls, so this stays quiet for every other arm.
     if req.get("resumed"):
         share = 100.0 * req["resumed"] / req["count"] if req["count"] else 0.0

@@ -11,6 +11,7 @@ import asyncssh
 
 from .config import (
     CONNECT_TIMEOUT_SECONDS,
+    EXECUTION_MODE_BASELINE_DIRECT,
     MARKER_PREFIX,
     PTY_HEIGHT,
     PTY_TERM_TYPE,
@@ -38,6 +39,19 @@ MILESTONES = (
     ("end", END_RE),
 )
 SSH_RUN_ATTEMPTS = 2
+# Ways a request has been seen to end with nothing to measure, all of them from a
+# user pod being reclaimed as its owner came back:
+#   exit 137                  container killed at the end of its grace period
+#   "container not found"     container gone, pod object not yet
+#   "current phase is Failed" pod reached Failed between the read and the exec
+#   exit 0 with one byte      the relay lost the output entirely
+# The retry does not match on these. It matches on the outcome - no end marker,
+# so nothing to measure - because the list was never complete.
+RERUN_MAX_ATTEMPTS = 5
+# The pod takes about three seconds to disappear after its container is killed,
+# so a pause before reconnecting is what makes the next attempt land on a fresh
+# pod rather than the one still going away.
+RERUN_DELAY_SECONDS = 2.0
 # Authenticating does not build a user pod. swlabssh creates it when a shell
 # is requested, so a resume is only over once a command has run, and this is
 # the cheapest one that forces it.
@@ -80,6 +94,9 @@ class CommandResult:
     ssh_attempts: int = 1
     # Time lost on attempts that failed before the last one started.
     ssh_retry_delay_ms: float = 0.0
+    # Extra attempts spent because an attempt ended with no end marker, so with
+    # nothing to measure. 0 for a request that worked first time.
+    reruns: int = 0
 
 
 @dataclass
@@ -111,6 +128,9 @@ class _TimedOutput:
     def __init__(self, started: float) -> None:
         self._started = started
         self._lines: list[str] = []
+        # Output from attempts that were discarded, kept so a run that needed
+        # several tries can still show what happened on the earlier ones.
+        self._failed_output: list[str] = []
         self.stderr = ""
         self.seen_ms: dict[str, float] = {}
         # Set once the server accepted the command; a failure before that is safe to resend.
@@ -119,6 +139,14 @@ class _TimedOutput:
     def restart(self, started: float) -> None:
         self._started = started
         self.channel_opened = False
+        # CommandResult documents the milestone times as "counted from the last
+        # attempt", and that only holds if the previous attempt's marks go.
+        self.seen_ms.clear()
+        # The lines go too, now that a retry can be triggered by text in them: a
+        # leftover "container not found" from an earlier attempt would make every
+        # later attempt look like it had failed the same way.
+        self._failed_output.append("".join(self._lines))
+        self._lines.clear()
 
     @property
     def received(self) -> bool:
@@ -127,6 +155,10 @@ class _TimedOutput:
     @property
     def stdout(self) -> str:
         return "".join(self._lines)
+
+    @property
+    def discarded_stdout(self) -> str:
+        return "".join(self._failed_output)
 
     def add_line(self, line: str) -> None:
         elapsed_ms = (time.monotonic() - self._started) * 1000.0
@@ -178,11 +210,18 @@ class SSHUserSession:
         self._connection: asyncssh.SSHClientConnection | None = None
         self._connect_lock = asyncio.Lock()
         self._max_concurrent = config.users.max_concurrent_requests
+        # Re-running is only safe where the command is a process in the user's own
+        # pod. In kda mode it would submit a second ticket for work that may have
+        # completed with only its output lost, so that case is reported instead.
+        self._rerun_when_unmeasured = (
+            config.execution.mode == EXECUTION_MODE_BASELINE_DIRECT
+        )
         self._run_lock = asyncio.Semaphore(self._max_concurrent)
         # Last time this user did anything at all. Set now rather than at the
         # first request so a user who is never scheduled still ages out.
         self._idle_since = time.monotonic()
         self._culled = False
+        self.reruns = 0
         # One resume per user at a time. Without this, concurrent requests each
         # wait for the pod to go and then race to recreate it, and the losers
         # wait out the full timeout against a pod the winner just created.
@@ -217,6 +256,7 @@ class SSHUserSession:
         # another one has already made this user active, and the culler must not
         # delete the pod out from under it.
         self._idle_since = time.monotonic()
+        self.reruns = 0
         lock_wait_started = time.monotonic()
         async with self._run_lock:
             user_concurrency_delay_ms = (time.monotonic() - lock_wait_started) * 1000.0
@@ -255,6 +295,7 @@ class SSHUserSession:
                 command_delivered=output.channel_opened or output.received,
                 ssh_attempts=len(attempts),
                 ssh_retry_delay_ms=(attempts[-1] - started) * 1000.0,
+                reruns=self.reruns,
             )
 
     async def _run_with_retry(
@@ -265,8 +306,15 @@ class SSHUserSession:
         attempts: list[float],
     ) -> int | None:
         last_error: str | None = None
-        for attempt in range(1, SSH_RUN_ATTEMPTS + 1):
+        # The upper bound is the reclaim path's; the ordinary transient-error
+        # retry below still stops at SSH_RUN_ATTEMPTS.
+        for attempt in range(1, RERUN_MAX_ATTEMPTS + 1):
             if attempt > 1:
+                if self.reruns:
+                    # Give the pod a moment to finish going. Retrying with no
+                    # pause is what made the first version of this fail: the
+                    # container was already gone but the pod was not.
+                    await asyncio.sleep(RERUN_DELAY_SECONDS)
                 attempts.append(time.monotonic())
                 output.restart(attempts[-1])
             try:
@@ -274,9 +322,18 @@ class SSHUserSession:
                 if self._connection is None:
                     raise RuntimeError("SSH connection was not established")
                 try:
-                    return await asyncio.wait_for(self._stream(remote_command, output), timeout)
+                    exit_status = await asyncio.wait_for(
+                        self._stream(remote_command, output), timeout
+                    )
                 except asyncio.TimeoutError as exc:
                     raise _CommandTimeout() from exc
+                if self._needs_rerun(output, attempt):
+                    # Drop the connection so the next attempt reconnects, and let
+                    # kubessh build a fresh pod once the old one has gone.
+                    self._connection = None
+                    self.reruns += 1
+                    continue
+                return exit_status
             except _CommandTimeout:
                 raise
             except Exception as exc:
@@ -295,9 +352,35 @@ class SSHUserSession:
                         or (time.monotonic() - attempts[-1]) <= SSH_RETRY_MAX_ELAPSED_SECONDS
                     )
                 )
+                # An exception is not a different situation from a clean return
+                # that left nothing to measure: either way there is no
+                # measurement, and on this arm another attempt allocates nothing.
+                # Without this the two paths disagree on how many attempts are
+                # allowed - a request that used one attempt on a re-run and then
+                # lost its connection had no attempts left, and was reported as
+                # an error with nothing measured.
+                if not can_retry and _is_transient_ssh_error(exc):
+                    if self._needs_rerun(output, attempt):
+                        self.reruns += 1
+                        continue
                 if not can_retry:
                     raise
         raise RuntimeError(last_error or "SSH command failed")
+
+    def _needs_rerun(self, output: _TimedOutput, attempt: int) -> bool:
+        """Is there nothing to measure from this attempt?
+
+        The wrapper prints the end marker even when the command exits non-zero,
+        so a missing marker means the session broke, not that the command failed.
+        Whatever broke it, the command did not finish and there is no measurement,
+        which on a run compared arm-for-arm on one trace is worse than a slow
+        request: the other arms have a number for this slot and this one does not.
+        """
+        return (
+            self._rerun_when_unmeasured
+            and attempt < RERUN_MAX_ATTEMPTS
+            and "end" not in output.seen_ms
+        )
 
     async def _stream(self, remote_command: str, output: _TimedOutput) -> int | None:
         process = await self._connection.create_process(
