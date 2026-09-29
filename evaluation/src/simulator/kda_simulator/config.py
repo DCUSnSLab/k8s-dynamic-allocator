@@ -71,6 +71,11 @@ COMMAND_TIMEOUT_SECONDS = 86400.0
 # Setup commands never queue, so they keep a short limit.
 SETUP_COMMAND_TIMEOUT_SECONDS = 120.0
 WRITER_QUEUE_SIZE = 10000
+# idle-baseline: how long a user goes without a request before their pod is
+# deleted, and how often that is checked. The sweep interval only bounds how
+# late a cull can be, so it stays well under the threshold.
+IDLE_CULLING_IDLE_MINUTES = 30.0
+IDLE_CULLING_POLL_SECONDS = 15.0
 PTY_TERM_TYPE = "xterm"
 PTY_WIDTH = 120
 PTY_HEIGHT = 40
@@ -150,6 +155,23 @@ class ExecutionConfig:
 
 
 @dataclass
+class IdleCullingConfig:
+    """The idle-baseline arm: delete a user pod that has gone quiet.
+
+    restore_background_activity decides what happens to the simulator's own
+    idle-load process, which dies with the pod. Restoring it keeps the arm
+    comparable with baseline, where that load never stops - the two arms then
+    differ only in whether an idle pod exists. Turning it off models the
+    other reading, that a culled user's long-running work is simply lost.
+    """
+
+    enabled: bool = False
+    idle_minutes: float = IDLE_CULLING_IDLE_MINUTES
+    poll_seconds: float = IDLE_CULLING_POLL_SECONDS
+    restore_background_activity: bool = True
+
+
+@dataclass
 class OutputConfig:
     dir: str
     command_output_chars: int
@@ -165,6 +187,7 @@ class SimulatorConfig:
     background_activity: BackgroundActivityConfig
     setup: SetupConfig
     execution: ExecutionConfig
+    idle_culling: IdleCullingConfig
     output: OutputConfig
 
     def user_names(self) -> list[str]:
@@ -202,6 +225,7 @@ def load_config(path: str | Path) -> SimulatorConfig:
             "background_activity",
             "setup",
             "execution",
+            "idle_culling",
             "output",
         },
     )
@@ -217,6 +241,7 @@ def load_config(path: str | Path) -> SimulatorConfig:
         ),
         setup=_load_setup(_optional_section(data, "setup")),
         execution=_load_execution(_optional_section(data, "execution")),
+        idle_culling=_load_idle_culling(_optional_section(data, "idle_culling")),
         output=_load_output(_required_section(data, "output")),
     )
     validate_config(config)
@@ -358,6 +383,30 @@ def _load_execution(data: dict[str, Any]) -> ExecutionConfig:
     return ExecutionConfig(mode=str(data.get("mode") or EXECUTION_MODE_KDA))
 
 
+def _load_idle_culling(data: dict[str, Any]) -> IdleCullingConfig:
+    _ensure_allowed(
+        "idle_culling",
+        data,
+        {"enabled", "idle_minutes", "poll_seconds", "restore_background_activity"},
+    )
+    return IdleCullingConfig(
+        enabled=_optional_bool(data.get("enabled"), "idle_culling.enabled", False),
+        idle_minutes=_optional_float(
+            data.get("idle_minutes"), "idle_culling.idle_minutes"
+        )
+        or IDLE_CULLING_IDLE_MINUTES,
+        poll_seconds=_optional_float(
+            data.get("poll_seconds"), "idle_culling.poll_seconds"
+        )
+        or IDLE_CULLING_POLL_SECONDS,
+        restore_background_activity=_optional_bool(
+            data.get("restore_background_activity"),
+            "idle_culling.restore_background_activity",
+            True,
+        ),
+    )
+
+
 def _load_output(data: dict[str, Any]) -> OutputConfig:
     _ensure_allowed("output", data, {"dir", "command_output_chars"})
     return OutputConfig(
@@ -459,6 +508,24 @@ def validate_config(config: SimulatorConfig) -> None:
     if config.execution.mode not in EXECUTION_MODES:
         choices = ", ".join(sorted(EXECUTION_MODES))
         raise ValueError(f"execution.mode must be one of: {choices}")
+    if config.idle_culling.enabled:
+        if config.idle_culling.idle_minutes <= 0:
+            raise ValueError("idle_culling.idle_minutes must be positive")
+        if config.idle_culling.poll_seconds <= 0:
+            raise ValueError("idle_culling.poll_seconds must be positive")
+        if config.idle_culling.poll_seconds > config.idle_culling.idle_minutes * 60.0:
+            raise ValueError(
+                "idle_culling.poll_seconds must not exceed idle_minutes, "
+                "or a pod could outlive the threshold by a whole sweep"
+            )
+        # The pod name is built as ssh-{username}; kubessh escapes anything
+        # outside lowercase letters and digits, and an escaped name would not
+        # match what the culler asks kubectl to delete.
+        if not config.users.prefix.isalnum() or not config.users.prefix.islower():
+            raise ValueError(
+                "users.prefix must be lowercase letters and digits when "
+                "idle_culling is enabled, so the user pod name is predictable"
+            )
 
 
 def _mapping(value: Any, section: str) -> dict[str, Any]:

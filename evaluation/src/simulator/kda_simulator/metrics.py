@@ -49,6 +49,10 @@ class SummaryCollector:
     since_send_to_assigned_ms: list[float] = field(default_factory=list)
     since_send_to_start_ms: list[float] = field(default_factory=list)
     command_duration_ms: list[float] = field(default_factory=list)
+    # Only the requests that had to wait for a culled pod land here, so
+    # the count doubles as how many resumes the run actually measured.
+    resume_latency_ms: list[float] = field(default_factory=list)
+    background_restore_ms: list[float] = field(default_factory=list)
     ticket_missing: int = 0
     allocation_missing: int = 0
     ssh_retried: int = 0
@@ -71,6 +75,8 @@ class SummaryCollector:
             (self.since_send_to_assigned_ms, "since_send_to_assigned_ms"),
             (self.since_send_to_start_ms, "since_send_to_start_ms"),
             (self.command_duration_ms, "command_duration_ms"),
+            (self.resume_latency_ms, "resume_latency_ms"),
+            (self.background_restore_ms, "background_restore_ms"),
         ):
             value = record.get(key)
             if isinstance(value, (int, float)) and math.isfinite(value):
@@ -102,6 +108,8 @@ class SummaryCollector:
             "since_send_to_assigned_ms": summarize_values(self.since_send_to_assigned_ms),
             "since_send_to_start_ms": summarize_values(self.since_send_to_start_ms),
             "command_duration_ms": summarize_values(self.command_duration_ms),
+            "resume_latency_ms": summarize_values(self.resume_latency_ms),
+            "background_restore_ms": summarize_values(self.background_restore_ms),
             "ticket_missing": self.ticket_missing,
             "allocation_missing": self.allocation_missing,
             "ssh_retried": self.ssh_retried,

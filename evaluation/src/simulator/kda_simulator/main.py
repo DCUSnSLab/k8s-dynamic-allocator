@@ -208,6 +208,13 @@ def print_dry_run(
     print(f"experiment_name={config.experiment.name}")
     print(f"execution_mode={config.execution.mode}")
     print(f"background_activity={config.background_activity.enabled}")
+    print(f"idle_culling={config.idle_culling.enabled}")
+    if config.idle_culling.enabled:
+        print(
+            f"idle_culling_config=idle_minutes:{config.idle_culling.idle_minutes},"
+            f"poll_seconds:{config.idle_culling.poll_seconds},"
+            f"restore_background_activity:{config.idle_culling.restore_background_activity}"
+        )
     if config.background_activity.enabled:
         print(
             "background_activity_config="
@@ -254,6 +261,7 @@ async def run_simulation(
     trace_file: str | None = None,
     server_settings: dict[str, Any] | None = None,
 ) -> None:
+    from .idle_culling import IdleCuller
     from .pod_watch import PodRecorder
     from .ssh_runner import SSHSessionPool, strip_ansi
 
@@ -265,10 +273,23 @@ async def run_simulation(
     output_dir: Path | None = None
     writer: AsyncJsonlWriter | None = None
     pod_recorder: PodRecorder | None = None
+    culler: IdleCuller | None = None
     setup_started_wall = now_iso()
     setup_completed_wall: str | None = None
     experiment_started_wall: str | None = None
     experiment_finished_wall: str | None = None
+
+    if config.idle_culling.enabled:
+        print(
+            "Idle culling on: a user pod is deleted after "
+            f"{config.idle_culling.idle_minutes} minutes without a request"
+        )
+        duration = config.workload.duration_minutes
+        if duration is not None and config.idle_culling.idle_minutes >= duration:
+            print(
+                "  warning: the threshold is not shorter than the run "
+                f"({duration} minutes), so nothing will be culled"
+            )
 
     if config.workload.duration_minutes is None and config.workload.max_requests is None:
         print("Running until Ctrl+C")
@@ -304,6 +325,22 @@ async def run_simulation(
         pod_recorder = PodRecorder(output_dir / "pods.jsonl")
         await pod_recorder.start()
 
+        # The idle load lives inside the pod, so culling kills it. Restoring
+        # it on resume keeps this arm comparable with baseline, where it runs
+        # for the whole experiment.
+        resume_restore_command: str | None = None
+        if (
+            config.idle_culling.enabled
+            and config.idle_culling.restore_background_activity
+            and config.background_activity.enabled
+        ):
+            from .background import build_start_command
+
+            resume_restore_command = build_start_command(config)
+        if config.idle_culling.enabled:
+            culler = IdleCuller(config, sessions, output_dir / "culls.jsonl")
+            await culler.start()
+
         started_mono = time.monotonic()
         experiment_started_wall = now_iso()
         print(f"Output: {output_dir}")
@@ -327,6 +364,7 @@ async def run_simulation(
                         experiment_started_mono=started_mono,
                         plan=plan,
                         strip_output=strip_ansi,
+                        resume_restore_command=resume_restore_command,
                     )
                 )
             )
@@ -351,7 +389,9 @@ async def run_simulation(
 
         # Each step runs even if an earlier one failed, so a long run always
         # leaves its records behind.
-        steps = [("pod recording", pod_recorder.stop)] if pod_recorder is not None else []
+        steps = [("idle culling", culler.stop)] if culler is not None else []
+        if pod_recorder is not None:
+            steps.append(("pod recording", pod_recorder.stop))
         if background_attempted:
             steps.append(("background activity", stop_background))
         steps.append(("SSH sessions", sessions.close))
@@ -390,6 +430,10 @@ async def run_simulation(
         },
         "execution": config.execution.__dict__,
         "background_activity": config.background_activity.__dict__,
+        "idle_culling": {
+            **config.idle_culling.__dict__,
+            "observed": culler.to_dict() if culler is not None else None,
+        },
         "summary": summary.to_dict(),
         "stopped_by_interrupt": stopped_by_interrupt,
     }
@@ -448,6 +492,7 @@ async def execute_request(
     experiment_started_mono: float,
     plan: dict[str, Any],
     strip_output: Any,
+    resume_restore_command: str | None = None,
 ) -> None:
     command: SelectedCommand = plan["command"]
     scheduled_mono = experiment_started_mono + float(plan["planned_offset_seconds"])
@@ -455,15 +500,24 @@ async def execute_request(
     schedule_delay_ms = max(0.0, (task_created_mono - scheduled_mono) * 1000.0)
     queue_started_mono = task_created_mono
 
+    session = sessions.get(plan["username"])
     async with global_sem:
         acquired_mono = time.monotonic()
         client_send_delay_ms = (acquired_mono - queue_started_mono) * 1000.0
+        # Stamped before the resume so the record covers the whole wait, not
+        # just the part after the pod came back.
         started_at = now_iso()
-        result = await sessions.get(plan["username"]).run_remote(
+        resume = await session.resume_if_culled(resume_restore_command)
+        result = await session.run_remote(
             command.remote_command,
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
         finished_at = now_iso()
+
+    resume_latency_ms = resume.resume_latency_ms if resume is not None else None
+    background_restore_ms = resume.background_restore_ms if resume is not None else None
+    resume_error = resume.error if resume is not None else None
+    resume_waited_for_peer = resume.waited_for_peer if resume is not None else False
 
     status = classify_result(result)
     record = {
@@ -482,7 +536,16 @@ async def execute_request(
         "execution_mode": config.execution.mode,
         "status": status,
         "exit_status": result.exit_status,
-        "request_duration_ms": result.elapsed_ms,
+        # Includes the resume: the user waited for it. resume_latency_ms is
+        # reported below so the command's own time can be recovered.
+        "request_duration_ms": result.elapsed_ms + (resume_latency_ms or 0.0),
+        "resume_latency_ms": resume_latency_ms,
+        "background_restore_ms": background_restore_ms,
+        # This request waited for another request on the same user to finish
+        # bringing the pod back, rather than doing it itself.
+        "resume_waited_for_peer": resume_waited_for_peer,
+        "resumed_from_cull": resume is not None,
+        "resume_error": resume_error,
         "since_send_to_ticket_ms": result.since_send_to_ticket_ms,
         "since_send_to_assigned_ms": result.since_send_to_assigned_ms,
         "since_send_to_start_ms": result.since_send_to_start_ms,
