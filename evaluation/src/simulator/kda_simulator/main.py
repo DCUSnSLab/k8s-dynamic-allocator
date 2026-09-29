@@ -563,6 +563,9 @@ async def execute_request(
         "command_delivered": result.command_delivered,
         "ssh_attempts": result.ssh_attempts,
         "ssh_retry_delay_ms": result.ssh_retry_delay_ms,
+        # Extra attempts spent because an attempt left nothing to measure. Counts
+        # how often a user came back exactly as their pod was being reclaimed.
+        "reruns": result.reruns,
     }
     add_output_tails(config, record, result, strip_output)
     summary.add(record)
