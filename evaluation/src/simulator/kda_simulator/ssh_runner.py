@@ -363,11 +363,11 @@ class SSHUserSession:
                     spent.reruns += 1
                     spent.discarded_exit_status = exit_status
                     continue
-                if ("end" not in output.seen_ms and "start" in output.seen_ms
-                        and exit_status is not None
-                        and exit_status != KILLED_EXIT_STATUS):
-                    # The shell started, ran, and returned a status of its own, so
-                    # it reached the end marker; the marker was lost on the way.
+                if "end" not in output.seen_ms and self._shell_finished(output, exit_status):
+                    # The shell reached its last line, so the end marker was
+                    # printed and lost on the way back. The same predicate the
+                    # re-run decision uses, so the two cannot disagree and charge
+                    # the server for work it finished.
                     spent.output_lost = True
                 return exit_status
             except _CommandTimeout:
@@ -405,6 +405,39 @@ class SSHUserSession:
                     raise
         raise RuntimeError(last_error or "SSH command failed")
 
+    def _shell_finished(self, output: _TimedOutput, exit_status: int | None) -> bool:
+        """Did the remote shell reach its last line, whatever came back as output?
+
+        The wrapper is `echo START; <command>; exit_code=$?; echo END ...;
+        exit $exit_code`, so the end marker is printed and only then does the
+        shell exit. An exit status therefore implies the marker was printed, and a
+        marker printed but not seen was lost on the way - with the command already
+        done. Exit status travels on the SSH channel rather than in the output
+        stream, so it arrives even when no output does.
+
+        The status value is the discriminator, not the start marker:
+
+          0             only the wrapper's own `exit $exit_code` produces it, and
+                        that line runs after the end marker. kubectl failing, the
+                        ticket failing, run failing are all non-zero.
+          137           SIGKILL, so the shell never reached its last line.
+          None          the channel died before a status arrived.
+          other, with a start marker    the shell ran and the command failed; the
+                        wrapper prints the end marker for that too.
+          other, no start marker        the exec itself failed - "container not
+                        found" returns 1 with nothing having run.
+
+        An earlier version asked for the start marker in every case. That was
+        right about the container-gone window and wrong in general: a request
+        whose output was lost from the very first byte has no start marker either,
+        and five of them in one cold-start run were read as unfinished.
+        """
+        if exit_status == 0:
+            return True
+        if exit_status is None or exit_status == KILLED_EXIT_STATUS:
+            return False
+        return "start" in output.seen_ms
+
     def _needs_rerun(
         self,
         output: _TimedOutput,
@@ -413,28 +446,14 @@ class SSHUserSession:
     ) -> bool:
         """Is there nothing to measure, and is running it again the way to get it?
 
-        The wrapper is `echo START; <command>; exit_code=$?; echo END ...;
-        exit $exit_code`, so the end marker is printed before the shell exits. An
-        exit status arriving therefore means the shell reached its last statement
-        and the marker was printed - and if it was printed and not seen, it was
-        lost on the way, with the command already finished. Running it again would
-        repeat sixty seconds of work that was already done, which is what happened
-        to eight requests before this check existed.
-
-        Exit status travels on the SSH channel rather than in the output stream,
-        so it arrives even when the output does not. That is what makes it usable
-        here.
+        Only when the shell did not finish. Re-running a command that completed
+        repeats its work and bills the run twice for one measurement.
         """
         if not self._rerun_when_unmeasured or attempt >= RERUN_MAX_ATTEMPTS:
             return False
         if "end" in output.seen_ms:
             return False
-        # The start marker is what proves the shell ran at all. Without it the
-        # exit status came from the exec failing - "container not found" returns
-        # 1 without the command ever starting - and there is nothing to preserve.
-        started = "start" in output.seen_ms
-        finished = started and exit_status is not None and exit_status != KILLED_EXIT_STATUS
-        return not finished
+        return not self._shell_finished(output, exit_status)
 
     async def _stream(self, remote_command: str, output: _TimedOutput) -> int | None:
         process = await self._connection.create_process(
