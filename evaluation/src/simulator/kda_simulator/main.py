@@ -10,7 +10,13 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Iterator
 
-from .cluster import ServerSettingsError, prepare_server
+from .cluster import (
+    ServerSettingsError,
+    describe_headroom,
+    prepare_server,
+    read_node_headroom,
+    require_headroom,
+)
 from .config import (
     CLIENT_MAX_INFLIGHT,
     COMMAND_TIMEOUT_SECONDS,
@@ -55,6 +61,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration-minutes", type=float, help="Override workload duration in minutes.")
     parser.add_argument("--max-requests", type=int, help="Override workload.max_requests.")
     parser.add_argument("--trace-file", help="Replay a pre-generated request trace CSV.")
+    parser.add_argument(
+        "--ignore-headroom",
+        action="store_true",
+        help="Start even when the cluster has no room for this run's pods.",
+    )
     parser.add_argument("--export-trace", help="Generate a request trace CSV and exit.")
     return parser.parse_args()
 
@@ -103,11 +114,18 @@ async def main() -> None:
         plans = iter_request_plans(config, iter_schedule(config, rng), selector)
 
     try:
-        server_settings = await asyncio.to_thread(prepare_server, config)
+        server_settings = await asyncio.to_thread(
+            prepare_server, config, args.ignore_headroom)
     except ServerSettingsError as exc:
         raise SystemExit(f"Server preparation failed: {exc}") from exc
 
-    await run_simulation(config, plans, trace_file=trace_file, server_settings=server_settings)
+    await run_simulation(
+        config,
+        plans,
+        trace_file=trace_file,
+        server_settings=server_settings,
+        allow_short_headroom=args.ignore_headroom,
+    )
 
 
 def apply_overrides(config: SimulatorConfig, args: argparse.Namespace) -> None:
@@ -260,6 +278,7 @@ async def run_simulation(
     *,
     trace_file: str | None = None,
     server_settings: dict[str, Any] | None = None,
+    allow_short_headroom: bool = False,
 ) -> None:
     from .idle_culling import IdleCuller
     from .pod_watch import PodRecorder
@@ -276,6 +295,7 @@ async def run_simulation(
     culler: IdleCuller | None = None
     setup_started_wall = now_iso()
     setup_completed_wall: str | None = None
+    headroom_after_warmup: dict[str, Any] | None = None
     experiment_started_wall: str | None = None
     experiment_finished_wall: str | None = None
 
@@ -312,6 +332,19 @@ async def run_simulation(
 
         setup_completed_wall = now_iso()
         print(f"Warm-up complete at {setup_completed_wall}")
+
+        # The user pods are up now, so what they reserve is real rather than
+        # projected and the compute figure is exact. Checked before the output
+        # directory exists, so a refusal leaves no run behind to be analysed.
+        headroom_after_warmup = await asyncio.to_thread(read_node_headroom)
+        print(f"Headroom after warm-up: {describe_headroom(headroom_after_warmup)}")
+        require_headroom(
+            headroom_after_warmup,
+            users=config.users.count,
+            capacity=config.experiment.buffer_capacity,
+            allow_short=allow_short_headroom,
+            stage="warm-up 직후",
+        )
 
         output_dir = make_output_dir(config)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -412,6 +445,9 @@ async def run_simulation(
         "schema_version": SUMMARY_SCHEMA_VERSION,
         "experiment": config.experiment.__dict__,
         "server": server_settings,
+        # server.node_headroom is the room before this run touched anything;
+        # this is what was left once its user pods were up.
+        "node_headroom_after_warmup": headroom_after_warmup,
         "ssh": {"host": config.ssh.host, "port": config.ssh.port},
         "users": {"count": config.users.count, "prefix": config.users.prefix},
         "setup": {
