@@ -208,7 +208,11 @@ def request_metrics(
         statuses[r.get("status") or "unknown"] = statuses.get(r.get("status") or "unknown", 0) + 1
     success = [r for r in requests if r.get("status") == "success"]
     # ssh_error never reached the server, so it is not a server failure.
-    charged = sum(n for s, n in statuses.items() if s not in ("success", "ssh_error", "incomplete"))
+    # output_lost is work the server finished, so it is not charged as a failure -
+    # the same treatment the incomplete branch gives it when the controller's logs
+    # can prove it. baseline_direct has no controller logs and reports it directly.
+    charged = sum(n for s, n in statuses.items()
+                  if s not in ("success", "ssh_error", "incomplete", "output_lost"))
     incomplete_server, incomplete_output_lost, incomplete_unclassified = split_incomplete(
         requests, assignments
     )
@@ -218,7 +222,7 @@ def request_metrics(
         "server_failures": charged + incomplete_server + incomplete_unclassified,
         # Work the server completed and the client never saw. Not a server
         # failure, but not a success either, so it is reported on its own.
-        "output_lost": incomplete_output_lost,
+        "output_lost": incomplete_output_lost + statuses.get("output_lost", 0),
         "incomplete_unclassified": incomplete_unclassified,
         "start_delay_s": summarize_values([r["since_send_to_start_ms"] / 1000.0 for r in success if r.get("since_send_to_start_ms") is not None]),
         # idle-baseline only. A resume happens before the command is sent, so it
