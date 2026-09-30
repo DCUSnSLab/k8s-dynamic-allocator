@@ -47,6 +47,9 @@ SSH_RUN_ATTEMPTS = 2
 #   exit 0 with one byte      the relay lost the output entirely
 # The retry does not match on these. It matches on the outcome - no end marker,
 # so nothing to measure - because the list was never complete.
+# 128 + SIGKILL: the container was killed, so the shell never reached the end
+# marker and never returned a status of its own.
+KILLED_EXIT_STATUS = 137
 RERUN_MAX_ATTEMPTS = 5
 # The pod takes about three seconds to disappear after its container is killed,
 # so a pause before reconnecting is what makes the next attempt land on a fresh
@@ -97,6 +100,14 @@ class CommandResult:
     # Extra attempts spent because an attempt ended with no end marker, so with
     # nothing to measure. 0 for a request that worked first time.
     reruns: int = 0
+    # Set when an attempt delivered an exit status but no end marker: the shell
+    # reached its last statement, so the command finished and its output was lost
+    # on the way back. Not a failure of the command, and not re-run.
+    output_lost: bool = False
+    # What the attempts that were thrown away actually said. Without this a
+    # re-run can only be diagnosed by arithmetic on the request's duration.
+    discarded_output: str = ""
+    discarded_exit_status: int | None = None
 
 
 @dataclass
@@ -222,6 +233,8 @@ class SSHUserSession:
         self._idle_since = time.monotonic()
         self._culled = False
         self.reruns = 0
+        self.output_lost = False
+        self.discarded_exit_status: int | None = None
         # One resume per user at a time. Without this, concurrent requests each
         # wait for the pod to go and then race to recreate it, and the losers
         # wait out the full timeout against a pod the winner just created.
@@ -257,6 +270,8 @@ class SSHUserSession:
         # delete the pod out from under it.
         self._idle_since = time.monotonic()
         self.reruns = 0
+        self.output_lost = False
+        self.discarded_exit_status = None
         lock_wait_started = time.monotonic()
         async with self._run_lock:
             user_concurrency_delay_ms = (time.monotonic() - lock_wait_started) * 1000.0
@@ -296,6 +311,9 @@ class SSHUserSession:
                 ssh_attempts=len(attempts),
                 ssh_retry_delay_ms=(attempts[-1] - started) * 1000.0,
                 reruns=self.reruns,
+                output_lost=self.output_lost,
+                discarded_output=output.discarded_stdout[-2000:],
+                discarded_exit_status=self.discarded_exit_status,
             )
 
     async def _run_with_retry(
@@ -327,12 +345,19 @@ class SSHUserSession:
                     )
                 except asyncio.TimeoutError as exc:
                     raise _CommandTimeout() from exc
-                if self._needs_rerun(output, attempt):
+                if self._needs_rerun(output, attempt, exit_status):
                     # Drop the connection so the next attempt reconnects, and let
                     # kubessh build a fresh pod once the old one has gone.
                     self._connection = None
                     self.reruns += 1
+                    self.discarded_exit_status = exit_status
                     continue
+                if ("end" not in output.seen_ms and "start" in output.seen_ms
+                        and exit_status is not None
+                        and exit_status != KILLED_EXIT_STATUS):
+                    # The shell started, ran, and returned a status of its own, so
+                    # it reached the end marker; the marker was lost on the way.
+                    self.output_lost = True
                 return exit_status
             except _CommandTimeout:
                 raise
@@ -360,27 +385,45 @@ class SSHUserSession:
                 # lost its connection had no attempts left, and was reported as
                 # an error with nothing measured.
                 if not can_retry and _is_transient_ssh_error(exc):
-                    if self._needs_rerun(output, attempt):
+                    # An exception carries no exit status, so the shell did not
+                    # finish and another attempt is the right answer.
+                    if self._needs_rerun(output, attempt, None):
                         self.reruns += 1
                         continue
                 if not can_retry:
                     raise
         raise RuntimeError(last_error or "SSH command failed")
 
-    def _needs_rerun(self, output: _TimedOutput, attempt: int) -> bool:
-        """Is there nothing to measure from this attempt?
+    def _needs_rerun(
+        self,
+        output: _TimedOutput,
+        attempt: int,
+        exit_status: int | None,
+    ) -> bool:
+        """Is there nothing to measure, and is running it again the way to get it?
 
-        The wrapper prints the end marker even when the command exits non-zero,
-        so a missing marker means the session broke, not that the command failed.
-        Whatever broke it, the command did not finish and there is no measurement,
-        which on a run compared arm-for-arm on one trace is worse than a slow
-        request: the other arms have a number for this slot and this one does not.
+        The wrapper is `echo START; <command>; exit_code=$?; echo END ...;
+        exit $exit_code`, so the end marker is printed before the shell exits. An
+        exit status arriving therefore means the shell reached its last statement
+        and the marker was printed - and if it was printed and not seen, it was
+        lost on the way, with the command already finished. Running it again would
+        repeat sixty seconds of work that was already done, which is what happened
+        to eight requests before this check existed.
+
+        Exit status travels on the SSH channel rather than in the output stream,
+        so it arrives even when the output does not. That is what makes it usable
+        here.
         """
-        return (
-            self._rerun_when_unmeasured
-            and attempt < RERUN_MAX_ATTEMPTS
-            and "end" not in output.seen_ms
-        )
+        if not self._rerun_when_unmeasured or attempt >= RERUN_MAX_ATTEMPTS:
+            return False
+        if "end" in output.seen_ms:
+            return False
+        # The start marker is what proves the shell ran at all. Without it the
+        # exit status came from the exec failing - "container not found" returns
+        # 1 without the command ever starting - and there is nothing to preserve.
+        started = "start" in output.seen_ms
+        finished = started and exit_status is not None and exit_status != KILLED_EXIT_STATUS
+        return not finished
 
     async def _stream(self, remote_command: str, output: _TimedOutput) -> int | None:
         process = await self._connection.create_process(

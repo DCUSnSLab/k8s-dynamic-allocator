@@ -566,8 +566,16 @@ async def execute_request(
         # Extra attempts spent because an attempt left nothing to measure. Counts
         # how often a user came back exactly as their pod was being reclaimed.
         "reruns": result.reruns,
+        # The shell finished and its end marker never arrived. The command did
+        # run, so this is not a server failure; it is output that was lost on the
+        # way back, the same thing the kda arm reports from the controller's logs.
+        "output_lost": result.output_lost,
+        "discarded_exit_status": result.discarded_exit_status,
     }
     add_output_tails(config, record, result, strip_output)
+    if result.discarded_output:
+        record["discarded_output_tail"] = strip_output(
+            result.discarded_output)[-config.output.command_output_chars:]
     summary.add(record)
     await writer.write(record)
 
@@ -586,6 +594,11 @@ def classify_result(result: Any) -> str:
         return "ssh_error"
     if result.error:
         return "error"
+    if getattr(result, "output_lost", False):
+        # The shell reached its last statement - an exit status came back - so the
+        # command finished and only its end marker was lost. Calling this
+        # incomplete would charge the server for work it completed.
+        return "output_lost"
     if result.command_delivered and result.since_send_to_end_ms is None:
         # The command was sent and the Compute Pod picked it up, but the run
         # never printed its end marker. Something cut the session short - a
