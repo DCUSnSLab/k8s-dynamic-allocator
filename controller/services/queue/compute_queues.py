@@ -766,6 +766,37 @@ class ComputeQueues:
         stale.sort(key=lambda item: item.get("created_at") or _utc_now())
         return stale
 
+    def count_allocating_without_pod(self, compute_type: Optional[str] = None) -> int:
+        """Claims that hold a capacity slot but have produced no Pod yet.
+
+        Cold start counts occupancy from the Pods that exist, and creates the Pod
+        after the claim, outside the allocator lock. For that gap the slot looks
+        free and the cap can be exceeded, so the claim itself has to count.
+
+        A ticket stops being counted here the moment its Pod name is recorded -
+        which happens as soon as the Pod object is created - because from then on
+        the Pod is in the LIST and counting both would charge the slot twice.
+
+        Stale claims are excluded deliberately. A worker that died between the
+        claim and the create leaves a ticket the sweep will requeue; holding a
+        slot for it would close the cap on work nobody is doing.
+        """
+        types = [self.normalize_compute_type(compute_type)] if compute_type else self.known_compute_types()
+        pending = 0
+        for type_name in types:
+            for ticket_id in self._active_ticket_ids(type_name):
+                ticket = self.tickets.get_ticket(ticket_id)
+                if not ticket:
+                    continue
+                if ticket.get("status") != "allocating":
+                    continue
+                if ticket.get("compute_pod"):
+                    continue
+                if self.is_allocation_stale(ticket):
+                    continue
+                pending += 1
+        return pending
+
     def claim_next_ticket(self, compute_type: str, worker_id: Optional[str] = None) -> Optional[Dict[str, object]]:
         compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()

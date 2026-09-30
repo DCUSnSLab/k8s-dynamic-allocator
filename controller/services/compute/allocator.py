@@ -116,6 +116,10 @@ class ComputeAllocator:
             if capacity is None:
                 return effective_batch
             active = self.provider.count_active_pods(compute_type)
+            # Claims whose Pod is not created yet. Without these the cap is read
+            # from Pods alone and the gap between claiming and creating reads as
+            # free capacity, which took this arm to 22 Pods against N=20.
+            pending = self.queues.count_allocating_without_pod(compute_type)
         except Exception as exc:
             # Reading capacity is a Kubernetes call; a blip must not stall the
             # queue, and the per-ticket create still fails safely on its own.
@@ -126,10 +130,10 @@ class ComputeAllocator:
             )
             return effective_batch
 
-        remaining = max(0, capacity - active)
+        remaining = max(0, capacity - active - pending)
         if remaining == 0:
             result["capacity_blocked"] = "capacity"
-            if active == 0:
+            if active + pending == 0:
                 # Being at the cap is ordinary backpressure, but only while
                 # something is running that can finish and free a slot. With
                 # nothing active the cap itself is the blocker and the queue
@@ -197,6 +201,15 @@ class ComputeAllocator:
 
         try:
             compute_pod = self.provider.create_pod_for_ticket(ticket)
+            # The Pod object exists now, so count_active_pods will see it from
+            # here on. Record it before waiting for Ready, or the claim keeps
+            # counting as a pending creation as well and the slot is charged
+            # twice for the whole readiness wait.
+            self.tickets.record_allocating_pod(
+                ticket_id,
+                compute_pod=compute_pod,
+                claim_token=claim_token,
+            )
             ready_pod = self.provider.wait_pod_ready(
                 compute_pod,
                 keep_claim=lambda: self.tickets.extend_allocation_deadline(ticket_id, claim_token),

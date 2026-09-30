@@ -455,6 +455,34 @@ class Tickets:
             },
         )
 
+    def record_allocating_pod(
+        self,
+        ticket_id: str,
+        compute_pod: str,
+        claim_token: Optional[str] = None,
+    ) -> Optional[Dict[str, object]]:
+        """Attach the Pod name to an allocating ticket the moment it is created.
+
+        Separate from mark_allocating, which also publishes the IP: the name has
+        to be recorded as soon as the Pod object exists, so the capacity count can
+        stop treating the claim as a pending creation. The IP does not exist until
+        the Pod is Ready, and writing an empty one here would publish a value that
+        looks usable and is not.
+
+        Only the name is written. Status, claim token and deadline are left as
+        they are, so this cannot extend a claim that is about to be swept.
+        """
+        ticket = self.get_ticket(ticket_id)
+        if not ticket:
+            return None
+        return self._ticket_transition(
+            ticket_id,
+            compute_type=self.queue.normalize_compute_type(ticket.get("compute_type")),
+            expected_statuses={"allocating"},
+            expected_claim_token=claim_token or ticket.get("claim_token") or None,
+            updates={"compute_pod": compute_pod},
+        )
+
     def extend_allocation_deadline(self, ticket_id: str, claim_token: str) -> bool:
         """Keep an allocating claim alive while its compute pod is still starting.
 
