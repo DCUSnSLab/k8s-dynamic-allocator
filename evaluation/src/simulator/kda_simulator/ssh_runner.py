@@ -129,6 +129,20 @@ class ResumeTiming:
     error: str | None = None
 
 
+@dataclass
+class _Attempts:
+    """What one run_remote call has spent, and what it threw away.
+
+    A session is shared by every request that user has in flight, so none of this
+    can live there: a sibling request would reset it mid-flight and read back the
+    other's numbers.
+    """
+
+    reruns: int = 0
+    output_lost: bool = False
+    discarded_exit_status: int | None = None
+
+
 class _CommandTimeout(Exception):
     pass
 
@@ -232,9 +246,6 @@ class SSHUserSession:
         # first request so a user who is never scheduled still ages out.
         self._idle_since = time.monotonic()
         self._culled = False
-        self.reruns = 0
-        self.output_lost = False
-        self.discarded_exit_status: int | None = None
         # One resume per user at a time. Without this, concurrent requests each
         # wait for the pod to go and then race to recreate it, and the losers
         # wait out the full timeout against a pod the winner just created.
@@ -269,20 +280,19 @@ class SSHUserSession:
         # another one has already made this user active, and the culler must not
         # delete the pod out from under it.
         self._idle_since = time.monotonic()
-        self.reruns = 0
-        self.output_lost = False
-        self.discarded_exit_status = None
         lock_wait_started = time.monotonic()
         async with self._run_lock:
             user_concurrency_delay_ms = (time.monotonic() - lock_wait_started) * 1000.0
             started = time.monotonic()
             output = _TimedOutput(started)
+            spent = _Attempts()
             exit_status: int | None = None
             timed_out = False
             error: str | None = None
             attempts = [started]
             try:
-                exit_status = await self._run_with_retry(remote_command, timeout, output, attempts)
+                exit_status = await self._run_with_retry(
+                    remote_command, timeout, output, attempts, spent)
             except _CommandTimeout:
                 timed_out = True
                 error = f"command timed out after {timeout} seconds"
@@ -310,10 +320,10 @@ class SSHUserSession:
                 command_delivered=output.channel_opened or output.received,
                 ssh_attempts=len(attempts),
                 ssh_retry_delay_ms=(attempts[-1] - started) * 1000.0,
-                reruns=self.reruns,
-                output_lost=self.output_lost,
+                reruns=spent.reruns,
+                output_lost=spent.output_lost,
                 discarded_output=output.discarded_stdout[-2000:],
-                discarded_exit_status=self.discarded_exit_status,
+                discarded_exit_status=spent.discarded_exit_status,
             )
 
     async def _run_with_retry(
@@ -322,13 +332,14 @@ class SSHUserSession:
         timeout: float,
         output: _TimedOutput,
         attempts: list[float],
+        spent: _Attempts,
     ) -> int | None:
         last_error: str | None = None
         # The upper bound is the reclaim path's; the ordinary transient-error
         # retry below still stops at SSH_RUN_ATTEMPTS.
         for attempt in range(1, RERUN_MAX_ATTEMPTS + 1):
             if attempt > 1:
-                if self.reruns:
+                if spent.reruns:
                     # Give the pod a moment to finish going. Retrying with no
                     # pause is what made the first version of this fail: the
                     # container was already gone but the pod was not.
@@ -349,15 +360,15 @@ class SSHUserSession:
                     # Drop the connection so the next attempt reconnects, and let
                     # kubessh build a fresh pod once the old one has gone.
                     self._connection = None
-                    self.reruns += 1
-                    self.discarded_exit_status = exit_status
+                    spent.reruns += 1
+                    spent.discarded_exit_status = exit_status
                     continue
                 if ("end" not in output.seen_ms and "start" in output.seen_ms
                         and exit_status is not None
                         and exit_status != KILLED_EXIT_STATUS):
                     # The shell started, ran, and returned a status of its own, so
                     # it reached the end marker; the marker was lost on the way.
-                    self.output_lost = True
+                    spent.output_lost = True
                 return exit_status
             except _CommandTimeout:
                 raise
@@ -388,7 +399,7 @@ class SSHUserSession:
                     # An exception carries no exit status, so the shell did not
                     # finish and another attempt is the right answer.
                     if self._needs_rerun(output, attempt, None):
-                        self.reruns += 1
+                        spent.reruns += 1
                         continue
                 if not can_retry:
                     raise
