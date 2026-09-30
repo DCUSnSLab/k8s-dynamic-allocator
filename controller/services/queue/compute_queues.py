@@ -766,21 +766,28 @@ class ComputeQueues:
         stale.sort(key=lambda item: item.get("created_at") or _utc_now())
         return stale
 
-    def count_allocating_without_pod(self, compute_type: Optional[str] = None) -> int:
-        """Claims that hold a capacity slot but have produced no Pod yet.
+    def count_allocating_missing_pods(
+        self,
+        active_pod_names,
+        compute_type: Optional[str] = None,
+    ) -> int:
+        """Claims that hold a capacity slot because their Pod is not visible yet.
 
-        Cold start counts occupancy from the Pods that exist, and creates the Pod
-        after the claim, outside the allocator lock. For that gap the slot looks
-        free and the cap can be exceeded, so the claim itself has to count.
+        Cold start creates the Pod after the claim, outside the allocator lock, so
+        for a moment the slot belongs to neither the Pod count nor the claim. The
+        test is deliberately "is this claim's Pod in the list we just read" rather
+        than "does this claim have a Pod name": the name is written as soon as the
+        create call returns, while the API server's LIST trails it, and the gap
+        between those two is exactly where a slot used to disappear.
 
-        A ticket stops being counted here the moment its Pod name is recorded -
-        which happens as soon as the Pod object is created - because from then on
-        the Pod is in the LIST and counting both would charge the slot twice.
+        A claim whose Pod is in the set is not counted here - the Pod already holds
+        the slot, and counting both would charge it twice and halve capacity.
 
         Stale claims are excluded deliberately. A worker that died between the
-        claim and the create leaves a ticket the sweep will requeue; holding a
-        slot for it would close the cap on work nobody is doing.
+        claim and the create leaves a ticket the sweep will requeue; holding a slot
+        for it would close the cap on work nobody is doing.
         """
+        known = set(active_pod_names or ())
         types = [self.normalize_compute_type(compute_type)] if compute_type else self.known_compute_types()
         pending = 0
         for type_name in types:
@@ -790,7 +797,7 @@ class ComputeQueues:
                     continue
                 if ticket.get("status") != "allocating":
                     continue
-                if ticket.get("compute_pod"):
+                if (ticket.get("compute_pod") or "") in known:
                     continue
                 if self.is_allocation_stale(ticket):
                     continue

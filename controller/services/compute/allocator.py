@@ -115,20 +115,31 @@ class ComputeAllocator:
             capacity = self.provider.read_capacity(compute_type)
             if capacity is None:
                 return effective_batch
-            active = self.provider.count_active_pods(compute_type)
-            # Claims whose Pod is not created yet. Without these the cap is read
-            # from Pods alone and the gap between claiming and creating reads as
-            # free capacity, which took this arm to 22 Pods against N=20.
-            pending = self.queues.count_allocating_without_pod(compute_type)
+            # One LIST, used twice: as the set of Pods holding a slot, and as the
+            # test for which claims are still waiting for theirs to appear.
+            active_pods = self.provider.active_pod_names(compute_type)
+            active = len(active_pods)
+            # Claims whose Pod the LIST cannot see yet. Asking the LIST rather
+            # than the ticket's recorded name is what closes the window where the
+            # Pod is created, recorded, and still invisible - the gap that left
+            # this arm at 21 Pods against N=20 after the first fix.
+            pending = self.queues.count_allocating_missing_pods(
+                active_pods, compute_type)
         except Exception as exc:
-            # Reading capacity is a Kubernetes call; a blip must not stall the
-            # queue, and the per-ticket create still fails safely on its own.
+            # The cap cannot be verified, so nothing is claimed this tick. The
+            # worker comes back in a second, which is what keeps the queue from
+            # stalling; handing out the whole batch instead would turn the cap off
+            # at the one moment there is no way to check it, and a batch is ten.
+            # For a run whose comparison rests on N, one second of pause is
+            # cheaper than ten Pods over the limit.
             logger.warning(
-                "[Warning] operation=cold_start_capacity_check compute_type=%s reason=%r",
+                "[Warning] operation=cold_start_capacity_check compute_type=%s "
+                "claimed=0 reason=%r",
                 compute_type,
                 str(exc),
             )
-            return effective_batch
+            result["capacity_blocked"] = "capacity_unknown"
+            return 0
 
         remaining = max(0, capacity - active - pending)
         if remaining == 0:

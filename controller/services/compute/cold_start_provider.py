@@ -247,11 +247,22 @@ class ColdStartProvider(KubernetesClient):
 
     def count_active_pods(self, compute_type: Optional[str] = None) -> int:
         """Pods that still hold capacity. Terminating ones are already giving it back."""
-        return sum(
-            1
+        return len(self.active_pod_names(compute_type=compute_type))
+
+    def active_pod_names(self, compute_type: Optional[str] = None) -> set:
+        """Names of the Pods that hold capacity right now.
+
+        The names matter and not just the count: a claim that has created its Pod
+        can only be told apart from one that has not by asking whether its Pod is
+        in here. The alternative - trusting the name written on the ticket - leaves
+        the window where the Pod is recorded but the API server's watch cache has
+        not caught up, and in that window neither the Pod nor the claim counts.
+        """
+        return {
+            pod["name"]
             for pod in self.list_buffer_status(compute_type=compute_type)
             if not pod["terminating"]
-        )
+        }
 
     def drain_buffer_deployments(self) -> int:
         """Scale the warm Deployments to zero and report how many were scaled.
