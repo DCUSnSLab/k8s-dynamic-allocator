@@ -53,6 +53,31 @@ class PodLife:
     gone_at: datetime | None = None
 
 
+def describe_headroom(headroom: dict[str, Any] | None) -> str:
+    """One line on the room the cluster had when the run started.
+
+    Requests and usage are both shown because they diverge widely on this shared
+    cluster - a node can sit at 14% CPU while the scheduler counts it 54%
+    committed - and only the requests figure explains a pod that stayed Pending.
+    """
+    if not headroom:
+        return "node headroom  not recorded"
+    if "error" in headroom:
+        return f"node headroom  unavailable ({headroom['error']})"
+    totals = headroom["eligible"]
+    eligible = [n for n in headroom["nodes"] if n["eligible"] and n["schedulable"]]
+    used = [n["cpu_used_m"] for n in eligible if n["cpu_used_m"] is not None]
+    actual = f"  actual {sum(used) / 1000:.1f} cores" if used else ""
+    # for-run counts this run's own pods as room it may have, so the figure does
+    # not depend on whether the reading was taken before or after warm-up.
+    return (
+        f"node headroom  {totals['nodes']} nodes  "
+        f"for run {totals['cpu_free_for_run_m'] / 1000:.0f} cores/"
+        f"{totals['memory_free_for_run_bytes'] / 1024 ** 3:.0f} GiB  "
+        f"(this run held {totals['cpu_ours_m'] / 1000:.0f} cores){actual}"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compute experiment metrics for one run directory.")
     parser.add_argument("run_dir", help="evaluation/data/<run-id> (the folder that contains simulator/)")
@@ -86,6 +111,9 @@ def main() -> int:
             {"deployment": p.get("deployment"), "R": p.get("R"), "N": p.get("N")}
             for p in (summary.get("server") or {}).get("buffers") or []
         ],
+        # Absent for runs recorded before the field existed; None then, so the
+        # report can say "not recorded" instead of reporting no headroom.
+        "node_headroom": (summary.get("server") or {}).get("node_headroom"),
         "sources": {"pods": pods is not None, "controller_logs": assignments is not None},
         "overall": window_metrics(window, requests, pods, assignments, users, summary),
     }
@@ -379,6 +407,7 @@ def print_report(metrics: dict[str, Any]) -> None:
     req = overall["requests"]
     print(f"run {metrics['run']}  {metrics['window']['minutes']:.1f} min  users={metrics['users']}  "
           f"buffers={metrics['server_buffers']}")
+    print(describe_headroom(metrics.get("node_headroom")))
     line = f"requests {req['count']}  status={req['status']}  server_failures={req['server_failures']}"
     if req.get("output_lost"):
         # Named separately because the server did the work; counting it as a
