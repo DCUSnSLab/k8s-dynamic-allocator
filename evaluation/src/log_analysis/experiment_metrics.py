@@ -41,6 +41,9 @@ KEY_VALUE_RE = re.compile(r"(?P<key>[a-z_]+)=(?P<value>\S+)")
 # Non-numeric controller fields worth keeping. outcome is written only by an
 # arm that can hand a pod back instead of deleting it.
 TEXT_FIELDS = {"compute_pod", "outcome"}
+# The window opens when the first request is scheduled; a request can reach the
+# controller a moment before the simulator records the start.
+REQUEST_WINDOW_SLACK = timedelta(minutes=1)
 
 
 @dataclass
@@ -117,7 +120,10 @@ def main() -> int:
         print(f"WARNING: {pods_path.name} is empty, pod metrics are skipped")
     pods = build_pod_lives(pod_records, window[1]) if pod_records else None
     logs_dir = Path(args.logs_dir) if args.logs_dir else run_dir / "log_analysis" / "raw-jsonl"
-    assignments = read_assignments(logs_dir, {r["request_id"] for r in requests}) if logs_dir.exists() else None
+    assignments = (
+        read_assignments(logs_dir, {r["request_id"] for r in requests}, window)
+        if logs_dir.exists() else None
+    )
 
     metrics: dict[str, Any] = {
         "run": run_dir.name,
@@ -449,7 +455,11 @@ def build_pod_lives(records: Iterable[dict[str, Any]], run_end: datetime) -> lis
     return list(lives.values())
 
 
-def read_assignments(logs_dir: Path, request_ids: set[str]) -> dict[str, dict[str, float]]:
+def read_assignments(
+    logs_dir: Path,
+    request_ids: set[str],
+    window: tuple[datetime, datetime] | None = None,
+) -> dict[str, dict[str, float]]:
     """Controller [Assigned] and [Released] fields per simulator request_id.
 
     [Released] carries session_ms, which is how long the controller held the
@@ -474,6 +484,12 @@ def read_assignments(logs_dir: Path, request_ids: set[str]) -> dict[str, dict[st
                     continue
                 label, event, rest = match.group("label", "event", "rest")
                 if event == "Request":
+                    # request_id comes from the simulator's experiment name and a
+                    # sequence number, so a rerun under the same name repeats every
+                    # id. The server keeps older runs' logs, and without this the
+                    # last matching run wins. Only this run's window counts.
+                    if window is not None and not _within(record.get("time"), window):
+                        continue
                     found = REQUEST_ID_RE.search(rest)
                     if found and found.group("request_id") in request_ids:
                         label_to_request[label] = found.group("request_id")
@@ -595,6 +611,14 @@ def _parse_time(value: str) -> datetime:
 
 def _seconds(start: datetime, end: datetime) -> float:
     return (end - start).total_seconds()
+
+
+def _within(value: Any, window: tuple[datetime, datetime]) -> bool:
+    try:
+        at = _parse_time(str(value))
+    except ValueError:
+        return False
+    return window[0] - REQUEST_WINDOW_SLACK <= at <= window[1] + REQUEST_WINDOW_SLACK
 
 
 def _is_number(value: str) -> bool:
