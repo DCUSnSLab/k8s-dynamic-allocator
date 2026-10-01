@@ -54,6 +54,8 @@ TIMELINE_COLUMNS = [
 ]
 
 SAFE_LOG_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+\.jsonl(\.gz)?$")
+# Reads of one log file before giving up on a short copy.
+COPY_ATTEMPTS = 3
 KEY_VALUE_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\"[^\"]*\"|'[^']*'|[^\s]+)")
 EVENT_TAG_RE = re.compile(r"^\[(?P<tag>[^\]]+)\](?:\s+(?P<rest>.*))?$")
 LEVEL_PREFIX_RE = re.compile(r"^(?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL):\s*(?P<message>.*)$")
@@ -769,8 +771,22 @@ def copy_logs(args: argparse.Namespace, pod_name: str, raw_dir: Path) -> None:
         target = raw_dir / name
         command = exec_prefix + ["head", "-c", size_text, f"/mnt/logs/{name}"]
         print("+ " + " ".join(command))
-        with target.open("wb") as handle:
-            subprocess.run(command, check=True, stdout=handle)
+        # kubectl exec can end a long stream early and still exit 0. The cut
+        # line is then dropped below and the file looks whole, so a run would
+        # silently lose its last minutes. Compare against the listed size.
+        expected = int(size_text)
+        for attempt in range(1, COPY_ATTEMPTS + 1):
+            with target.open("wb") as handle:
+                subprocess.run(command, check=True, stdout=handle)
+            received = target.stat().st_size
+            if received == expected:
+                break
+            print(f"short read for {name}: {received} of {expected} bytes (attempt {attempt}/{COPY_ATTEMPTS})")
+        else:
+            raise SystemExit(
+                f"{name}: received {received} of {expected} bytes after {COPY_ATTEMPTS} attempts. "
+                "Clear old logs before a run (reset_server.py --clear-logs) so the files stay small."
+            )
         if name.endswith(".jsonl"):
             drop_partial_last_line(target)
 
