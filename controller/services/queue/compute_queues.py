@@ -213,6 +213,9 @@ class ComputeQueues:
     def _compute_available_key(self, compute_pod: str) -> str:
         return f"{self.prefix}:compute-available:{compute_pod}"
 
+    def _release_lock_key(self, ticket_id: str) -> str:
+        return f"{self.prefix}:release-lock:{ticket_id}"
+
     def record_compute_available(self, compute_pod: str, compute_available_at: Optional[str] = None) -> bool:
         compute_pod_value = (compute_pod or "").strip()
         if not compute_pod_value:
@@ -232,6 +235,30 @@ class ComputeQueues:
         except RedisError as exc:
             raise QueueUnavailableError(
                 f"Failed to record compute availability for {compute_pod_value}: {exc}"
+            ) from exc
+
+    def set_compute_available(self, compute_pod: str, compute_available_at: str) -> bool:
+        """Record when a returned Pod became available, replacing any earlier value.
+
+        record_compute_available keeps the first sighting, which for a returned
+        Pod can be the watcher noticing the relabel a moment after the return.
+        """
+        compute_pod_value = (compute_pod or "").strip()
+        if not compute_pod_value or not compute_available_at:
+            return False
+
+        client = self._redis_client()
+        try:
+            return bool(
+                client.set(
+                    self._compute_available_key(compute_pod_value),
+                    compute_available_at,
+                    ex=max(1, int(self.compute_available_ttl_seconds)),
+                )
+            )
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to set compute availability for {compute_pod_value}: {exc}"
             ) from exc
 
     def pop_compute_available_at(self, compute_pod: str) -> str:

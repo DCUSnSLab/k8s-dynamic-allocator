@@ -102,6 +102,7 @@ def log_queue_event(
             "ticket_id",
             "operation",
             "status",
+            "outcome",
             "source",
             "error_type",
             "compute_type",
@@ -128,6 +129,10 @@ def log_queue_event(
             "since_request_to_assigned_ms",
             "session_ms",
             "release_ms",
+            "scrub_ms",
+            "agent_scrub_ms",
+            "relabel_ms",
+            "reuse_count",
         ]
         used = set()
         for key in ordered_keys:

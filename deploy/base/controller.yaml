@@ -51,7 +51,7 @@ spec:
         # evaluation harness reads it off this Deployment to label which arm a
         # run measured, and a run with the wrong label is worse than no run.
         - name: COMPUTE_ALLOCATION_MODE
-          value: warm_buffer
+          value: warm_buffer_reuse
         # DEBUG 가 켜져 있으면 Django 가 SQL 과 요청 정보를 프로세스 안에 모아 두고
         # 예외마다 트레이스백 페이지를 만든다. 측정하는 쪽에서는 메모리와 응답 시간에
         # 잡음만 더하는 것이라 끈다. 기본값이 true 이므로 명시해야 한다.
