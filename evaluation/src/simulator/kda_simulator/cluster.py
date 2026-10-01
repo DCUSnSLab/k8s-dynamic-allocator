@@ -20,6 +20,10 @@ BUFFER_CAPACITY_ANNOTATION = "k8s-dynamic-allocator/buffer-capacity"
 KUBECTL_TIMEOUT_SECONDS = 30
 BUFFER_SETTLE_TIMEOUT_SECONDS = 180.0
 BUFFER_SETTLE_POLL_SECONDS = 2.0
+# Allocation modes that keep a compute Deployment whose R/N annotations the
+# controller follows. The reuse arm hands pods back to that same Deployment
+# instead of deleting them, so it takes R/N exactly as the proposal does.
+DEPLOYMENT_BUFFER_MODES = {"warm_buffer", "warm_buffer_reuse"}
 
 
 class ServerSettingsError(RuntimeError):
@@ -45,7 +49,7 @@ def prepare_server(
         return {"error": str(exc)}
 
     if apply_policy:
-        if settings["allocation_mode"] != "warm_buffer":
+        if settings["allocation_mode"] not in DEPLOYMENT_BUFFER_MODES:
             print(f"R/N not applied: allocation mode is {settings['allocation_mode']}")
         else:
             r, n = wanted
