@@ -48,6 +48,7 @@ class SessionHandler:
     """
 
     IDLE_WATCH_INTERVAL_SECONDS = 10
+    REJECT_HEADER_TIMEOUT_SECONDS = 2
 
     def __init__(self, port: Optional[int] = None) -> None:
         self.port = port or int(os.getenv("COMPUTE_AGENT_TCP_PORT", "8081"))
@@ -77,6 +78,7 @@ class SessionHandler:
         self._controller_release_timeout_seconds = float(os.getenv("CONTROLLER_RELEASE_TIMEOUT_SECONDS", "10"))
         self._user_pod_ip = ""
         self._user_pod = ""
+        self._ticket_id = ""
         self._mount_context_lock = threading.Lock()
 
     async def start(self) -> None:
@@ -198,10 +200,11 @@ class SessionHandler:
             except Exception:
                 pass
 
-    async def begin_session_lifecycle(self, user_pod_ip: str = "", user_pod: str = "") -> None:
+    async def begin_session_lifecycle(self, user_pod_ip: str = "", user_pod: str = "", ticket_id: str = "") -> None:
         with self._mount_context_lock:
             self._user_pod_ip = user_pod_ip or ""
             self._user_pod = user_pod or ""
+            self._ticket_id = ticket_id or ""
 
         self._mark_idle_since_now()
         self._release_notify_cancelled.clear()
@@ -219,7 +222,12 @@ class SessionHandler:
             return {
                 "user_pod_ip": self._user_pod_ip,
                 "user_pod": self._user_pod,
+                "ticket_id": self._ticket_id,
             }
+
+    def _is_current_mount_context(self, mount_context: Dict[str, str]) -> bool:
+        """mount_context 를 잡은 배정이 아직 이어지는지 (반납이나 다음 배정이 없었는지)."""
+        return self._mount_context_snapshot() == mount_context
 
     def _clear_mount_context(self) -> None:
         self._idle_since = None
@@ -227,6 +235,16 @@ class SessionHandler:
         with self._mount_context_lock:
             self._user_pod_ip = ""
             self._user_pod = ""
+            self._ticket_id = ""
+
+    def revoke_mount_context(self) -> None:
+        """지금 배정을 끝내고 이후 들어오는 세션을 거절한다.
+
+        세션은 시작 전에 mount context 를 확인하므로, 정리에 앞서 이걸 비워
+        두면 나가는 사용자의 늦은 연결이 다음 사용자에게 넘길 Pod 에서
+        세션을 열지 못한다.
+        """
+        self._clear_mount_context()
 
     @staticmethod
     def _configure_keepalive(sock: socket.socket) -> None:
@@ -267,6 +285,14 @@ class SessionHandler:
 
         logger.info("[ConnectionOpened] client_ip=%s", client_ip)
 
+        # 재사용하면 Pod 가 다음 사용자에게 넘어가므로, 배정된 User Pod 가 아닌
+        # 연결(이전 사용자의 늦은 연결, 배정이 없는 상태의 연결)에는 셸을 주지 않는다
+        expected_ip = mount_context.get("user_pod_ip")
+        if client_ip != expected_ip:
+            logger.warning("[ConnectionRejected] client_ip=%s expected=%s", client_ip, expected_ip or "-")
+            await self._reject_connection(reader, writer)
+            return
+
         # 클라이언트 소켓에 TCP Keepalive 적용
         client_sock = writer.get_extra_info('socket')
         if client_sock:
@@ -301,6 +327,16 @@ class SessionHandler:
                 term_env = 'xterm-256color'
                 settings = {}
                 logger.warning("Received legacy command format")
+
+            # 헤더를 기다리는 사이 반납·정리·다음 배정이 일어났으면 이 세션의
+            # 작업 공간이 아니다. 여기서 세션 등록까지는 await 가 없어 빈틈이 없다.
+            if not self._is_current_mount_context(mount_context):
+                logger.warning(
+                    "[ConnectionRejected] client_ip=%s expected=%s",
+                    client_ip,
+                    self._mount_context_snapshot()["user_pod_ip"] or "-",
+                )
+                return
 
             # 2. PTY 생성 및 프로세스 시작
             master_fd, slave_fd = pty.openpty()
@@ -417,7 +453,8 @@ class SessionHandler:
 
             # 세션 추적 제거
             session_info = self._active_sessions.pop(session_id, None)
-            if not self._active_sessions:
+            # 배정이 끝난 뒤 닫힌 세션이 다음 사용자의 유휴 시계를 건드리면 안 된다
+            if not self._active_sessions and self._is_current_mount_context(mount_context):
                 self._mark_idle_since_now()
 
             await self._send_exit_trailer(writer, process)
@@ -429,7 +466,9 @@ class SessionHandler:
             logger.info("[ConnectionClosed] session_ms=%s", max(0, session_ms))
 
             # 활성 세션이 없으면 Controller에 자원 해제 요청
-            await self._notify_release_if_idle()
+            # 위 await 사이에 다음 배정이 시작됐으면, 그 배정을 반납시키지 않도록 건너뛴다
+            if self._is_current_mount_context(mount_context):
+                await self._notify_release_if_idle()
 
     async def _notify_release_if_idle(self):
         """Tell the controller the pod is free, once the last session is gone.
@@ -451,9 +490,11 @@ class SessionHandler:
             self._release_notify_pending = True
             loop = asyncio.get_running_loop()
             generation = self._release_notify_generation
-            self._release_notify_task = loop.create_task(self._notify_release(generation))
+            # 컨트롤러가 어느 배정에 대한 반납인지 가릴 수 있게 지금 배정의 티켓을 싣는다
+            ticket_id = self._mount_context_snapshot()["ticket_id"]
+            self._release_notify_task = loop.create_task(self._notify_release(generation, ticket_id))
 
-    async def _notify_release(self, generation: int):
+    async def _notify_release(self, generation: int, ticket_id: str = ""):
         """
         Controller에 Compute 해제 요청 (TCP 끊김 시 안전망).
 
@@ -479,10 +520,13 @@ class SessionHandler:
             if cancelled_event.is_set():
                 return False
             import http.client
-            body = json.dumps({
+            payload = {
                 "compute_pod": hostname,
                 "source": "compute_fallback",
-            }).encode("utf-8")
+            }
+            if ticket_id:
+                payload["ticket_id"] = ticket_id
+            body = json.dumps(payload).encode("utf-8")
             release_notify_http_connection = None
             try:
                 release_notify_http_connection = http.client.HTTPConnection(
@@ -560,6 +604,24 @@ class SessionHandler:
             # The client is already gone; it will see the missing trailer and
             # treat the session as cut, which is the right answer here.
             logger.warning("[Warning] operation=exit_trailer reason=%r", str(exc))
+
+    async def _reject_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """거절한 연결에 실패 종료 코드를 보내고 닫는다.
+
+        세션 정리 경로(유휴 시계, 반납 요청)는 거치지 않는다. 거절된 연결은
+        지금 배정의 세션이 아니기 때문이다.
+        """
+        try:
+            # 헤더를 읽지 않은 채 닫으면 커널이 RST 를 보내 트레일러가 유실될 수 있다
+            await asyncio.wait_for(reader.readline(), timeout=self.REJECT_HEADER_TIMEOUT_SECONDS)
+        except (asyncio.TimeoutError, OSError, ValueError):
+            pass
+        await self._send_exit_trailer(writer, None)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
 
     async def _handle_io(
         self,

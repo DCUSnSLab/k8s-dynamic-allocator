@@ -499,7 +499,7 @@ class ComputeAllocator:
 
         try:
             with ComputeAgent(compute_pod_ip) as agent:
-                agent.mount(user_pod_ip, command, user_pod)
+                agent.mount(user_pod_ip, command, user_pod, ticket_id=ticket_id)
         except ComputeAgentError as exc:
             ticket_format.log_queue_event(
                 "warning",

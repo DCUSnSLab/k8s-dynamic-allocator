@@ -51,7 +51,7 @@ spec:
         # evaluation harness reads it off this Deployment to label which arm a
         # run measured, and a run with the wrong label is worse than no run.
         - name: COMPUTE_ALLOCATION_MODE
-          value: warm_buffer
+          value: warm_buffer_reuse
         resources:
           requests:
             cpu: "100m"

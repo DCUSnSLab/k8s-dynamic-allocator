@@ -139,10 +139,12 @@ CACHES = {
 REDIS_URL = _env_first(('REDIS_URL',), 'redis://localhost:6379/0')
 WAIT_QUEUE_PREFIX = _env_first(('WAIT_QUEUE_PREFIX',), 'kda:waitq')
 DEFAULT_COMPUTE_TYPE = _env_first(('DEFAULT_COMPUTE_TYPE',), 'general')
-# This branch is the proposal system and carries no other allocation path,
-# so the mode is a constant rather than a switch: reading it from the
-# environment would let a typo silently deploy an arm that is not here.
-COMPUTE_ALLOCATION_MODE = 'warm_buffer'
+# This branch is the reuse arm: a Compute Pod released by its user is scrubbed
+# and handed back to its Deployment instead of being deleted. It carries no
+# other allocation path, so the mode is a constant rather than a switch:
+# reading it from the environment would let a typo silently deploy an arm that
+# is not here.
+COMPUTE_ALLOCATION_MODE = 'warm_buffer_reuse'
 COMPUTE_POD_IMAGE = _env_first(
     ('COMPUTE_POD_IMAGE',),
     'harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:latest',
@@ -251,6 +253,19 @@ COMPUTE_AGENT_MOUNT_TIMEOUT_SECONDS = _env_float_any(
 COMPUTE_AGENT_UNMOUNT_TIMEOUT_SECONDS = _env_float_any(
     ('COMPUTE_AGENT_UNMOUNT_TIMEOUT_SECONDS',),
     COMPUTE_AGENT_TIMEOUT_SECONDS,
+)
+# The controller's wait on /scrub. The agent's own kill deadline is a separate
+# variable (COMPUTE_AGENT_SCRUB_TIMEOUT_SECONDS, 10 s) that this must outlast.
+COMPUTE_AGENT_SCRUB_HTTP_TIMEOUT_SECONDS = _env_float_any(
+    ('COMPUTE_AGENT_SCRUB_HTTP_TIMEOUT_SECONDS',),
+    20.0,
+)
+# A release lock this old belongs to a release that died midway: the scrub wait
+# plus the few API calls after it fit well inside. Cleanup then deletes the Pod
+# the lock still holds, since nothing else would. 0 disables.
+RELEASE_LOCK_STALE_SECONDS = _env_float_any(
+    ('RELEASE_LOCK_STALE_SECONDS',),
+    COMPUTE_AGENT_SCRUB_HTTP_TIMEOUT_SECONDS + 40.0,
 )
 
 LANGUAGE_CODE = 'ko-kr'

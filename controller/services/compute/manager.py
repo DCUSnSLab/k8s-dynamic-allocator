@@ -203,20 +203,56 @@ class ComputeManager:
         self,
         compute_pod: str,
         request_context: Optional[Dict[str, object]] = None,
+        expected_status: Optional[str] = None,
+        expected_ticket_id: str = "",
     ) -> Dict:
         return self.releaser.release_compute_pod(
             compute_pod=compute_pod,
             request_context=request_context,
+            expected_status=expected_status,
+            expected_ticket_id=expected_ticket_id,
         )
 
     def release_unreachable_compute_pod(
         self,
         compute_pod: str,
         request_context: Optional[Dict[str, object]] = None,
+        expected_status: Optional[str] = None,
+        expected_ticket_id: str = "",
     ) -> Dict:
         return self.releaser.release_unreachable_compute_pod(
             compute_pod=compute_pod,
             request_context=request_context,
+            expected_status=expected_status,
+            expected_ticket_id=expected_ticket_id,
+        )
+
+    def release_stale_locked_compute_pod(
+        self,
+        compute_pod: str,
+        ticket_id: str,
+        stale_lock_token: str,
+        request_context: Optional[Dict[str, object]] = None,
+        unmount: bool = True,
+    ) -> Dict:
+        return self.releaser.release_stale_locked_compute_pod(
+            compute_pod=compute_pod,
+            ticket_id=ticket_id,
+            stale_lock_token=stale_lock_token,
+            request_context=request_context,
+            unmount=unmount,
+        )
+
+    def return_compute_pod(
+        self,
+        compute_pod: str,
+        request_context: Optional[Dict[str, object]] = None,
+        ticket_id: str = "",
+    ) -> Dict:
+        return self.releaser.return_compute_pod(
+            compute_pod=compute_pod,
+            request_context=request_context,
+            ticket_id=ticket_id,
         )
 
     def process_wait_queues(self, compute_type: Optional[str] = None) -> Dict:

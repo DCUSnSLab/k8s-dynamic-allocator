@@ -185,6 +185,18 @@ class Orchestrator:
             request_context=request_context,
         )
 
+    def return_compute_pod(
+        self,
+        compute_pod: str,
+        request_context: Optional[Dict[str, object]] = None,
+        ticket_id: str = "",
+    ) -> Dict:
+        return self.compute_manager.return_compute_pod(
+            compute_pod=compute_pod,
+            request_context=request_context,
+            ticket_id=ticket_id,
+        )
+
     def process_wait_queues(self) -> Dict:
         return self.compute_manager.process_wait_queues()
 

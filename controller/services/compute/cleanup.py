@@ -1,10 +1,10 @@
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from config import settings
 
-from ..queue import QueueUnavailableError
+from ..queue import QueueUnavailableError, release_lock_age_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -14,12 +14,15 @@ class ComputeCleanup:
 
     A Compute Pod goes back to the buffer when the User Pod behind it is gone, or
     when its agent has been NotReady past the grace period -- nothing in
-    Kubernetes replaces a NotReady Pod on its own.
+    Kubernetes replaces a NotReady Pod on its own. An assigned Pod whose
+    release died holding the ticket's release lock is deleted too, since no
+    other release would ever get past that lock.
 
     Runs independently of the allocation path. Tolerates partial failure:
     if the Redis queue is unavailable, stale-ticket recovery is skipped
-    but buffer-level orphan cleanup still proceeds so that compute pods bound
-    to dead users are released.
+    but buffer-level orphan cleanup still proceeds for Pods that carry no
+    ticket. One that does waits for Redis: without the release lock its delete
+    could race the Pod's return to the buffer.
     """
 
     def __init__(self, provider, queues, compute_manager):
@@ -27,6 +30,7 @@ class ComputeCleanup:
         self.queues = queues
         self.compute_manager = compute_manager
         self.not_ready_grace_seconds = settings.COMPUTE_NOT_READY_GRACE_SECONDS
+        self.release_lock_stale_seconds = settings.RELEASE_LOCK_STALE_SECONDS
 
     def check_stale_allocations(self) -> Dict:
         queue_recovered = []
@@ -55,13 +59,29 @@ class ComputeCleanup:
             if compute_pod in journal_released:
                 continue
 
-            reason = self._release_reason(pod_info)
+            # Checked first: a stale lock also turns the ordinary delete below
+            # away as a duplicate, so it would never take such a Pod.
+            stale_lock, stale_age = self._stale_release_lock(pod_info)
+            if stale_lock:
+                reason = "stale_release_lock"
+                if stale_age is not None:
+                    reason = f"stale_release_lock_{int(stale_age)}s"
+            else:
+                reason = self._release_reason(pod_info)
             if not reason:
                 continue
 
+            # This snapshot can be seconds old, and with reuse the Pod may have
+            # been returned and handed to the next user since; the release
+            # re-reads it and leaves it alone if it no longer matches.
+            expected_status, expected_ticket_id = self._snapshot_expectation(pod_info)
             # Names the request this reclaim belongs to, and is handed to the release,
             # which looks it up itself only if this lookup failed.
             request_context = self._assigned_request_context(compute_pod)
+            context_ticket = str((request_context or {}).get("ticket_id") or "").strip()
+            if expected_ticket_id and context_ticket and context_ticket != expected_ticket_id:
+                # Keyed by Pod name, so it may already describe the next user.
+                request_context = {}
             request_label = (request_context or {}).get("request_label") or "-"
             with settings.request_label_scope(request_label):
                 logger.warning(
@@ -73,18 +93,34 @@ class ComputeCleanup:
                     reason,
                 )
                 unready = reason.startswith("not_ready")
-                if unready:
+                if stale_lock:
+                    result = self.compute_manager.release_stale_locked_compute_pod(
+                        compute_pod,
+                        expected_ticket_id,
+                        stale_lock,
+                        request_context=request_context,
+                        # A silent agent would hold the sweep for the whole
+                        # unmount timeout before failing anyway.
+                        unmount=bool(pod_info.get("ready")),
+                    )
+                elif unready:
                     result = self.compute_manager.release_unreachable_compute_pod(
                         compute_pod,
                         request_context=request_context,
+                        expected_status=expected_status,
+                        expected_ticket_id=expected_ticket_id,
                     )
                 else:
                     result = self.compute_manager.release_compute_pod(
                         compute_pod,
                         request_context=request_context,
+                        expected_status=expected_status,
+                        expected_ticket_id=expected_ticket_id,
                     )
 
             if result["status"] == "success":
+                if result.get("outcome") == "ignored":
+                    continue
                 released.append(compute_pod)
                 if unready:
                     unready_released.append(compute_pod)
@@ -124,6 +160,52 @@ class ComputeCleanup:
         if user_status == "Running":
             return ""
         return f"user_pod_{str(user_status).lower()}"
+
+    def _stale_release_lock(self, pod_info: Dict) -> Tuple[str, Optional[float]]:
+        """The release lock an assigned Pod's ticket holds past the stale age, or "".
+
+        A release in progress holds the lock only for as long as its scrub and
+        the few API calls after it; older than that, the release died midway
+        and left the Pod assigned with nothing to retry it. A lock whose age
+        cannot be read was not written by a release still running, so it
+        counts as stale.
+        """
+        if (
+            self.release_lock_stale_seconds <= 0
+            or pod_info.get("buffer_status") != "assigned"
+            or pod_info.get("terminating")
+        ):
+            return "", None
+        ticket_id = str(pod_info.get("allocation_ticket_id") or "").strip()
+        if not ticket_id:
+            return "", None
+
+        try:
+            token = self.compute_manager.tickets.get_release_lock(ticket_id)
+        except QueueUnavailableError as exc:
+            logger.debug(
+                "[ReleaseLockCheckSkipped] ticket_id=%s reason=%r",
+                ticket_id,
+                str(exc),
+            )
+            return "", None
+        if not token:
+            return "", None
+        age = release_lock_age_seconds(token)
+        if age is not None and age < self.release_lock_stale_seconds:
+            return "", None
+        return token, age
+
+    @staticmethod
+    def _snapshot_expectation(pod_info: Dict) -> Tuple[Optional[str], str]:
+        """The status (and, if assigned, ticket) the release must still find."""
+        status = pod_info.get("buffer_status")
+        if status == "assigned":
+            return status, str(pod_info.get("allocation_ticket_id") or "").strip()
+        if status == "available":
+            return status, ""
+        # No label to hold the Pod to; such a Pod is never handed to anyone.
+        return None, ""
 
     def _assigned_request_context(self, compute_pod: str) -> Optional[Dict]:
         """The request a Pod was handed to: {} if it never was, None if Redis is down."""

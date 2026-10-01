@@ -1,17 +1,23 @@
 import ipaddress
 import json
 import logging
+import threading
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from django.http import HttpRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
+from config import settings
 from config.settings import DEFAULT_COMPUTE_TYPE, build_request_label, set_request_label
 
 logger = logging.getLogger(__name__)
+
+# Releases that mean "this user is done": in the reuse arm these hand the Pod
+# back. Every other release still deletes it.
+_RETURN_SOURCES = {"user_release", "compute_fallback"}
 
 
 def _get_orchestrator():
@@ -67,6 +73,35 @@ def _clean_optional_string(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip()
+
+
+def _start_return(
+    orchestrator,
+    compute_pod: str,
+    request_context: Optional[Dict[str, Any]],
+    ticket_id: str,
+    request_label: str,
+) -> None:
+    def _run() -> None:
+        # The label is thread-local, so the request's own does not follow.
+        set_request_label(request_label or "-")
+        try:
+            orchestrator.return_compute_pod(
+                compute_pod,
+                request_context=request_context,
+                ticket_id=ticket_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[Failed] operation=return compute_pod=%s reason=%r",
+                compute_pod,
+                str(exc),
+                exc_info=True,
+            )
+        finally:
+            set_request_label("-")
+
+    threading.Thread(target=_run, name="compute-return", daemon=True).start()
 
 
 @csrf_exempt
@@ -262,6 +297,35 @@ def release_compute_pod(request: HttpRequest) -> HttpResponse:
         if not compute_pod:
             return _error_response("compute_pod is required")
 
+        caller_hints = {}
+        for hint_key in ("ticket_id", "compute_type", "user_pod", "request_label", "reason", "source"):
+            hint_value = _clean_optional_string(data.get(hint_key))
+            if hint_value:
+                caller_hints[hint_key] = hint_value
+
+        caller_ticket_id = caller_hints.get("ticket_id", "")
+        returning = (
+            settings.COMPUTE_ALLOCATION_MODE == "warm_buffer_reuse"
+            and caller_hints.get("source") in _RETURN_SOURCES
+        )
+        if returning and not caller_ticket_id:
+            # The Pod may already serve the next user, and only the ticket tells
+            # this user's release from a late one, so nothing is touched. Checked
+            # before the Pod's context is read: it could carry the next user's label.
+            set_request_label(caller_hints.get("request_label") or caller_hints.get("user_pod") or compute_pod)
+            logger.info(
+                "[ReleaseIgnored] compute_pod=%s ticket_id=- pod_ticket_id=- reason=no_ticket",
+                compute_pod,
+            )
+            return json_response(
+                {
+                    "status": "accepted",
+                    "outcome": "ignored",
+                    "message": f"Return ignored (no_ticket): {compute_pod}",
+                },
+                status=202,
+            )
+
         try:
             request_context = orchestrator.get_assigned_request_context(compute_pod)
         except Exception as exc:
@@ -272,11 +336,16 @@ def release_compute_pod(request: HttpRequest) -> HttpResponse:
             )
             request_context = None
 
-        caller_hints = {}
-        for hint_key in ("ticket_id", "compute_type", "user_pod", "request_label", "reason", "source"):
-            hint_value = _clean_optional_string(data.get(hint_key))
-            if hint_value:
-                caller_hints[hint_key] = hint_value
+        if (
+            returning
+            and request_context
+            and caller_ticket_id
+            and _clean_optional_string(request_context.get("ticket_id")) != caller_ticket_id
+        ):
+            # Keyed by Pod name, so after a return it can be the next user's;
+            # a late release must not log under or act on their request.
+            request_context = None
+
         if caller_hints:
             if request_context is None:
                 request_context = caller_hints
@@ -297,6 +366,19 @@ def release_compute_pod(request: HttpRequest) -> HttpResponse:
         request_label = _clean_optional_string((request_context or {}).get("request_label"))
         if request_label:
             set_request_label(request_label)
+
+        if returning:
+            # The scrub can outlast the client's 2 s timeout, and its retries
+            # would hold the user's slot longer than the delete arm does, so the
+            # two arms would not see the same load. Answered before the work.
+            _start_return(orchestrator, compute_pod, request_context, caller_ticket_id, request_label)
+            return json_response(
+                {
+                    "status": "accepted",
+                    "message": f"Return accepted: {compute_pod}",
+                },
+                status=202,
+            )
 
         result = orchestrator.release_compute_pod(compute_pod, request_context=request_context)
         status_code = 200 if result["status"] == "success" else 500

@@ -10,6 +10,7 @@ import glob
 import logging
 import os
 import yaml
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from kubernetes import client
@@ -44,8 +45,10 @@ class WarmBufferProvider(KubernetesClient):
     `app` identifies compute pods managed by this controller.
     `compute-status` is part of the Deployment selector, so changing it from
     available -> assigned removes a pod from warm-buffer membership while keeping
-    the compute identity labels intact. Released assigned pods are deleted so
-    the Deployment can backfill a new Ready warm pod.
+    the compute identity labels intact. A pod its user released is scrubbed and
+    returned (available again, so the Deployment owns it once more); every other
+    released assigned pod is deleted so the Deployment can backfill a new Ready
+    warm pod.
     """
 
     LABEL_APP = "app"
@@ -62,6 +65,8 @@ class WarmBufferProvider(KubernetesClient):
     ANNOTATION_BUFFER_CAPACITY = BUFFER_CAPACITY_ANNOTATION
     ANNOTATION_ALLOCATION_TICKET = "k8s-dynamic-allocator/allocation-ticket-id"
     ANNOTATION_ALLOCATION_CLAIM = "k8s-dynamic-allocator/allocation-claim-token"
+    ANNOTATION_REUSE_COUNT = "k8s-dynamic-allocator/reuse-count"
+    ANNOTATION_AVAILABLE_SINCE = "k8s-dynamic-allocator/available-since"
 
     _cached_owner_ref = None
     _owner_ref_resolved = False
@@ -98,6 +103,38 @@ class WarmBufferProvider(KubernetesClient):
             if condition.type == "Ready" and condition.status == "True":
                 return getattr(condition, "last_transition_time", None)
         return None
+
+    @classmethod
+    def _pod_available_at(cls, pod):
+        """When a Ready Pod last became available to allocation.
+
+        A returned Pod stays Ready throughout its reuse, so its Ready time is
+        its first boot; the later return time is what a waiting request saw.
+        """
+        ready_at = cls._pod_ready_at(pod)
+        annotations = getattr(pod.metadata, "annotations", None) or {}
+        raw = (annotations.get(cls.ANNOTATION_AVAILABLE_SINCE) or "").strip()
+        if not raw:
+            return ready_at
+        try:
+            available_since = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return ready_at
+        if available_since.tzinfo is None:
+            available_since = available_since.replace(tzinfo=timezone.utc)
+        if ready_at is None:
+            return available_since
+        try:
+            return max(ready_at, available_since)
+        except TypeError:
+            # A naive Ready time cannot be ordered against it; one bad value
+            # must not take the whole snapshot down.
+            return ready_at
+
+    @staticmethod
+    def _annotation_path(key: str) -> str:
+        # JSON Pointer escaping (RFC 6901): annotation keys carry a "/".
+        return "/metadata/annotations/" + key.replace("~", "~0").replace("/", "~1")
 
     def _validate_compute_manifest(self, spec: Dict) -> str:
         metadata = spec.get("metadata", {})
@@ -571,7 +608,9 @@ class WarmBufferProvider(KubernetesClient):
                     {
                         "name": getattr(metadata, "name", "") or "",
                         "ip": getattr(status, "pod_ip", "") or "",
-                        "ready_at": self._pod_ready_at(pod),
+                        # Feeds P_ready: a returned Pod must count from its
+                        # return, not from the boot it is still Ready since.
+                        "ready_at": self._pod_available_at(pod),
                         "creation_timestamp": getattr(
                             metadata, "creation_timestamp", None
                         ),
@@ -744,6 +783,73 @@ class WarmBufferProvider(KubernetesClient):
             if e.status in (404, 409, 422):
                 raise PodConflictError(
                     f"{pod_name} is no longer assignable"
+                ) from e
+            raise
+
+    def return_pod(
+        self,
+        pod_name: str,
+        ticket_id: str,
+        reuse_count: int,
+        available_since: str,
+    ) -> None:
+        """
+        Hand a scrubbed assigned pod back to the warm buffer.
+
+        Restoring compute-status=available puts the pod back under the
+        Deployment selector, so its ReplicaSet adopts it again; ownerReferences
+        and pod-template-hash are left for the ReplicaSet to settle. The ticket
+        test refuses a pod that has since moved to another ticket. There is no
+        resourceVersion test: the kubelet keeps writing status while the scrub
+        runs, which would fail it for no reason.
+        """
+        ticket_path = self._annotation_path(self.ANNOTATION_ALLOCATION_TICKET)
+        patch = [
+            {
+                "op": "test",
+                "path": "/metadata/labels/compute-status",
+                "value": self.STATUS_ASSIGNED,
+            },
+            {"op": "test", "path": ticket_path, "value": ticket_id},
+            {
+                "op": "replace",
+                "path": "/metadata/labels/compute-status",
+                "value": self.STATUS_AVAILABLE,
+            },
+            {"op": "replace", "path": "/metadata/labels/assigned-user", "value": ""},
+            # assign_pod always writes the ticket and claim annotations together.
+            {"op": "remove", "path": ticket_path},
+            {
+                "op": "remove",
+                "path": self._annotation_path(self.ANNOTATION_ALLOCATION_CLAIM),
+            },
+            {
+                "op": "add",
+                "path": self._annotation_path(self.ANNOTATION_REUSE_COUNT),
+                "value": str(reuse_count),
+            },
+            {
+                "op": "add",
+                "path": self._annotation_path(self.ANNOTATION_AVAILABLE_SINCE),
+                "value": available_since,
+            },
+        ]
+        try:
+            self.v1.api_client.call_api(
+                "/api/v1/namespaces/{namespace}/pods/{name}",
+                "PATCH",
+                path_params={"namespace": self.namespace, "name": pod_name},
+                body=patch,
+                header_params={"Content-Type": "application/json-patch+json"},
+                auth_settings=["BearerToken"],
+                _return_http_data_only=True,
+                _preload_content=True,
+                _request_timeout=self.api_request_timeout,
+            )
+        except ApiException as e:
+            if e.status in (404, 409, 422):
+                raise PodConflictError(
+                    f"{pod_name} is no longer assigned to ticket {ticket_id}"
                 ) from e
             raise
 
