@@ -147,6 +147,12 @@ def pod_summary(pod: dict[str, Any]) -> dict[str, Any] | None:
     spec = pod.get("spec") or {}
     status = pod.get("status") or {}
     containers = spec.get("containers") or []
+    ready_condition = next(
+        (c for c in status.get("conditions") or [] if c.get("type") == "Ready"), {}
+    )
+    owner = next(
+        (o for o in metadata.get("ownerReferences") or [] if o.get("controller")), {}
+    )
     return {
         "name": metadata.get("name"),
         "uid": metadata.get("uid"),
@@ -155,11 +161,18 @@ def pod_summary(pod: dict[str, Any]) -> dict[str, Any] | None:
         "compute_type": labels.get("compute-type"),
         "node": spec.get("nodeName"),
         "phase": status.get("phase"),
-        "ready": any(
-            condition.get("type") == "Ready" and condition.get("status") == "True"
-            for condition in status.get("conditions") or []
-        ),
+        "ready": ready_condition.get("status") == "True",
+        # When readiness last changed. A pod handed back for reuse keeps its
+        # first Ready time, so this is the only record of how old it is.
+        "ready_since": ready_condition.get("lastTransitionTime"),
         "deleting": bool(metadata.get("deletionTimestamp")),
+        # Tells who deleted a pod: the controller deletes with a grace of 0, a
+        # ReplicaSet with the pod's default (30). Kubernetes Events that would
+        # say so expire within about an hour, so it has to be caught here.
+        "deletion_grace_seconds": metadata.get("deletionGracePeriodSeconds"),
+        # ReplicaSet while a buffer member, nothing once assigned. A pod that
+        # gains an owner again was adopted back into the buffer.
+        "owner_kind": owner.get("kind"),
         "created_at": metadata.get("creationTimestamp"),
         "cpu_limit": _sum_quantity(containers, "limits", "cpu"),
         "cpu_request": _sum_quantity(containers, "requests", "cpu"),
