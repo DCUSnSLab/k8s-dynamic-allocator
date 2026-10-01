@@ -20,7 +20,7 @@ import json
 import re
 import statistics
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
@@ -38,6 +38,9 @@ CONTROLLER_EVENT_RE = re.compile(
 )
 REQUEST_ID_RE = re.compile(r"request_id=(?P<request_id>[^\s;'\"]+)")
 KEY_VALUE_RE = re.compile(r"(?P<key>[a-z_]+)=(?P<value>\S+)")
+# Non-numeric controller fields worth keeping. outcome is written only by an
+# arm that can hand a pod back instead of deleting it.
+TEXT_FIELDS = {"compute_pod", "outcome"}
 
 
 @dataclass
@@ -48,9 +51,23 @@ class PodLife:
     memory_limit: float
     start: datetime
     ready_at: datetime | None = None
-    assigned_at: datetime | None = None
     deleting_at: datetime | None = None
     gone_at: datetime | None = None
+    # Seen in the first snapshot, so it was not created during the run.
+    preexisting: bool = False
+    deletion_grace_seconds: int | None = None
+    # One [status, start, end] per stretch spent as "available" or "assigned".
+    # A deleted pod is assigned at most once, but a pod handed back for reuse
+    # goes assigned -> available -> assigned, and keeping only the first
+    # assignment would count it as held the whole time.
+    spans: list[list[Any]] = field(default_factory=list)
+
+    @property
+    def assigned_at(self) -> datetime | None:
+        return next((s[1] for s in self.spans if s[0] == "assigned"), None)
+
+    def stretches(self, status: str) -> list[tuple[datetime, datetime | None]]:
+        return [(s[1], s[2]) for s in self.spans if s[0] == status]
 
 
 def describe_headroom(headroom: dict[str, Any] | None) -> str:
@@ -285,7 +302,18 @@ def assignment_metrics(items: list[dict[str, float]]) -> dict[str, Any]:
         "total_assignment_s": summarize_values(
             [item["since_request_to_assigned_ms"] / 1000.0 for item in items if "since_request_to_assigned_ms" in item]
         ),
+        "release_s": summarize_values([item["release_ms"] / 1000.0 for item in items if "release_ms" in item]),
+        "duplicate_releases": sum(1 for item in items if item.get("released_events", 0) > 1),
+        # Empty unless the arm logs how each release ended (returned or deleted).
+        "release_outcomes": _count(item.get("outcome") for item in items if item.get("outcome")),
     }
+
+
+def _count(values: Iterable[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return counts
 
 
 def pod_metrics(pods: list[PodLife], window: tuple[datetime, datetime], users: int) -> dict[str, Any]:
@@ -307,21 +335,68 @@ def pod_metrics(pods: list[PodLife], window: tuple[datetime, datetime], users: i
         [(p.start, p.deleting_at or _end(p, window)) for p in compute], window
     )
     result["available_pods"] = _level(
-        [(p.ready_at, min(t for t in (p.assigned_at, p.deleting_at, _end(p, window)) if t is not None))
-         for p in compute if p.ready_at is not None],
+        [(max(start, p.ready_at), end or p.deleting_at or _end(p, window))
+         for p in compute if p.ready_at is not None
+         for start, end in p.stretches("available")],
         window,
     )
     result["assigned_pods"] = _level(
-        [(p.assigned_at, p.deleting_at or _end(p, window)) for p in compute if p.assigned_at is not None],
+        [(start, end or p.deleting_at or _end(p, window))
+         for p in compute for start, end in p.stretches("assigned")],
         window,
     )
+    result["compute_churn"] = compute_churn(compute, window)
     return result
+
+
+def compute_churn(compute: list[PodLife], window: tuple[datetime, datetime]) -> dict[str, Any]:
+    """How many compute pods were created per assignment, and who deleted them.
+
+    The reuse comparison rests on creation_saving_ratio. Counting how often a
+    pod was assigned again is not enough: with the same R/N rule the Deployment
+    backfills the moment a pod is assigned, so a returned pod can be reused
+    while the number of pods created stays where it was. Only creations per
+    assignment says whether reuse saved any.
+
+    Pods already there when recording began were not created by the run and
+    are left out of created. Who deleted a pod is read from its grace period:
+    the controller deletes with 0, a ReplicaSet with the pod's default.
+    """
+    def inside(at: datetime | None) -> bool:
+        return at is not None and window[0] <= at < window[1]
+
+    assignments = sum(1 for p in compute for start, _ in p.stretches("assigned") if inside(start))
+    created = sum(1 for p in compute if not p.preexisting and inside(p.start))
+    deleted = [p for p in compute if inside(p.deleting_at)]
+    deleted_by = {"controller": 0, "replicaset": 0, "unknown": 0}
+    for p in deleted:
+        if p.deletion_grace_seconds is None:
+            deleted_by["unknown"] += 1
+        elif p.deletion_grace_seconds == 0:
+            deleted_by["controller"] += 1
+        else:
+            deleted_by["replicaset"] += 1
+    first_assignments = sum(1 for p in compute if inside(p.assigned_at))
+    return {
+        "assignments": assignments,
+        "created": created,
+        # Assignments that landed on a pod already used by an earlier request.
+        "reassignments": assignments - first_assignments,
+        # Created and deleted without serving anyone: a creation paid for nothing.
+        "deleted_never_assigned": sum(1 for p in deleted if p.assigned_at is None and not p.preexisting),
+        "deleted_by": deleted_by,
+        "creation_saving_ratio": (1.0 - created / assignments) if assignments else None,
+    }
 
 
 def build_pod_lives(records: Iterable[dict[str, Any]], run_end: datetime) -> list[PodLife]:
     lives: dict[str, PodLife] = {}
 
-    def observe(pod: dict[str, Any], at: datetime) -> PodLife:
+    def close_span(life: PodLife, at: datetime) -> None:
+        if life.spans and life.spans[-1][2] is None:
+            life.spans[-1][2] = at
+
+    def observe(pod: dict[str, Any], at: datetime, preexisting: bool = False) -> PodLife:
         life = lives.get(pod["uid"])
         if life is None:
             life = PodLife(
@@ -330,28 +405,39 @@ def build_pod_lives(records: Iterable[dict[str, Any]], run_end: datetime) -> lis
                 cpu_limit=float(pod.get("cpu_limit") or 0.0),
                 memory_limit=float(pod.get("memory_limit") or 0.0),
                 start=at,
+                preexisting=preexisting,
             )
             lives[pod["uid"]] = life
         if pod.get("ready") and life.ready_at is None:
             life.ready_at = at
-        if pod.get("compute_status") == "assigned" and life.assigned_at is None:
-            life.assigned_at = at
+        if life.deleting_at is None:
+            status = pod.get("compute_status")
+            current = life.spans[-1][0] if life.spans and life.spans[-1][2] is None else None
+            if status in ("available", "assigned") and status != current:
+                close_span(life, at)
+                life.spans.append([status, at, None])
         if pod.get("deleting") and life.deleting_at is None:
             life.deleting_at = at
+            close_span(life, at)
+        if pod.get("deletion_grace_seconds") is not None:
+            life.deletion_grace_seconds = int(pod["deletion_grace_seconds"])
         return life
 
     def gone(life: PodLife, at: datetime) -> None:
         if life.gone_at is None:
             life.gone_at = at
             life.deleting_at = life.deleting_at or at
+            close_span(life, life.deleting_at)
 
+    first_snapshot = True
     for record in sorted(records, key=lambda item: item["observed_at"]):
         at = _parse_time(record["observed_at"])
         if record["type"] == "SNAPSHOT":
             present = set()
             for pod in record["pods"]:
-                observe(pod, at)
+                observe(pod, at, preexisting=first_snapshot)
                 present.add(pod["uid"])
+            first_snapshot = False
             # Deleted while the watch was reconnecting.
             for uid, life in lives.items():
                 if uid not in present:
@@ -394,11 +480,16 @@ def read_assignments(logs_dir: Path, request_ids: set[str]) -> dict[str, dict[st
                     continue
                 # Assigned and Released describe one session between them, so
                 # their fields are merged rather than overwriting each other.
-                timings.setdefault(label, {}).update({
-                    key: float(value)
-                    for key, value in KEY_VALUE_RE.findall(rest)
-                    if key.endswith("_ms") and _is_number(value)
-                })
+                fields = timings.setdefault(label, {})
+                for key, value in KEY_VALUE_RE.findall(rest):
+                    if key.endswith("_ms") and _is_number(value):
+                        fields[key] = float(value)
+                    elif key in TEXT_FIELDS:
+                        fields[key] = value.rstrip(",;")
+                if event == "Released":
+                    # A pod that is deleted makes a second release a no-op; a pod
+                    # handed back for reuse does not, so repeats are counted.
+                    fields["released_events"] = fields.get("released_events", 0) + 1
     return {request: timings[label] for label, request in label_to_request.items() if label in timings}
 
 
@@ -434,6 +525,11 @@ def print_report(metrics: dict[str, Any]) -> None:
         print(f"waited for a warm pod  {ratio:.1%}  wait s {_fmt(ctl['compute_wait_s'])}" if ratio is not None
               else "waited for a warm pod  n/a")
         print(f"queue wait s  {_fmt(ctl['queue_wait_s'])}")
+        print(f"release s  {_fmt(ctl['release_s'])}")
+        if ctl.get("duplicate_releases"):
+            print(f"requests released more than once  {ctl['duplicate_releases']}")
+        if ctl.get("release_outcomes"):
+            print(f"release outcomes  {ctl['release_outcomes']}")
     if "pods" in overall:
         pods = overall["pods"]
         for group in ("compute", "user"):
@@ -443,6 +539,14 @@ def print_report(metrics: dict[str, Any]) -> None:
         for key in ("compute_pods", "available_pods", "assigned_pods"):
             level = pods[key]
             print(f"{key}  avg {level['avg']:.2f}  max {level['max']}")
+        churn = pods["compute_churn"]
+        saving = churn["creation_saving_ratio"]
+        print(
+            f"compute churn  assignments {churn['assignments']}  created {churn['created']}  "
+            f"reassigned {churn['reassignments']}  deleted unused {churn['deleted_never_assigned']}  "
+            f"deleted by {churn['deleted_by']}  "
+            f"creation saving {'n/a' if saving is None else f'{saving:.1%}'}"
+        )
 
 
 def _level(intervals: list[tuple[datetime, datetime]], window: tuple[datetime, datetime]) -> dict[str, float]:
