@@ -264,6 +264,25 @@ class ComputeQueues:
                 return True
         return False
 
+    def queued_count(self, compute_type: str) -> int:
+        """How many tickets are waiting for a Compute Pod right now.
+
+        The same test has_queued_tickets applies, counting instead of stopping at
+        the first hit. It deliberately skips _repair_queue_membership: that is the
+        write half of the pair, the allocator's drain already repairs on every
+        pass, and a stale id is dropped by the status test here anyway. This runs
+        on every reconcile, so the repair would double the write load for nothing.
+        """
+        compute_type_value = self.normalize_compute_type(compute_type)
+        waiting = 0
+        for ticket_id in self._queue_ids(compute_type_value):
+            ticket = self.tickets.get_ticket_raw(ticket_id)
+            if not ticket:
+                continue
+            if str(ticket.get("status") or "").lower() == "queued":
+                waiting += 1
+        return waiting
+
     def compute_types_with_queued_tickets(self) -> List[str]:
         queued_types = []
         for compute_type in self.known_compute_types():
