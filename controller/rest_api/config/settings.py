@@ -239,6 +239,29 @@ BUFFER_SCALE_DOWN_GATE_RENEW_SECONDS = _env_int_any(
     ('BUFFER_SCALE_DOWN_GATE_RENEW_SECONDS',),
     5,
 )
+# Size the warm buffer from the queue instead of holding a fixed R. Off by
+# default so one build can run both policies and the comparison does not have to
+# span two builds and two days.
+BUFFER_DYNAMIC_RESERVE_ENABLED = _env_bool_any(
+    ('BUFFER_DYNAMIC_RESERVE_ENABLED',),
+    False,
+)
+
+# The cooldown itself is not configured - it is the larger of two observed
+# quantities, the time a Pod takes to become Ready and how long the target stays
+# down before recovering. These two only size the estimator's window: how many
+# recent observations to keep, and the fewest that make a p90 worth trusting.
+# Below the minimum that input is ignored; with neither there is no cooldown,
+# which is only the case at startup while the buffer is still filling.
+BUFFER_SCALE_DOWN_COOLDOWN_SAMPLES = _env_int_any(
+    ('BUFFER_SCALE_DOWN_COOLDOWN_SAMPLES',),
+    50,
+)
+BUFFER_SCALE_DOWN_COOLDOWN_MIN_SAMPLES = _env_int_any(
+    ('BUFFER_SCALE_DOWN_COOLDOWN_MIN_SAMPLES',),
+    10,
+)
+
 BUFFER_SCALE_DOWN_WAIT_TIMEOUT_SECONDS = _env_int_any(
     ('BUFFER_SCALE_DOWN_WAIT_TIMEOUT_SECONDS',),
     10,

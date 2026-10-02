@@ -11,6 +11,23 @@ class ControllerStatus:
         self.tickets = tickets
         self.capacity_reconciler = capacity_reconciler
 
+    def _desired_replicas(self, policy: Dict, buffer_assigned: int) -> int:
+        """What the reconciler would target, so the report cannot disagree with it."""
+        if self.capacity_reconciler is None:
+            return min(int(policy["R"]), max(0, int(policy["N"]) - int(buffer_assigned)))
+        queued = None
+        if getattr(self.capacity_reconciler, "dynamic_reserve", False):
+            try:
+                queued = self.queues.queued_count(policy.get("compute_type") or "")
+            except Exception:
+                queued = None
+        return self.capacity_reconciler.desired_replicas(
+            policy["R"],
+            policy["N"],
+            buffer_assigned,
+            queued,
+        )
+
     def get_buffer_status(self) -> Dict:
         buffer_list = self.provider.list_buffer_status()
 
@@ -121,9 +138,12 @@ class ControllerStatus:
                             "deployment_name": policy["deployment_name"],
                             "R": policy["R"],
                             "N": policy["N"],
-                            "desired_replicas": min(
-                                policy["R"],
-                                max(0, policy["N"] - buffer_assigned),
+                            # The reconciler owns this formula; a copy here went
+                            # stale the moment the buffer could be sized from the
+                            # queue. Falls back to the fixed form only when no
+                            # reconciler was handed in (unit tests do that).
+                            "desired_replicas": self._desired_replicas(
+                                policy, buffer_assigned
                             ),
                             "current_replicas": self.provider.read_deployment_replicas(
                                 policy["deployment_name"]

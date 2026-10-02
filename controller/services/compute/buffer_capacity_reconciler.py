@@ -71,12 +71,179 @@ class BufferCapacityReconciler:
         self._status_lock = threading.Lock()
         self._status: Dict[str, Dict] = {}
 
-    @staticmethod
-    def desired_replicas(buffer_reserve: int, buffer_capacity: int, assigned: int) -> int:
-        return min(
-            int(buffer_reserve),
-            max(0, int(buffer_capacity) - int(assigned)),
+        self.dynamic_reserve = bool(settings.BUFFER_DYNAMIC_RESERVE_ENABLED)
+        self.cooldown_samples = max(
+            1,
+            int(settings.BUFFER_SCALE_DOWN_COOLDOWN_SAMPLES),
         )
+        self.cooldown_min_samples = max(
+            1,
+            int(settings.BUFFER_SCALE_DOWN_COOLDOWN_MIN_SAMPLES),
+        )
+        # 비교군별로: 목표가 가라앉아 있던 시간들(쿨다운 추정에 씀), 진행 중인
+        # 꺼짐의 시작 시각, 쿨다운이 막아낸 축소 횟수. 다른 스레드가 상태를 읽으므로
+        # _churn_lock 으로 보호한다.
+        self._churn_lock = threading.Lock()
+        self._churn: Dict[str, Dict] = {}
+
+    @staticmethod
+    def desired_replicas(
+        buffer_reserve: int,
+        buffer_capacity: int,
+        assigned: int,
+        queued: Optional[int] = None,
+    ) -> int:
+        """How many spare Pods to keep ready.
+
+        queued=None is the fixed policy and stays the default: hold R spares,
+        capped by what capacity is left. A run with the dynamic path off behaves
+        exactly as before.
+
+        With a queue length, R becomes a floor and the queue sets the target, so
+        everyone already waiting has a Pod coming. Still capped by capacity -
+        nothing is created once N is committed, however long the queue is, because
+        there is nowhere to put it.
+        """
+        room = max(0, int(buffer_capacity) - int(assigned))
+        if queued is None:
+            return min(int(buffer_reserve), room)
+        return min(max(int(buffer_reserve), int(queued)), room)
+
+    def _queued_for_target(self, compute_type: str) -> Optional[int]:
+        """Queue length to size the buffer from, or None to keep the fixed policy.
+
+        A Redis hiccup degrades this pass to the fixed policy rather than failing
+        the reconcile: holding R spares is always a safe answer, and the next pass
+        picks the queue up again.
+        """
+        if not self.dynamic_reserve:
+            return None
+        try:
+            return self.queues.queued_count(compute_type)
+        except Exception as exc:
+            logger.warning(
+                "[Warning] operation=buffer_dynamic_reserve_queue compute_type=%s reason=%r",
+                compute_type,
+                str(exc),
+            )
+            return None
+
+    def _churn_state(self, compute_type: str) -> Dict:
+        return self._churn.setdefault(
+            compute_type,
+            {
+                # 목표가 어떤 수준에서 떨어졌다가 그 수준으로 돌아오기까지 걸린
+                # 시간들. 쿨다운 길이를 여기서 추정한다.
+                "dips": [],
+                # 파드 생성 → Ready 에 걸린 시간들. 쿨다운의 바닥을 정한다.
+                "creates": [],
+                # Ready 이벤트는 한 파드에 여러 번 오므로 센 것을 기억한다.
+                "created_seen": [],
+                # 진행 중인 꺼짐: 언제 떨어졌고, 어느 값에서 떨어졌나.
+                "dip_started_at": None,
+                "last_target": None,
+                "held_back": 0,
+                "cooldown": None,
+                # (관측 시각, 그때의 목표). 쿨다운 창 밖으로 나간 것은 버린다.
+                "targets": [],
+            },
+        )
+
+    def cooldown_seconds(self, compute_type: str) -> float:
+        """관측값 두 개의 큰 쪽. 설정에 적힌 숫자가 아니다.
+
+            생성 시간   파드를 다시 세우는 데 걸리는 시간. 줄였다가 바로 필요해지면
+                        사용자가 그만큼 기다린다. 그보다 짧게 기다릴 이유가 없다.
+            꺼짐 길이   목표가 가라앉아 있던 시간. 그 안에 줄이면 되돌려진다.
+
+        둘 다 표본이 모자란 때는 0 을 돌려준다. 그 시점은 기동 직후뿐이고 버퍼를
+        채우는 중이라 줄일 것이 없으므로 위험하지 않다.
+
+        목표가 꺼졌다 돌아오는 시간을 쓰는 이유:
+
+        쿨다운이 답해야 할 질문이 그것이다 - 지금 줄이면 얼마 뒤에 되돌려지는가.
+        목표값은 큐를 그대로 따라가고 쿨다운이 손대지 않으므로, 이 신호는 쿨다운
+        자신의 동작에 오염되지 않는다. 축소에서 재확대까지의 간격을 쓰면 쿨다운이
+        밀어낸 시간이 그 안에 섞여 추정치가 자기 자신을 키운다.
+
+        중앙값이 아니라 높은 분위를 쓴다. 중앙값으로 맞추면 절반의 꺼짐이 쿨다운보다
+        길어 그만큼은 되돌려진다.
+
+        표본이 모이기 전에는 하한을 쓴다. 기동 직후가 그 상태다.
+        """
+        with self._churn_lock:
+            state = self._churn_state(compute_type)
+            dips = sorted(state["dips"])
+            creates = sorted(state["creates"])
+
+        def high(values):
+            if len(values) < self.cooldown_min_samples:
+                return None
+            return float(values[min(len(values) - 1, int(len(values) * 0.9))])
+
+        candidates = [v for v in (high(creates), high(dips)) if v is not None]
+        return max(candidates) if candidates else 0.0
+
+    def _note_target(self, compute_type: str, desired: int, cooldown: float) -> None:
+        """이번 패스의 목표를 적고, 꺼짐이 끝났으면 그 길이를 표본에 넣는다.
+
+        꺼짐은 목표가 내려간 순간 시작되고 올라간 순간 끝난다. 기준값을 고정해
+        "그 수준으로 돌아올 때까지"로 재면, 목표가 계단식으로 내려가 다시 올라오지
+        않는 구간에서 꺼짐이 영구히 열린 채로 남아 그 뒤의 표본을 하나도 못 모은다.
+        재려는 것은 "수요가 가라앉아 있는 시간"이고, 조금이라도 되돌아오면 그 구간은
+        끝난 것으로 보는 편이 보수적이다 - 쿨다운을 짧게 잡는 방향이 아니라 표본을
+        확보하는 방향이다.
+        """
+        now = time.monotonic()
+        target = int(desired)
+        cutoff = now - max(0.0, cooldown)
+        with self._churn_lock:
+            state = self._churn_state(compute_type)
+
+            previous = state["last_target"]
+            if previous is not None:
+                if state["dip_started_at"] is None:
+                    if target < previous:
+                        state["dip_started_at"] = now
+                elif target > previous:
+                    state["dips"].append(now - state["dip_started_at"])
+                    if len(state["dips"]) > self.cooldown_samples:
+                        del state["dips"][: len(state["dips"]) - self.cooldown_samples]
+                    state["dip_started_at"] = None
+            state["last_target"] = target
+
+            targets = state["targets"]
+            targets.append((now, target))
+            while targets and targets[0][0] < cutoff:
+                targets.pop(0)
+
+    def _cooldown_blocks_scale_down(
+        self,
+        compute_type: str,
+        desired: int,
+        cooldown: float,
+    ) -> Optional[float]:
+        """아직 기다려야 하는 초, 또는 줄여도 될 때 None.
+
+        창 안에서 목표가 지금보다 높았던 적이 있으면 아직 출렁이는 중이므로 기다린다.
+        내내 지금 이하였다면 수요가 가라앉은 것이고, 그때의 축소는 되돌려지지 않는다.
+
+        여기에는 "여유가 목표보다 많다"는 경우만 들어온다. 용량 상한이 요구하는 축소는
+        이 함수를 거치지 않으므로 N 이 열린 채로 유지되는 일은 없다.
+        """
+        if cooldown <= 0:
+            return None
+        now = time.monotonic()
+        with self._churn_lock:
+            state = self._churn_state(compute_type)
+            state["cooldown"] = cooldown
+            higher = [(at, value) for at, value in state["targets"] if value > int(desired)]
+            if not higher:
+                return None
+            newest_at = max(at for at, _ in higher)
+            state["held_back"] += 1
+        remaining = cooldown - (now - newest_at)
+        return remaining if remaining > 0 else None
 
     def set_leadership_validator(self, validator: Callable[[], bool]) -> None:
         self._leadership_validator = validator
@@ -167,7 +334,39 @@ class BufferCapacityReconciler:
         labels = getattr(metadata, "labels", None) or {}
         compute_type = labels.get(self.provider.LABEL_COMPUTE_TYPE)
         if compute_type:
+            self._note_create_time(compute_type, pod)
             self.request_reconcile(compute_type)
+
+    def _note_create_time(self, compute_type: str, pod) -> None:
+        """파드가 Ready 가 된 순간, 세우는 데 걸린 시간을 표본에 넣는다.
+
+        쿨다운의 바닥이 되는 값이다. Ready 이벤트는 같은 파드에 여러 번 오므로
+        uid 로 한 번만 센다. 시각이 둘 다 있을 때만 쓰고, 없으면 조용히 넘어간다 -
+        추정기는 표본이 모자라면 스스로 비켜선다.
+        """
+        try:
+            if not self.provider._pod_is_ready(pod):
+                return
+            uid = getattr(getattr(pod, "metadata", None), "uid", None)
+            created = getattr(getattr(pod, "metadata", None), "creation_timestamp", None)
+            ready = self.provider._pod_ready_at(pod)
+            if not uid or created is None or ready is None:
+                return
+            seconds = (ready - created).total_seconds()
+            if seconds < 0:
+                return
+        except Exception:
+            return
+        with self._churn_lock:
+            state = self._churn_state(compute_type)
+            if uid in state["created_seen"]:
+                return
+            state["created_seen"].append(uid)
+            if len(state["created_seen"]) > self.cooldown_samples * 2:
+                del state["created_seen"][: len(state["created_seen"]) - self.cooldown_samples * 2]
+            state["creates"].append(seconds)
+            if len(state["creates"]) > self.cooldown_samples:
+                del state["creates"][: len(state["creates"]) - self.cooldown_samples]
 
     def on_deployment_event(
         self,
@@ -219,6 +418,15 @@ class BufferCapacityReconciler:
     def get_status(self) -> Dict[str, Dict]:
         with self._status_lock:
             return {key: dict(value) for key, value in self._status.items()}
+
+    def _schedule_after(self, delay: float) -> None:
+        """Wake up when the cooldown expires instead of waiting for an event.
+
+        Without this a buffer that went quiet would hold its extra spare until the
+        next resync, which is a minute away.
+        """
+        with self._condition:
+            self._schedule_locked(max(0.0, float(delay)))
 
     def _schedule_locked(self, delay: float) -> None:
         run_at = time.monotonic() + max(0.0, delay)
@@ -637,6 +845,7 @@ class BufferCapacityReconciler:
                 policy["R"],
                 policy["N"],
                 snapshot["buffer_assigned"],
+                self._queued_for_target(compute_type_value),
             )
             current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]
@@ -662,16 +871,45 @@ class BufferCapacityReconciler:
                 self._record_status(compute_type_value, **result)
                 return result
 
-            if current > desired:
-                result = self._scale_down(
-                    compute_type_value,
-                    policy,
-                    base_result,
-                )
-                self._record_status(compute_type_value, **result)
-                return result
+            # Over capacity is an N violation and shrinks at once. Anything else
+            # is just an extra spare and waits out the cooldown, so a buffer that
+            # is merely cautious can never hold N open.
+            room = max(0, int(policy["N"]) - int(snapshot["buffer_assigned"]))
+            over_capacity = current > room
+            cooldown = self.cooldown_seconds(compute_type_value)
+            self._note_target(compute_type_value, desired, cooldown)
 
-            if snapshot["buffer_available"] > desired:
+            if current > desired or snapshot["buffer_available"] > desired:
+                waiting = (
+                    None
+                    if over_capacity
+                    else self._cooldown_blocks_scale_down(
+                        compute_type_value, desired, cooldown
+                    )
+                )
+                if waiting is not None:
+                    logger.info(
+                        "[BufferScaleDownDeferred] compute_type=%s reason=%r "
+                        "desired=%s current=%s available=%s cooldown_s=%.1f "
+                        "remaining_s=%.1f",
+                        compute_type_value,
+                        "target was higher inside the cooldown window",
+                        desired,
+                        current,
+                        snapshot["buffer_available"],
+                        cooldown,
+                        waiting,
+                    )
+                    result = {
+                        **base_result,
+                        "status": "deferred",
+                        "reason": "scale_down_cooldown",
+                        "cooldown_s": round(cooldown, 2),
+                        "cooldown_remaining_s": round(waiting, 2),
+                    }
+                    self._record_status(compute_type_value, **result)
+                    self._schedule_after(waiting)
+                    return result
                 result = self._scale_down(
                     compute_type_value,
                     policy,
@@ -726,6 +964,7 @@ class BufferCapacityReconciler:
                 policy["R"],
                 policy["N"],
                 snapshot["buffer_assigned"],
+                self._queued_for_target(compute_type),
             )
             current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]
@@ -870,6 +1109,7 @@ class BufferCapacityReconciler:
                     policy["R"],
                     policy["N"],
                     snapshot["buffer_assigned"],
+                    self._queued_for_target(compute_type),
                 )
                 current = self.provider.read_deployment_replicas(
                     policy["deployment_name"]
