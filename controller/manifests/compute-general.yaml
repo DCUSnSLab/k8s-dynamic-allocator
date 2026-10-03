@@ -42,11 +42,21 @@ spec:
           periodSeconds: 2
           timeoutSeconds: 1
           failureThreshold: 3
-        # requests == limits: the pod holds exactly what it may use, so its
-        # footprint is unambiguous.
+        # The CPU request is what the work actually uses, not what the limit
+        # allows. Every command the experiment runs is one single-threaded
+        # python process, so a pod cannot exceed one core no matter what the
+        # limit says - measured usage ran at 11-31% of a 2-core request. Asking
+        # for 2 reserved a core that could never be used and capped N at 56 on
+        # this cluster; asking for 1 matches the work and lifts that to 113.
+        #
+        # The limit stays at 2 cores. It is the figure the occupancy numbers are
+        # reported against, so changing it would break comparison with every arm
+        # already measured, and it leaves room for a burst the request does not
+        # reserve. Memory keeps requests == limits: 4Gi is never the binding
+        # constraint here (591GiB free admits 144 pods).
         resources:
           requests:
-            cpu: "2"
+            cpu: "1"
             memory: "4Gi"
           limits:
             cpu: "2"
