@@ -10,6 +10,10 @@ from typing import Dict, Iterable, List, Optional
 
 from config import settings
 
+# 도착 기록을 얼마나 들고 있을지. 창 길이가 아니라 상한이다 - 창은 파드 생성 시간이
+# 정하고 (실측 6.5초), 그보다 훨씬 긴 이 값은 기록이 무한히 쌓이는 것만 막는다.
+ARRIVALS_TTL_SECONDS = 900
+
 try:
     import redis
     from redis.exceptions import RedisError
@@ -139,6 +143,9 @@ class ComputeQueues:
     def _types_key(self) -> str:
         return f"{self.prefix}:types"
 
+    def _arrivals_key(self, compute_type: str) -> str:
+        return f"{self.prefix}:arrivals:{compute_type}"
+
     def _lock_key(self, compute_type: str) -> str:
         return f"{self.prefix}:lock:{compute_type}"
 
@@ -236,6 +243,51 @@ class ComputeQueues:
             if str(ticket.get("status") or "").lower() == "queued":
                 return True
         return False
+
+    def record_arrival(self, compute_type: str, ticket_id: str, pipe=None) -> None:
+        """티켓이 들어온 시각을 남긴다. 버퍼 크기를 정할 때 쓰는 유일한 수요 신호다.
+
+        큐 길이가 아니라 도착 시각을 쓰는 이유는 둘이 재는 것이 다르기 때문이다.
+        큐 길이는 공급이 모자랐던 결과가 쌓인 양이고 (리틀의 법칙으로 λ x 대기시간),
+        버퍼가 덮어야 하는 것은 파드 하나를 세우는 동안 새로 오는 양 (λ x 생성시간)
+        이다. 실측에서 대기시간이 195초, 생성시간이 6.5초였으니 큐 길이를 그대로
+        목표로 삼으면 30배 과대 추정이 된다.
+
+        파이프라인을 받으면 거기 실어 티켓 생성과 원자적으로 묶는다.
+        """
+        key = self._arrivals_key(self.normalize_compute_type(compute_type))
+        now_ms = time.time() * 1000.0
+        target = pipe if pipe is not None else self._redis_client()
+        target.zadd(key, {ticket_id: now_ms})
+        if pipe is None:
+            try:
+                target.expire(key, ARRIVALS_TTL_SECONDS)
+            except RedisError:
+                pass
+        else:
+            target.expire(key, ARRIVALS_TTL_SECONDS)
+
+    def arrival_count(self, compute_type: str, window_seconds: float) -> int:
+        """최근 window_seconds 동안 들어온 티켓 수.
+
+        추정이 아니라 관측이다. window 로 파드 생성 시간을 주면 "지금 파드를 세우기
+        시작하면 그것이 준비될 때까지 몇 건이 더 오는가"가 그대로 나오고, 그 수만큼
+        미리 떠 있으면 아무도 생성을 기다리지 않는다.
+
+        창 밖으로 나간 기록은 읽을 때 정리한다. 키에 TTL 도 걸려 있어 큐가 조용해지면
+        알아서 사라진다.
+        """
+        if window_seconds <= 0:
+            return 0
+        key = self._arrivals_key(self.normalize_compute_type(compute_type))
+        now_ms = time.time() * 1000.0
+        client = self._redis_client()
+        oldest_ms = now_ms - (ARRIVALS_TTL_SECONDS * 1000.0)
+        try:
+            client.zremrangebyscore(key, 0, oldest_ms)
+        except RedisError:
+            pass
+        return int(client.zcount(key, now_ms - window_seconds * 1000.0, now_ms))
 
     def queued_count(self, compute_type: str) -> int:
         """How many tickets are waiting for a Compute Pod right now.

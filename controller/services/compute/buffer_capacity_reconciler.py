@@ -91,42 +91,71 @@ class BufferCapacityReconciler:
         buffer_reserve: int,
         buffer_capacity: int,
         assigned: int,
-        queued: Optional[int] = None,
+        demand: Optional[int] = None,
     ) -> int:
         """How many spare Pods to keep ready.
 
-        queued=None is the fixed policy and stays the default: hold R spares,
+        demand=None is the fixed policy and stays the default: hold R spares,
         capped by what capacity is left. A run with the dynamic path off behaves
         exactly as before.
 
-        With a queue length, R becomes a floor and the queue sets the target, so
-        everyone already waiting has a Pod coming. Still capped by capacity -
-        nothing is created once N is committed, however long the queue is, because
-        there is nowhere to put it.
+        With a demand figure, R becomes a floor and demand sets the target. The
+        figure to pass is how many requests arrive while one Pod is being built -
+        hold that many and nobody waits on a creation. Queue length is the wrong
+        input even though it measures the same shortage: by Little's law a queue
+        is arrival rate x *waiting* time, and waiting time was 195s against a 6.5s
+        creation time, so sizing the buffer by the queue overshoots ~30x. The runs
+        that did exactly that built 844 Pods they never used and held N open 11.9%
+        of the time.
+
+        Still capped by capacity - nothing is created once N is committed, however
+        large demand is, because there is nowhere to put it.
         """
         room = max(0, int(buffer_capacity) - int(assigned))
-        if queued is None:
+        if demand is None:
             return min(int(buffer_reserve), room)
-        return min(max(int(buffer_reserve), int(queued)), room)
+        return min(max(int(buffer_reserve), int(demand)), room)
 
-    def _queued_for_target(self, compute_type: str) -> Optional[int]:
-        """Queue length to size the buffer from, or None to keep the fixed policy.
+    def _demand_for_target(self, compute_type: str) -> Optional[int]:
+        """생성 시간 동안 들어온 요청 수, 또는 고정 정책을 유지할 때 None.
 
-        A Redis hiccup degrades this pass to the fixed policy rather than failing
-        the reconcile: holding R spares is always a safe answer, and the next pass
-        picks the queue up again.
+        창의 길이는 설정이 아니라 관측한 파드 생성 시간이다. 그래서 느린 노드나 큰
+        이미지에서는 창이 저절로 넓어지고 더 많은 여유를 들고, 빠른 환경에서는 좁아져
+        적게 든다. 다시 측정하지 않아도 환경을 따라간다.
+
+        표본이 모자라 생성 시간을 모르는 동안은 None 을 돌려 고정 정책으로 둔다.
+        그 시점은 기동 직후뿐이고 그때는 버퍼를 채우는 중이라 위험하지 않다.
+
+        Redis 가 흔들리면 이번 패스만 고정 정책으로 물러난다 - R 개를 드는 것은 언제나
+        안전한 답이고, 다음 패스가 다시 읽는다.
         """
         if not self.dynamic_reserve:
             return None
+        window = self.create_time_seconds(compute_type)
+        if window <= 0:
+            return None
         try:
-            return self.queues.queued_count(compute_type)
+            return self.queues.arrival_count(compute_type, window)
         except Exception as exc:
             logger.warning(
-                "[Warning] operation=buffer_dynamic_reserve_queue compute_type=%s reason=%r",
+                "[Warning] operation=buffer_dynamic_reserve_demand compute_type=%s reason=%r",
                 compute_type,
                 str(exc),
             )
             return None
+
+    def create_time_seconds(self, compute_type: str) -> float:
+        """파드를 세우는 데 걸린 시간의 높은 분위. 표본이 모자라면 0.
+
+        쿨다운과 수요 창이 둘 다 이 값을 쓴다 - 한쪽은 "이보다 짧게 기다리고 줄이지
+        마라", 다른 쪽은 "이 시간 동안 오는 만큼 들고 있어라"로, 묻는 질문은 다르지만
+        근거가 되는 시간은 같다.
+        """
+        with self._churn_lock:
+            creates = sorted(self._churn_state(compute_type)["creates"])
+        if len(creates) < self.cooldown_min_samples:
+            return 0.0
+        return float(creates[min(len(creates) - 1, int(len(creates) * 0.9))])
 
     def _churn_state(self, compute_type: str) -> Dict:
         return self._churn.setdefault(
@@ -172,16 +201,15 @@ class BufferCapacityReconciler:
         표본이 모이기 전에는 하한을 쓴다. 기동 직후가 그 상태다.
         """
         with self._churn_lock:
-            state = self._churn_state(compute_type)
-            dips = sorted(state["dips"])
-            creates = sorted(state["creates"])
+            dips = sorted(self._churn_state(compute_type)["dips"])
 
         def high(values):
             if len(values) < self.cooldown_min_samples:
                 return None
             return float(values[min(len(values) - 1, int(len(values) * 0.9))])
 
-        candidates = [v for v in (high(creates), high(dips)) if v is not None]
+        create = self.create_time_seconds(compute_type) or None
+        candidates = [v for v in (create, high(dips)) if v is not None]
         return max(candidates) if candidates else 0.0
 
     def _note_target(self, compute_type: str, desired: int, cooldown: float) -> None:
@@ -845,7 +873,7 @@ class BufferCapacityReconciler:
                 policy["R"],
                 policy["N"],
                 snapshot["buffer_assigned"],
-                self._queued_for_target(compute_type_value),
+                self._demand_for_target(compute_type_value),
             )
             current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]
@@ -964,11 +992,38 @@ class BufferCapacityReconciler:
                 policy["R"],
                 policy["N"],
                 snapshot["buffer_assigned"],
-                self._queued_for_target(compute_type),
+                self._demand_for_target(compute_type),
             )
             current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]
             )
+
+            # N 을 넘지 않는 마지막 관문. 목표 공식은 N - assigned 로 이미 묶여 있지만
+            # 그것만으로는 부족하다 - 파드가 배정되면 ReplicaSet 의 selector 에서 빠지고
+            # ReplicaSet 은 replicas 를 맞추려 한 개를 더 만든다. 배정 자체는 available
+            # 을 assigned 로 옮길 뿐이라 합이 그대로인데, 이 backfill 이 합을 올린다.
+            # 목표를 낮춰 두면 다음 패스가 금방 따라잡지만, 삭제가 늦거나 락이 밀리는
+            # 순간에는 그 사이에 넘을 수 있다.
+            #
+            # buffer_total 은 terminating 을 뺀 available + assigned 다. 삭제 중인 파드는
+            # 자리를 곧 비우므로 세지 않는다 - 상한이 지켜야 하는 것은 "일하고 있는 것과
+            # 그것을 기다리는 것"의 합이다. 그 수가 N 을 넘게 만드는 확대는 하지 않는다.
+            headroom = int(policy["N"]) - int(snapshot["buffer_total"])
+            if desired > current and desired - current > headroom:
+                capped = current + max(0, headroom)
+                if capped != desired:
+                    logger.info(
+                        "[BufferScaleUpCapped] compute_type=%s desired=%s->%s "
+                        "current=%s total=%s N=%s",
+                        compute_type,
+                        desired,
+                        capped,
+                        current,
+                        snapshot["buffer_total"],
+                        policy["N"],
+                    )
+                desired = capped
+
             refreshed = {
                 **base_result,
                 "R": policy["R"],
@@ -1109,7 +1164,7 @@ class BufferCapacityReconciler:
                     policy["R"],
                     policy["N"],
                     snapshot["buffer_assigned"],
-                    self._queued_for_target(compute_type),
+                    self._demand_for_target(compute_type),
                 )
                 current = self.provider.read_deployment_replicas(
                     policy["deployment_name"]

@@ -59,9 +59,14 @@ def main():
 
     while running:
         cycle_started = time.monotonic()
-        busy_until = cycle_started + args.cpu_busy_seconds
+        # 벽시계가 아니라 CPU 시간으로 센다. user pod 의 CPU limit 은 200m 이고 이
+        # 루프는 단일 스레드라 1코어를 요구하므로, 도는 내내 throttle 된다. 벽시계로
+        # 재면 0.2초가 지나는 동안 CPU 는 40ms 밖에 못 써서 의도한 부하의 1/5 만
+        # 걸렸다 (의도 20m, 실측 평균 4~8m). CPU 시간으로 세면 throttle 되는 만큼
+        # 벽시계가 늘어날 뿐 걸리는 부하는 설정한 값 그대로다.
+        cpu_started = time.process_time()
         i = 0
-        while running and time.monotonic() < busy_until:
+        while running and time.process_time() - cpu_started < args.cpu_busy_seconds:
             checksum += math.sqrt(i % 1000000)
             i += 1
 

@@ -52,13 +52,18 @@ spec:
         # run measured, and a run with the wrong label is worse than no run.
         - name: COMPUTE_ALLOCATION_MODE
           value: warm_buffer
+        # The reconciler runs on the leader only, so adding replicas does not
+        # share this work - the limit has to carry it. At N=100 the leader sat at
+        # 377m against a 500m limit and spent 59-63% of its CPU periods throttled,
+        # which shows up as allocation falling behind the load it is meant to
+        # measure. Two cores leaves room for the buffer sizes a large N asks for.
         resources:
           requests:
-            cpu: "100m"
-            memory: "128Mi"
-          limits:
             cpu: "500m"
-            memory: "512Mi"
+            memory: "256Mi"
+          limits:
+            cpu: "2"
+            memory: "1Gi"
 
 ---
 

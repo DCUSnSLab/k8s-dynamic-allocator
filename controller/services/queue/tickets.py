@@ -183,6 +183,9 @@ class Tickets:
             )
             pipe.sadd(self.queue._active_key(compute_type_value), ticket_id_value)
             pipe.sadd(self.queue._types_key(), compute_type_value)
+            # 도착 시각. 버퍼 크기를 정하는 수요 신호이고, 티켓과 같은 트랜잭션에
+            # 실어 둘이 어긋나지 않게 한다.
+            self.queue.record_arrival(compute_type_value, ticket_id_value, pipe=pipe)
             pipe.execute()
             return self.get_ticket(ticket_id_value) or {"ticket_id": ticket_id_value, **ticket}
         except RedisError as exc:
