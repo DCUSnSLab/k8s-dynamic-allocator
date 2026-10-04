@@ -131,7 +131,7 @@ class BufferCapacityReconciler:
         """
         if not self.dynamic_reserve:
             return None
-        window = self.create_time_seconds(compute_type)
+        window = self.create_time_seconds(compute_type, self.DEMAND_WINDOW_QUANTILE)
         if window <= 0:
             return None
         try:
@@ -144,18 +144,30 @@ class BufferCapacityReconciler:
             )
             return None
 
-    def create_time_seconds(self, compute_type: str) -> float:
-        """파드를 세우는 데 걸린 시간의 높은 분위. 표본이 모자라면 0.
+    # 수요 창에 쓰는 분위. 낮은 쪽을 쓰는 이유는 이 값이 자기 출력에 오염되기
+    # 때문이다. 버퍼가 파드를 많이 만들면 kubelet 큐가 길어져 생성이 느려지고,
+    # 높은 분위를 창으로 쓰면 그 느려진 시간이 창을 넓혀 더 많이 세고 더 만든다.
+    # 실측에서 이 되먹임이 p90 을 7초에서 63초로 밀어 목표를 126 까지 띄웠다.
+    # 같은 실행의 p10 은 3.8초 대 7.3초로 1.9배에 그친다 - 한산한 순간의 생성은
+    # 혼잡해도 여전히 빠르기 때문이다.
+    DEMAND_WINDOW_QUANTILE = 0.1
+    # 쿨다운에 쓰는 분위. 여기서는 높은 쪽이 맞다 - "줄였다가 되돌려지지 않으려면
+    # 얼마나 기다려야 하나"의 답이고, 중앙값으로 맞추면 절반은 되돌려진다.
+    COOLDOWN_QUANTILE = 0.9
 
-        쿨다운과 수요 창이 둘 다 이 값을 쓴다 - 한쪽은 "이보다 짧게 기다리고 줄이지
-        마라", 다른 쪽은 "이 시간 동안 오는 만큼 들고 있어라"로, 묻는 질문은 다르지만
-        근거가 되는 시간은 같다.
+    def create_time_seconds(self, compute_type: str, quantile: float = COOLDOWN_QUANTILE) -> float:
+        """파드를 세우는 데 걸린 시간의 분위수. 표본이 모자라면 0.
+
+        쿨다운과 수요 창이 같은 표본을 보지만 다른 분위를 가져간다. 묻는 질문이
+        다르기 때문이다 - 쿨다운은 "최악에 가까울 때 얼마나 걸리나", 창은 "이 환경이
+        막히지 않았을 때 얼마나 걸리나" 를 묻는다. 뒤쪽이 낮은 분위여야 하는 이유는
+        DEMAND_WINDOW_QUANTILE 에 적어 두었다.
         """
         with self._churn_lock:
             creates = sorted(self._churn_state(compute_type)["creates"])
         if len(creates) < self.cooldown_min_samples:
             return 0.0
-        return float(creates[min(len(creates) - 1, int(len(creates) * 0.9))])
+        return float(creates[min(len(creates) - 1, int(len(creates) * quantile))])
 
     def _churn_state(self, compute_type: str) -> Dict:
         return self._churn.setdefault(
@@ -902,8 +914,18 @@ class BufferCapacityReconciler:
             # Over capacity is an N violation and shrinks at once. Anything else
             # is just an extra spare and waits out the cooldown, so a buffer that
             # is merely cautious can never hold N open.
+            #
+            # 판정은 replicas 가 아니라 실제로 떠 있는 파드로 한다. replicas 를 낮춰도
+            # ReplicaSet 이 따라잡기 전까지는 대기 파드가 그보다 많이 남아 있고, 그
+            # 구간에서 replicas 만 보면 "한도 안" 으로 읽혀 쿨다운을 타게 된다. 실측에서
+            # 축소가 1186번 미뤄지는 동안 할당중 + 대기중 이 14.7% 의 시간 동안 N 을
+            # 넘었다. buffer_total 은 삭제 중인 파드를 뺀 할당중 + 대기중 이므로,
+            # 이 값이 N 을 넘으면 그 자체로 위반이고 기다릴 이유가 없다.
             room = max(0, int(policy["N"]) - int(snapshot["buffer_assigned"]))
-            over_capacity = current > room
+            over_capacity = (
+                current > room
+                or int(snapshot["buffer_total"]) > int(policy["N"])
+            )
             cooldown = self.cooldown_seconds(compute_type_value)
             self._note_target(compute_type_value, desired, cooldown)
 
