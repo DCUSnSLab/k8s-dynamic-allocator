@@ -425,7 +425,12 @@ def build_pod_lives(records: Iterable[dict[str, Any]], run_end: datetime) -> lis
         if pod.get("deleting") and life.deleting_at is None:
             life.deleting_at = at
             close_span(life, at)
-        if pod.get("deletion_grace_seconds") is not None:
+        # 첫 값만 쓴다. 종료가 진행되면 grace 가 0 으로 수렴하므로, 매번 덮어쓰면
+        # ReplicaSet 삭제(grace 30)가 전부 controller(grace 0)로 집계된다.
+        if (
+            pod.get("deletion_grace_seconds") is not None
+            and life.deletion_grace_seconds is None
+        ):
             life.deletion_grace_seconds = int(pod["deletion_grace_seconds"])
         return life
 

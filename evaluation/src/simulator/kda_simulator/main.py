@@ -377,10 +377,13 @@ async def run_simulation(
         experiment_started_wall = now_iso()
         print(f"Output: {output_dir}")
         print_server_log_export_hint(output_dir)
-        # 동시 요청 수를 제한하지 않는다. 열린 모델에서 부하는 λ 가 정한다 -
-        # 클라이언트가 묶으면 큐가 길어진 만큼 도착이 느려져, 설정한 λ 가 아니라
-        # 시스템 처리 속도가 부하를 정하게 된다. 실측에서 상한 300 에 막히자
-        # 도착률이 완료율과 같아져 수요 신호가 무의미해졌다.
+        # 동시 요청 수를 제한하지 않는다. 묶으면 적체가 깎여 설정한 λ 가 서버에
+        # 그대로 가지 않는다 - 상한 100 에 N=80 이던 실행은 포화를 의도했지만
+        # 실제로는 사용률 60~70% 였다.
+        #
+        # 대신 λ 를 서버가 감당하는 범위에서 고른다. 적체는 (λ_peak - 용량) x
+        # 포화 지속시간 으로 쌓이고 그만큼 동시 요청이 늘어난다. 실측에서 동시
+        # 300 은 안정적이었고 587 에서 swlabssh 가 전부 OOM 으로 죽었다.
         global_sem = _Unlimited()
 
         for plan in request_plans:

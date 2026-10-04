@@ -91,77 +91,74 @@ class BufferCapacityReconciler:
         buffer_reserve: int,
         buffer_capacity: int,
         assigned: int,
-        demand: Optional[int] = None,
+        queue_busy: Optional[bool] = None,
     ) -> int:
-        """How many spare Pods to keep ready.
+        """여유 파드를 몇 개 들고 있을지.
 
-        demand=None is the fixed policy and stays the default: hold R spares,
-        capped by what capacity is left. A run with the dynamic path off behaves
-        exactly as before.
+        queue_busy=None 이 고정 정책이고 기본값이다. 동적 경로를 끈 실행은 예전과
+        한 글자도 다르지 않다.
 
-        With a demand figure, R becomes a floor and demand sets the target. The
-        figure to pass is how many requests arrive while one Pod is being built -
-        hold that many and nobody waits on a creation. Queue length is the wrong
-        input even though it measures the same shortage: by Little's law a queue
-        is arrival rate x *waiting* time, and waiting time was 195s against a 6.5s
-        creation time, so sizing the buffer by the queue overshoots ~30x. The runs
-        that did exactly that built 844 Pods they never used and held N open 11.9%
-        of the time.
+        동적 경로는 비율로 크기를 정하지 않는다. 그 방식은 공급이 병목인 동안
+        리틀의 법칙 항등식이 되어 어떤 신호를 넣어도 하한으로 수렴한다 -
+        여유 파드 V = 소비율 x 슬롯 회전시간 이므로, desired = 소비율 x 창 은
+        V x (창 / 회전시간) 이 되고, 실측에서 회전시간 5.6~7.7초 대 창 0~1초라
+        V 의 1/6~1/8 이 나온다. 큐 길이, 도착률, 반납률을 차례로 넣어 봤지만
+        셋 다 같은 이유로 목표가 R 밖으로 나가지 못했다.
 
-        Still capped by capacity - nothing is created once N is committed, however
-        large demand is, because there is nowhere to put it.
+        그래서 재는 것을 "얼마나 빠른가" 에서 "못 쓴 수요가 있는가" 로 바꾼다.
+        대기 중인 티켓이 있으면 자리가 허락하는 만큼 든다. 그 동안 준비된 파드는
+        즉시 소비되므로 낭비가 원리적으로 생기지 않는다.
+
+        이 규칙의 평형은 N x T_slot / (T_slot + T_work) 이다 - 여유가 그만큼일 때
+        소비율(여유/T_slot)과 완료율(작업중/T_work)이 같아진다. N=80, 회전 6초,
+        작업 60초면 여유 7.3 / 작업중 72.7 로 N 의 91% 를 쓴다. 고정 R=2 는 같은
+        조건에서 작업중 20 에 묶였고 실측도 17.2 였다.
+
+        큐가 비면 하한으로 돌아간다. 다만 그 판정은 호출자가 쿨다운을 거쳐 내린다 -
+        큐가 깜빡일 때마다 목표를 내리면 만들던 파드를 버리게 된다.
         """
         room = max(0, int(buffer_capacity) - int(assigned))
-        if demand is None:
+        if queue_busy is None:
             return min(int(buffer_reserve), room)
-        return min(max(int(buffer_reserve), int(demand)), room)
+        if queue_busy:
+            return room
+        return min(int(buffer_reserve), room)
 
-    def _demand_for_target(self, compute_type: str) -> Optional[int]:
-        """생성 시간 동안 들어온 요청 수, 또는 고정 정책을 유지할 때 None.
+    def _queue_busy(self, compute_type: str) -> Optional[bool]:
+        """대기 중인 티켓이 있는가. 고정 정책을 유지할 때는 None.
 
-        창의 길이는 설정이 아니라 관측한 파드 생성 시간이다. 그래서 느린 노드나 큰
-        이미지에서는 창이 저절로 넓어지고 더 많은 여유를 들고, 빠른 환경에서는 좁아져
-        적게 든다. 다시 측정하지 않아도 환경을 따라간다.
+        크기가 아니라 있고 없음만 본다. 큐 길이를 목표로 쓰면 길이를 따라 목표가
+        출렁이고, 그 사이 만들던 파드가 버려진다 - 그 방식으로 돌린 실행에서 844개를
+        만들어 쓰지 않고 지웠다. 자리는 N - assigned 가 알아서 막으므로 길이는
+        필요하지 않다.
 
-        표본이 모자라 생성 시간을 모르는 동안은 None 을 돌려 고정 정책으로 둔다.
-        그 시점은 기동 직후뿐이고 그때는 버퍼를 채우는 중이라 위험하지 않다.
-
-        Redis 가 흔들리면 이번 패스만 고정 정책으로 물러난다 - R 개를 드는 것은 언제나
-        안전한 답이고, 다음 패스가 다시 읽는다.
+        Redis 가 흔들리면 이번 패스만 고정 정책으로 물러난다. R 개를 드는 것은 언제나
+        안전한 답이고 다음 패스가 다시 읽는다.
         """
         if not self.dynamic_reserve:
             return None
-        window = self.create_time_seconds(compute_type, self.DEMAND_WINDOW_QUANTILE)
-        if window <= 0:
-            return None
         try:
-            return self.queues.release_count(compute_type, window)
+            return self.queues.queued_count(compute_type) > 0
         except Exception as exc:
             logger.warning(
-                "[Warning] operation=buffer_dynamic_reserve_demand compute_type=%s reason=%r",
+                "[Warning] operation=buffer_dynamic_reserve_queue compute_type=%s reason=%r",
                 compute_type,
                 str(exc),
             )
             return None
 
-    # 수요 창에 쓰는 분위. 낮은 쪽을 쓰는 이유는 이 값이 자기 출력에 오염되기
-    # 때문이다. 버퍼가 파드를 많이 만들면 kubelet 큐가 길어져 생성이 느려지고,
-    # 높은 분위를 창으로 쓰면 그 느려진 시간이 창을 넓혀 더 많이 세고 더 만든다.
-    # 실측에서 이 되먹임이 p90 을 7초에서 63초로 밀어 목표를 126 까지 띄웠다.
-    # 같은 실행의 p10 은 3.8초 대 7.3초로 1.9배에 그친다 - 한산한 순간의 생성은
-    # 혼잡해도 여전히 빠르기 때문이다.
-    DEMAND_WINDOW_QUANTILE = 0.1
-    # 쿨다운에 쓰는 분위. 여기서는 높은 쪽이 맞다 - "줄였다가 되돌려지지 않으려면
-    # 얼마나 기다려야 하나"의 답이고, 중앙값으로 맞추면 절반은 되돌려진다.
+    # 쿨다운에 쓰는 분위. 높은 쪽이 맞다 - "줄였다가 되돌려지지 않으려면 얼마나
+    # 기다려야 하나"의 답이고, 중앙값으로 맞추면 절반은 되돌려진다.
+    #
+    # 목표 크기에는 더 이상 생성 시간을 쓰지 않는다. 비율 기반 사이징을 버렸기
+    # 때문이고, 덕분에 이 값이 틀려도 목표가 틀어지지 않는다.
     COOLDOWN_QUANTILE = 0.9
 
     def create_time_seconds(self, compute_type: str, quantile: float = COOLDOWN_QUANTILE) -> float:
         """파드를 세우는 데 걸린 시간의 분위수. 표본이 모자라면 0.
 
-        쿨다운과 수요 창이 같은 표본을 보지만 다른 분위를 가져간다. 묻는 질문이
-        다르기 때문이다 - 쿨다운은 "최악에 가까울 때 얼마나 걸리나", 창은 "이 환경이
-        막히지 않았을 때 얼마나 걸리나" 를 묻는다. 뒤쪽이 낮은 분위여야 하는 이유는
-        DEMAND_WINDOW_QUANTILE 에 적어 두었다.
+        쿨다운이 이 값을 쓴다 - 줄였다가 바로 필요해지면 사용자가 파드를 세우는
+        시간만큼 기다린다. 그보다 짧게 기다리고 줄일 이유가 없다.
         """
         with self._churn_lock:
             creates = sorted(self._churn_state(compute_type)["creates"])
@@ -881,11 +878,12 @@ class BufferCapacityReconciler:
                 return result
 
             snapshot = self.provider.list_buffer_snapshot(compute_type_value)
+            queue_busy = self._queue_busy(compute_type_value)
             desired = self.desired_replicas(
                 policy["R"],
                 policy["N"],
                 snapshot["buffer_assigned"],
-                self._demand_for_target(compute_type_value),
+                queue_busy,
             )
             current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]
@@ -921,6 +919,24 @@ class BufferCapacityReconciler:
             # 축소가 1186번 미뤄지는 동안 할당중 + 대기중 이 14.7% 의 시간 동안 N 을
             # 넘었다. buffer_total 은 삭제 중인 파드를 뺀 할당중 + 대기중 이므로,
             # 이 값이 N 을 넘으면 그 자체로 위반이고 기다릴 이유가 없다.
+            # 이번 패스가 무엇을 보고 무엇을 정했는지 남긴다. 이 줄이 없어서
+            # "동적 경로가 켜져 있었는가" 를 사후에 확인할 수 없었고, 기능이 꺼진
+            # 실행을 켜진 것으로 읽어 여러 번 잘못 판단했다.
+            logger.info(
+                "[BufferTarget] compute_type=%s queue_busy=%s desired=%s current=%s "
+                "assigned=%s available=%s total=%s R=%s N=%s dynamic=%s",
+                compute_type_value,
+                queue_busy,
+                desired,
+                current,
+                snapshot["buffer_assigned"],
+                snapshot["buffer_available"],
+                snapshot["buffer_total"],
+                policy["R"],
+                policy["N"],
+                self.dynamic_reserve,
+            )
+
             room = max(0, int(policy["N"]) - int(snapshot["buffer_assigned"]))
             over_capacity = (
                 current > room
@@ -1014,7 +1030,7 @@ class BufferCapacityReconciler:
                 policy["R"],
                 policy["N"],
                 snapshot["buffer_assigned"],
-                self._demand_for_target(compute_type),
+                self._queue_busy(compute_type),
             )
             current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]
@@ -1186,7 +1202,7 @@ class BufferCapacityReconciler:
                     policy["R"],
                     policy["N"],
                     snapshot["buffer_assigned"],
-                    self._demand_for_target(compute_type),
+                    self._queue_busy(compute_type),
                 )
                 current = self.provider.read_deployment_replicas(
                     policy["deployment_name"]
