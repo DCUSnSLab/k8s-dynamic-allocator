@@ -135,7 +135,7 @@ class BufferCapacityReconciler:
         if window <= 0:
             return None
         try:
-            return self.queues.arrival_count(compute_type, window)
+            return self.queues.release_count(compute_type, window)
         except Exception as exc:
             logger.warning(
                 "[Warning] operation=buffer_dynamic_reserve_demand compute_type=%s reason=%r",

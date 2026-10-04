@@ -18,7 +18,6 @@ from .cluster import (
     require_headroom,
 )
 from .config import (
-    CLIENT_MAX_INFLIGHT,
     COMMAND_TIMEOUT_SECONDS,
     KUBERNETES_NAMESPACE,
     SUMMARY_SCHEMA_VERSION,
@@ -378,7 +377,11 @@ async def run_simulation(
         experiment_started_wall = now_iso()
         print(f"Output: {output_dir}")
         print_server_log_export_hint(output_dir)
-        global_sem = asyncio.Semaphore(CLIENT_MAX_INFLIGHT)
+        # 동시 요청 수를 제한하지 않는다. 열린 모델에서 부하는 λ 가 정한다 -
+        # 클라이언트가 묶으면 큐가 길어진 만큼 도착이 느려져, 설정한 λ 가 아니라
+        # 시스템 처리 속도가 부하를 정하게 된다. 실측에서 상한 300 에 막히자
+        # 도착률이 완료율과 같아져 수요 신호가 무의미해졌다.
+        global_sem = _Unlimited()
 
         for plan in request_plans:
             target_mono = started_mono + float(plan["planned_offset_seconds"])
@@ -516,6 +519,16 @@ async def warmup_users(config: SimulatorConfig, sessions: Any, stage: str = "War
         preview = ", ".join(f"{username}={error}" for username, error in failed[:5])
         raise RuntimeError(f"{stage} failed for {len(failed)} users: {preview}")
 
+
+
+class _Unlimited:
+    """세마포어 자리에 들어가는 빈 자물쇠. 제한을 걸지 않는다."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
 
 async def execute_request(
     *,

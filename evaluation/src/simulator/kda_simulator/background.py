@@ -21,6 +21,10 @@ import time
 running = True
 
 
+# 리눅스 CFS 가 CPU 할당량을 나눠 주는 주기. 커널 기본값이고 우리가 고른 수가 아니다.
+# 부하를 이 주기에 맞춰 나누면 한 조각이 요구하는 CPU 가 limit 아래로 내려간다.
+CFS_PERIOD_SECONDS = 0.1
+
 def stop(_signum, _frame):
     global running
     running = False
@@ -64,11 +68,26 @@ def main():
         # 재면 0.2초가 지나는 동안 CPU 는 40ms 밖에 못 써서 의도한 부하의 1/5 만
         # 걸렸다 (의도 20m, 실측 평균 4~8m). CPU 시간으로 세면 throttle 되는 만큼
         # 벽시계가 늘어날 뿐 걸리는 부하는 설정한 값 그대로다.
-        cpu_started = time.process_time()
+        # CPU 시간을 한 번에 몰아 쓰지 않고 커널 스케줄 주기(100ms)에 맞춰 나눈다.
+        # 단일 스레드 루프는 도는 동안 1코어를 요구하는데 user pod 의 limit 은 200m
+        # 이라, 몰아 쓰면 그 구간 내내 throttle 된다. 평균 부하는 같은데 (0.2초 /
+        # 10초 = 20m) 알림만 뜨고 명령 중계까지 같이 밀린다. 조각으로 나누면 한
+        # 조각이 요구하는 양이 limit 아래로 내려가 throttle 없이 같은 양이 걸린다.
+        slices = max(1, int(args.cpu_period_seconds / CFS_PERIOD_SECONDS))
+        slice_cpu = args.cpu_busy_seconds / slices
+        slice_wall = args.cpu_period_seconds / slices
         i = 0
-        while running and time.process_time() - cpu_started < args.cpu_busy_seconds:
-            checksum += math.sqrt(i % 1000000)
-            i += 1
+        for slice_index in range(slices):
+            if not running:
+                break
+            slice_started_cpu = time.process_time()
+            slice_started_wall = time.monotonic()
+            while running and time.process_time() - slice_started_cpu < slice_cpu:
+                checksum += math.sqrt(i % 1000000)
+                i += 1
+            rest = slice_wall - (time.monotonic() - slice_started_wall)
+            if rest > 0 and slice_index + 1 < slices:
+                time.sleep(rest)
 
         if memory:
             memory[cursor] = (memory[cursor] + 1) % 256

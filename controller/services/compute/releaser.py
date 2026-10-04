@@ -156,6 +156,11 @@ class ComputeReleaser:
                 session_ms=session_ms,
                 release_ms=release_ms,
             )
+            # 자리가 비는 속도가 버퍼 크기를 정한다.
+            try:
+                self.queues.record_release(compute_type, compute_pod)
+            except Exception as exc:  # noqa: BLE001 - 신호는 반납을 막지 않는다
+                logger.debug("[ReleaseSignalSkipped] reason=%r", str(exc))
             cleanup_context = True
             return {
                 "status": "success",

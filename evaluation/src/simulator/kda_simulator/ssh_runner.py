@@ -234,6 +234,9 @@ class SSHUserSession:
         self.username = username
         self._connection: asyncssh.SSHClientConnection | None = None
         self._connect_lock = asyncio.Lock()
+        # 설정값은 기록으로만 남긴다. 동시 요청 수는 더 이상 제한하지 않는다 -
+        # 열린 모델에서 부하는 λ 가 정하고, 클라이언트가 묶으면 설정한 λ 가 아니라
+        # 시스템 처리 속도가 부하를 정하게 된다.
         self._max_concurrent = config.users.max_concurrent_requests
         # Re-running is only safe where the command is a process in the user's own
         # pod. In kda mode it would submit a second ticket for work that may have
@@ -241,7 +244,19 @@ class SSHUserSession:
         self._rerun_when_unmeasured = (
             config.execution.mode == EXECUTION_MODE_BASELINE_DIRECT
         )
-        self._run_lock = asyncio.Semaphore(self._max_concurrent)
+        # 동시 요청 수는 제한하지 않는다. 열린 모델에서 부하는 λ 가 정하는 것이지
+        # 클라이언트가 묶을 일이 아니다. 묶으면 큐가 길어진 만큼 도착이 느려져
+        # 설정한 λ 와 실제로 걸리는 부하가 달라진다 (실측에서 동시 300 에 막히자
+        # 도착률이 완료율과 같아졌다).
+        #
+        # 세마포어가 겸하던 배타 접근은 따로 둔다. idle culling 이 파드를 지우기
+        # 전에 이 사용자의 요청이 하나도 돌지 않는 상태를 만들어야 하는데, 그건
+        # 동시 수를 제한하지 않고도 "진행 수가 0 이 될 때까지 기다리고 그동안 새
+        # 요청을 막는" 것으로 된다.
+        self._inflight = 0
+        self._inflight_idle = asyncio.Event()
+        self._inflight_idle.set()
+        self._exclusive = asyncio.Lock()
         # Last time this user did anything at all. Set now rather than at the
         # first request so a user who is never scheduled still ages out.
         self._idle_since = time.monotonic()
@@ -281,7 +296,11 @@ class SSHUserSession:
         # delete the pod out from under it.
         self._idle_since = time.monotonic()
         lock_wait_started = time.monotonic()
-        async with self._run_lock:
+        # 배타 구간(파드 삭제)이 열려 있으면 그것만 기다린다. 평소에는 즉시 통과한다.
+        async with self._exclusive:
+            self._inflight += 1
+            self._inflight_idle.clear()
+        try:
             user_concurrency_delay_ms = (time.monotonic() - lock_wait_started) * 1000.0
             started = time.monotonic()
             output = _TimedOutput(started)
@@ -325,6 +344,11 @@ class SSHUserSession:
                 discarded_output=output.discarded_stdout[-2000:],
                 discarded_exit_status=spent.discarded_exit_status,
             )
+
+        finally:
+            self._inflight -= 1
+            if self._inflight == 0:
+                self._inflight_idle.set()
 
     async def _run_with_retry(
         self,
@@ -497,19 +521,18 @@ class SSHUserSession:
         which means a command is in flight and the user is not idle after
         all.
         """
-        acquired = 0
+        # 새 요청을 막고(배타 락), 이미 도는 것이 끝나기를 기다린다. 동시 수를
+        # 제한하지 않으므로 슬롯을 세어 잡던 방식은 쓸 수 없다.
+        await asyncio.wait_for(self._exclusive.acquire(), slot_timeout)
         try:
-            for _ in range(self._max_concurrent):
-                await asyncio.wait_for(self._run_lock.acquire(), slot_timeout)
-                acquired += 1
+            await asyncio.wait_for(self._inflight_idle.wait(), slot_timeout)
             # The pod is about to go. Leaving the connection open would have
             # the next request try to use a tunnel into a pod that no longer
             # exists and take the retry path instead of a clean reconnect.
             await self.close()
             yield
         finally:
-            for _ in range(acquired):
-                self._run_lock.release()
+            self._exclusive.release()
 
     async def resume_if_culled(
         self,
@@ -536,10 +559,10 @@ class SSHUserSession:
                     resume_latency_ms=(time.monotonic() - started) * 1000.0,
                     waited_for_peer=True,
                 )
-            # A request slot as well, so this cannot run while the culler holds
-            # them all to delete the pod. offline() never takes the resume lock,
-            # so taking them in this order cannot deadlock.
-            async with self._run_lock:
+            # 배타 구간도 함께 잡는다. 그래야 culler 가 파드를 지우는 동안 재개가
+            # 끼어들지 않는다. offline() 은 resume 락을 잡지 않으므로 이 순서로
+            # 잡아도 교착은 없다.
+            async with self._exclusive:
                 return await self._resume(started, restore_command)
 
     async def _resume(

@@ -146,6 +146,9 @@ class ComputeQueues:
     def _arrivals_key(self, compute_type: str) -> str:
         return f"{self.prefix}:arrivals:{compute_type}"
 
+    def _releases_key(self, compute_type: str) -> str:
+        return f"{self.prefix}:releases:{compute_type}"
+
     def _lock_key(self, compute_type: str) -> str:
         return f"{self.prefix}:lock:{compute_type}"
 
@@ -266,6 +269,41 @@ class ComputeQueues:
                 pass
         else:
             target.expire(key, ARRIVALS_TTL_SECONDS)
+
+    def record_release(self, compute_type: str, compute_pod: str) -> None:
+        """파드가 반납된 시각을 남긴다. 버퍼 크기를 정하는 수요 신호다.
+
+        도착이 아니라 반납을 세는 이유는, 버퍼가 덮어야 하는 것이 "자리가 비는
+        속도" 이기 때문이다. 한가할 때는 둘이 같지만 (들어온 만큼 끝난다) 밀릴
+        때는 갈라진다 - 큐가 길면 도착은 시스템이 끝내 주는 만큼으로 눌리는 반면,
+        반납은 작업이 끝날 때마다 일어나 실제 회전 속도를 그대로 보여 준다.
+        실측에서 동시 요청이 상한에 막히자 도착률이 완료율과 같아져, 가장 바쁠 때
+        수요가 가장 작게 읽혔다.
+
+        할당이 아니라 반납인 이유는 버퍼가 비면 할당이 막히기 때문이다. 할당을
+        세면 "버퍼가 없어서 못 쓴" 것이 "수요가 없다" 로 읽혀 스스로를 굶긴다.
+        """
+        key = self._releases_key(self.normalize_compute_type(compute_type))
+        try:
+            client = self._redis_client()
+            client.zadd(key, {f"{compute_pod}:{time.time()}": time.time() * 1000.0})
+            client.expire(key, ARRIVALS_TTL_SECONDS)
+        except RedisError:
+            # 수요 신호는 없어도 고정 정책으로 돌아갈 뿐이라 반납을 막지 않는다.
+            pass
+
+    def release_count(self, compute_type: str, window_seconds: float) -> int:
+        """최근 window_seconds 동안 반납된 파드 수."""
+        if window_seconds <= 0:
+            return 0
+        key = self._releases_key(self.normalize_compute_type(compute_type))
+        now_ms = time.time() * 1000.0
+        client = self._redis_client()
+        try:
+            client.zremrangebyscore(key, 0, now_ms - (ARRIVALS_TTL_SECONDS * 1000.0))
+        except RedisError:
+            pass
+        return int(client.zcount(key, now_ms - window_seconds * 1000.0, now_ms))
 
     def arrival_count(self, compute_type: str, window_seconds: float) -> int:
         """최근 window_seconds 동안 들어온 티켓 수.
