@@ -91,46 +91,32 @@ class BufferCapacityReconciler:
         buffer_reserve: int,
         buffer_capacity: int,
         assigned: int,
-        queue_busy: Optional[bool] = None,
+        queued: Optional[int] = None,
     ) -> int:
-        """여유 파드를 몇 개 들고 있을지.
+        """available 파드를 몇 개 들고 있을지.
 
-        queue_busy=None 이 고정 정책이고 기본값이다. 동적 경로를 끈 실행은 예전과
-        한 글자도 다르지 않다.
+        queued=None 이 고정 정책이고 기본값이다. 동적 경로를 끈 실행은 예전과 한
+        글자도 다르지 않다.
 
-        동적 경로는 비율로 크기를 정하지 않는다. 그 방식은 공급이 병목인 동안
-        리틀의 법칙 항등식이 되어 어떤 신호를 넣어도 하한으로 수렴한다 -
-        여유 파드 V = 소비율 x 슬롯 회전시간 이므로, desired = 소비율 x 창 은
-        V x (창 / 회전시간) 이 되고, 실측에서 회전시간 5.6~7.7초 대 창 0~1초라
-        V 의 1/6~1/8 이 나온다. 큐 길이, 도착률, 반납률을 차례로 넣어 봤지만
-        셋 다 같은 이유로 목표가 R 밖으로 나가지 못했다.
+        대기 중인 티켓 수를 그대로 목표로 쓴다. 다른 신호를 세 번 시도했지만
+        (도착률, 반납률, 큐 유무) 앞의 둘은 공급 병목에서 리틀의 법칙 항등식이 되어
+        하한에 붙었고, 셋째는 큐가 1건만 있어도 자리를 다 채워 배정보다 많은 파드를
+        버렸다. 큐 길이는 공급이 모자란 만큼 쌓이므로 그 셋과 달리 눈이 멀지 않는다.
 
-        그래서 재는 것을 "얼마나 빠른가" 에서 "못 쓴 수요가 있는가" 로 바꾼다.
-        대기 중인 티켓이 있으면 자리가 허락하는 만큼 든다. 그 동안 준비된 파드는
-        즉시 소비되므로 낭비가 원리적으로 생기지 않는다.
+        목표가 수요를 따라 출렁이는 것은 축소 쿨다운이 막는다. 상승은 즉시, 하강은
+        쿨다운 뒤 - 모자란 비용(사용자가 기다림)과 과한 비용(파드 한 개)이 다르므로
+        비대칭이 맞다.
 
-        이 규칙의 평형은 N x T_slot / (T_slot + T_work) 이다 - 여유가 그만큼일 때
-        소비율(여유/T_slot)과 완료율(작업중/T_work)이 같아진다. N=80, 회전 6초,
-        작업 60초면 여유 7.3 / 작업중 72.7 로 N 의 91% 를 쓴다. 고정 R=2 는 같은
-        조건에서 작업중 20 에 묶였고 실측도 17.2 였다.
-
-        큐가 비면 하한으로 돌아간다. 다만 그 판정은 호출자가 쿨다운을 거쳐 내린다 -
-        큐가 깜빡일 때마다 목표를 내리면 만들던 파드를 버리게 된다.
+        자리는 N - assigned 가 막는다. 할당과 ReplicaSet 의 backfill 사이에서 합이
+        잠깐 N 을 넘지만 (실측 한 번에 중앙값 3.4초) 곧 되돌아오는 일시적 현상이다.
         """
         room = max(0, int(buffer_capacity) - int(assigned))
-        if queue_busy is None:
+        if queued is None:
             return min(int(buffer_reserve), room)
-        if queue_busy:
-            return room
-        return min(int(buffer_reserve), room)
+        return min(max(int(buffer_reserve), int(queued)), room)
 
-    def _queue_busy(self, compute_type: str) -> Optional[bool]:
-        """대기 중인 티켓이 있는가. 고정 정책을 유지할 때는 None.
-
-        크기가 아니라 있고 없음만 본다. 큐 길이를 목표로 쓰면 길이를 따라 목표가
-        출렁이고, 그 사이 만들던 파드가 버려진다 - 그 방식으로 돌린 실행에서 844개를
-        만들어 쓰지 않고 지웠다. 자리는 N - assigned 가 알아서 막으므로 길이는
-        필요하지 않다.
+    def _queued_for_target(self, compute_type: str) -> Optional[int]:
+        """대기 중인 티켓 수. 고정 정책을 유지할 때는 None.
 
         Redis 가 흔들리면 이번 패스만 고정 정책으로 물러난다. R 개를 드는 것은 언제나
         안전한 답이고 다음 패스가 다시 읽는다.
@@ -138,7 +124,7 @@ class BufferCapacityReconciler:
         if not self.dynamic_reserve:
             return None
         try:
-            return self.queues.queued_count(compute_type) > 0
+            return int(self.queues.queued_count(compute_type))
         except Exception as exc:
             logger.warning(
                 "[Warning] operation=buffer_dynamic_reserve_queue compute_type=%s reason=%r",
@@ -265,8 +251,8 @@ class BufferCapacityReconciler:
         창 안에서 목표가 지금보다 높았던 적이 있으면 아직 출렁이는 중이므로 기다린다.
         내내 지금 이하였다면 수요가 가라앉은 것이고, 그때의 축소는 되돌려지지 않는다.
 
-        여기에는 "여유가 목표보다 많다"는 경우만 들어온다. 용량 상한이 요구하는 축소는
-        이 함수를 거치지 않으므로 N 이 열린 채로 유지되는 일은 없다.
+        이 함수가 막아도 N 이 열린 채로 남지는 않는다. replicas 중 N - assigned 를
+        넘는 부분은 호출자가 먼저 줄이고, 여기서 기다리는 것은 그 아래 부분뿐이다.
         """
         if cooldown <= 0:
             return None
@@ -456,13 +442,21 @@ class BufferCapacityReconciler:
         with self._status_lock:
             return {key: dict(value) for key, value in self._status.items()}
 
-    def _schedule_after(self, delay: float) -> None:
-        """Wake up when the cooldown expires instead of waiting for an event.
+    def _schedule_after(self, delay: float, compute_type: Optional[str] = None) -> None:
+        """쿨다운이 끝나는 시점에 깨어난다. 이벤트를 기다리지 않는다.
 
-        Without this a buffer that went quiet would hold its extra spare until the
-        next resync, which is a minute away.
+        이 예약이 없으면 조용해진 버퍼가 남은 파드를 다음 resync(기본 60초)까지
+        들고 있는다.
+
+        타입을 함께 적어야 한다. 예약 실행은 _pending_types 에 적힌 타입만 돌리므로
+        (아래 _run 의 scheduled_run 분기) 깨우기만 하면 아무것도 reconcile 하지 않고
+        다음 이벤트나 resync 까지 밀린다. 용량 트림이 "남은 축소는 쿨다운 뒤에 다시
+        본다" 를 이 예약에 기대므로, 조용한 구간에서 쿨다운이 60초까지 늘어나면
+        측정한 쿨다운 정책과 다른 것을 재게 된다.
         """
         with self._condition:
+            if compute_type:
+                self._pending_types.add(compute_type)
             self._schedule_locked(max(0.0, float(delay)))
 
     def _schedule_locked(self, delay: float) -> None:
@@ -878,12 +872,12 @@ class BufferCapacityReconciler:
                 return result
 
             snapshot = self.provider.list_buffer_snapshot(compute_type_value)
-            queue_busy = self._queue_busy(compute_type_value)
+            queued = self._queued_for_target(compute_type_value)
             desired = self.desired_replicas(
                 policy["R"],
                 policy["N"],
                 snapshot["buffer_assigned"],
-                queue_busy,
+                queued,
             )
             current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]
@@ -901,6 +895,14 @@ class BufferCapacityReconciler:
                 "desired_replicas": desired,
             }
 
+            # 목표를 먼저 적는다. 확대 패스보다 앞이어야 한다 - 전에는 축소 쪽에만
+            # 있어서, 올라간 목표(스파이크)가 이력에 남지 않았다. 그러면 쿨다운의
+            # "창 안에 지금보다 높은 목표가 있었나" 가 거짓이 되어 직후 트림이
+            # 그대로 통과한다. 실측에서 42->73 확대 직후의 73->69 축소가 이 경로로
+            # 쿨다운을 빠져나갔다.
+            cooldown = self.cooldown_seconds(compute_type_value)
+            self._note_target(compute_type_value, desired, cooldown)
+
             if current < desired:
                 result = self._scale_up(
                     compute_type_value,
@@ -909,26 +911,33 @@ class BufferCapacityReconciler:
                 self._record_status(compute_type_value, **result)
                 return result
 
-            # Over capacity is an N violation and shrinks at once. Anything else
-            # is just an extra spare and waits out the cooldown, so a buffer that
-            # is merely cautious can never hold N open.
+            # 축소는 두 부분으로 나눠 다룬다.
             #
-            # 판정은 replicas 가 아니라 실제로 떠 있는 파드로 한다. replicas 를 낮춰도
-            # ReplicaSet 이 따라잡기 전까지는 대기 파드가 그보다 많이 남아 있고, 그
-            # 구간에서 replicas 만 보면 "한도 안" 으로 읽혀 쿨다운을 타게 된다. 실측에서
-            # 축소가 1186번 미뤄지는 동안 할당중 + 대기중 이 14.7% 의 시간 동안 N 을
-            # 넘었다. buffer_total 은 삭제 중인 파드를 뺀 할당중 + 대기중 이므로,
-            # 이 값이 N 을 넘으면 그 자체로 위반이고 기다릴 이유가 없다.
-            # 이번 패스가 무엇을 보고 무엇을 정했는지 남긴다. 이 줄이 없어서
-            # "동적 경로가 켜져 있었는가" 를 사후에 확인할 수 없었고, 기능이 꺼진
-            # 실행을 켜진 것으로 읽어 여러 번 잘못 판단했다.
+            #   replicas 중 N - assigned 를 넘는 부분 - 쿨다운 없이 바로 줄인다.
+            #       할당된 파드는 selector 에서 빠지고 ReplicaSet 이 그 자리를 새
+            #       파드로 채우므로, replicas 를 그대로 두면 기다리는 내내 N 을
+            #       넘는다. 몇 초 뒤 저절로 풀리는 backfill 지연과 다르다.
+            #   N - assigned 아래에서 목표까지 내려가는 부분 - 쿨다운을 거친다.
+            #       수요가 줄어서 생긴 축소라 곧 되돌려질 수 있다.
+            #
+            # 801f39f 는 앞부분을 목표까지 한 번에 줄였고, _scale_down 이 락을 잡은
+            # 뒤 목표를 다시 계산해 큐가 빈 순간 "75로 트림" 이 "2로 붕괴" 가 됐다
+            # (실측 66건 중 25건). 즉시 줄이는 폭을 N - assigned 까지로 묶고 재계산을
+            # 없애면 그 붕괴가 생기지 않는다. 같은 큐 길이 신호에 이 우회가 있던
+            # 3a4f71e 는 Ready 후 쓰이지 않은 파드가 5.6% 였다.
+            #
+            # 판정은 replicas 로 한다. 실제 파드 합(buffer_total)이 N 을 넘는 것은
+            # 할당과 backfill 사이의 일시적 현상이라 (한 번에 중앙값 3.4초) 그것으로
+            # 줄이면 ReplicaSet 이 지우고 있는 파드를 한 번 더 지우게 된다.
+            room = max(0, int(policy["N"]) - int(snapshot["buffer_assigned"]))
             logger.info(
-                "[BufferTarget] compute_type=%s queue_busy=%s desired=%s current=%s "
-                "assigned=%s available=%s total=%s R=%s N=%s dynamic=%s",
+                "[BufferTarget] compute_type=%s queued=%s desired=%s current=%s "
+                "room=%s assigned=%s available=%s total=%s R=%s N=%s dynamic=%s",
                 compute_type_value,
-                queue_busy,
+                queued,
                 desired,
                 current,
+                room,
                 snapshot["buffer_assigned"],
                 snapshot["buffer_available"],
                 snapshot["buffer_total"],
@@ -937,22 +946,36 @@ class BufferCapacityReconciler:
                 self.dynamic_reserve,
             )
 
-            room = max(0, int(policy["N"]) - int(snapshot["buffer_assigned"]))
-            over_capacity = (
-                current > room
-                or int(snapshot["buffer_total"]) > int(policy["N"])
-            )
-            cooldown = self.cooldown_seconds(compute_type_value)
-            self._note_target(compute_type_value, desired, cooldown)
-
             if current > desired or snapshot["buffer_available"] > desired:
-                waiting = (
-                    None
-                    if over_capacity
-                    else self._cooldown_blocks_scale_down(
-                        compute_type_value, desired, cooldown
-                    )
+                waiting = self._cooldown_blocks_scale_down(
+                    compute_type_value, desired, cooldown
                 )
+                if waiting is not None and current > room:
+                    logger.info(
+                        "[BufferCapacityTrim] compute_type=%s replicas=%s->%s "
+                        "desired=%s assigned=%s N=%s cooldown_remaining_s=%.1f",
+                        compute_type_value,
+                        current,
+                        room,
+                        desired,
+                        snapshot["buffer_assigned"],
+                        policy["N"],
+                        waiting,
+                    )
+                    result = self._scale_down(
+                        compute_type_value,
+                        policy,
+                        {
+                            **base_result,
+                            "desired_replicas": room,
+                            "target_replicas": desired,
+                            "capacity_trim": True,
+                        },
+                    )
+                    self._record_status(compute_type_value, **result)
+                    # 목표까지 남은 축소는 쿨다운이 끝나면 다시 본다.
+                    self._schedule_after(waiting, compute_type_value)
+                    return result
                 if waiting is not None:
                     logger.info(
                         "[BufferScaleDownDeferred] compute_type=%s reason=%r "
@@ -974,7 +997,7 @@ class BufferCapacityReconciler:
                         "cooldown_remaining_s": round(waiting, 2),
                     }
                     self._record_status(compute_type_value, **result)
-                    self._schedule_after(waiting)
+                    self._schedule_after(waiting, compute_type_value)
                     return result
                 result = self._scale_down(
                     compute_type_value,
@@ -1030,7 +1053,7 @@ class BufferCapacityReconciler:
                 policy["R"],
                 policy["N"],
                 snapshot["buffer_assigned"],
-                self._queue_busy(compute_type),
+                self._queued_for_target(compute_type),
             )
             current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]
@@ -1198,11 +1221,33 @@ class BufferCapacityReconciler:
                     }
 
                 snapshot = self.provider.list_buffer_snapshot(compute_type)
-                desired = self.desired_replicas(
+                # 결정 시점의 목표는 "이보다 더 줄이지 않는다" 는 바닥으로만 쓴다.
+                # 이 지점까지 오는 데 게이트와 락으로 수초가 걸리고 (실측 2.2~17.6초)
+                # 그 사이 큐가 비면 다시 계산한 목표가 하한으로 떨어진다. 그러면
+                # "75로 트림" 으로 시작한 축소가 "2로 붕괴" 로 실행된다 - 실측 66건 중
+                # 25건이 그랬고 524개를 더 지웠다.
+                #
+                # 반대 방향도 막아야 한다. 기다리는 동안 상태는 한쪽으로만 움직인다 -
+                # 게이트가 서 있으면 할당기는 새로 할당하지 않고(allocator 의
+                # is_scale_down_gated) 반납은 게이트를 보지 않으므로, assigned 는 줄고
+                # 자리는 늘고 큐는 쌓인다. 결정 시점 값만 그대로 실행하면 그사이
+                # 필요해진 파드를 지웠다가 다음 패스에서 다시 만든다 (고정 R 에서
+                # 자리 1 -> 2 로 늘었는데 1 로 줄여 Ready 파드를 버리는 경우, 동적 R
+                # 에서 큐가 30 건 쌓였는데 2 로 붕괴하는 경우).
+                #
+                # 그래서 지금 값으로 다시 계산한 목표를 바닥에 깔고, 자리(N - assigned)
+                # 로 천장을 씌운다. 고정 정책에서는 이 식이 예전의 재계산과 정확히 같고,
+                # 동적 경로에서는 붕괴 방지만 더해진다.
+                room = max(0, int(policy["N"]) - int(snapshot["buffer_assigned"]))
+                fresh = self.desired_replicas(
                     policy["R"],
                     policy["N"],
                     snapshot["buffer_assigned"],
-                    self._queue_busy(compute_type),
+                    self._queued_for_target(compute_type),
+                )
+                desired = min(
+                    max(int(base_result["desired_replicas"]), fresh),
+                    room,
                 )
                 current = self.provider.read_deployment_replicas(
                     policy["deployment_name"]
