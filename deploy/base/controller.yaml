@@ -52,6 +52,11 @@ spec:
         # run measured, and a run with the wrong label is worse than no run.
         - name: COMPUTE_ALLOCATION_MODE
           value: warm_buffer
+        # DEBUG 가 켜져 있으면 Django 가 SQL 과 요청 정보를 프로세스 안에 모아 두고
+        # 예외마다 트레이스백 페이지를 만든다. 측정하는 쪽에서는 메모리와 응답 시간에
+        # 잡음만 더하는 것이라 끈다. 기본값이 true 이므로 명시해야 한다.
+        - name: DJANGO_DEBUG
+          value: "false"
         # The reconciler runs on the leader only, so adding replicas does not
         # share this work - the limit has to carry it. At N=100 the leader sat at
         # 377m against a 500m limit and spent 59-63% of its CPU periods throttled,
