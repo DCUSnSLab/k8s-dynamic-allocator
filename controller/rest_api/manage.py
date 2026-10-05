@@ -1,15 +1,9 @@
 #!/usr/bin/env python
 """Django's command-line utility for administrative tasks."""
 import os
-import runpy
 import sys
-from pathlib import Path
 
-
-def _config_value_to_env(value):
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
+from config.bootstrap import load_config_defaults, load_from_env
 
 
 def _extract_config_file(argv):
@@ -37,31 +31,19 @@ def _extract_config_file(argv):
     return config_file
 
 
-def _load_config_defaults(config_file):
-    if not config_file:
-        return
-
-    config_path = Path(config_file)
-    if not config_path.is_absolute():
-        config_path = Path.cwd() / config_path
-
-    values = runpy.run_path(str(config_path))
-    os.environ.setdefault("KDA_CONFIG_FILE", str(config_path))
-
-    for name, value in values.items():
-        if not name.isupper() or value is None:
-            continue
-        if isinstance(value, (str, int, float, bool)):
-            os.environ.setdefault(name, _config_value_to_env(value))
-
-    namespace = values.get("DEFAULT_NAMESPACE")
-    if namespace:
-        os.environ.setdefault("K8S_NAMESPACE", str(namespace))
-
-
 def main():
     """Run administrative tasks."""
-    _load_config_defaults(_extract_config_file(sys.argv))
+    config_file = _extract_config_file(sys.argv)
+    if config_file:
+        load_config_defaults(config_file)
+    else:
+        # WSGI 서버와 같은 경로. --config-file 없이 띄워도 KDA_CONFIG_FILE 이
+        # 있으면 같은 설정을 읽는다.
+        load_from_env()
+    # 리로더 없이 띄우는 runserver 에는 RUN_MAIN 이 없으므로, 서버라는 사실을
+    # 여기서 알려 준다. 다른 관리 명령에서는 올리지 않는다.
+    if "runserver" in sys.argv and "--noreload" in sys.argv:
+        os.environ.setdefault('KDA_START_ORCHESTRATOR', 'true')
     os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
     try:
         from django.core.management import execute_from_command_line
