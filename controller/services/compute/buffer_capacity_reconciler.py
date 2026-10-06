@@ -295,6 +295,61 @@ class BufferCapacityReconciler:
         if shared_dip is not None:
             self._share_sample(compute_type, "dip", shared_dip)
 
+    def _capacity_trim_still_needed(
+        self,
+        compute_type: str,
+        policy: Dict,
+        current: int,
+        room: int,
+    ) -> bool:
+        """용량 트림을 하려는 지금, 다시 읽어도 여전히 자리를 넘는가.
+
+        트림 판정에 쓰는 두 값은 서로 다른 시점에 읽힌다 - 스냅샷(assigned)을 먼저,
+        replicas 를 나중에 읽는다. 그 사이에 상태가 바뀌면 "넘지도 않았는데 넘었다" 로
+        읽힌다. 재사용 arm 에서 이 어긋남이 한 방향으로만 생긴다: 반납이 replicas 를
+        올리고 assigned 를 내리므로, 두 읽기 사이에 반납이 끼면 replicas 는 새 값(큼),
+        assigned 는 옛 값(큼)이 되어 자리가 실제보다 좁게 보인다. 실측에서 반납 1472회
+        중 136회가 그렇게 트림을 깨웠다(제안 arm 은 반납이 없어 0회).
+
+        그 호출은 파드를 지우지 않는다 - _scale_down 이 게이트 안에서 다시 읽어
+        current == desired 를 보고 converged 로 끝난다. 문제는 그 사이 게이트가 잡혀
+        있다는 것이다. 게이트가 잡히면 할당기는 아무것도 할당하지 않으므로(allocator 의
+        is_scale_down_gated), 파드가 Ready 로 남아 있는데도 큐만 쌓인다. 실측에서 그
+        구간의 할당중이 26, 대기 Ready 가 55, 큐가 645 였다.
+
+        그래서 게이트를 잡기 전에 같은 일을 한 번 더 확인한다. 거짓이면 이번 패스는
+        손대지 않고, 참이면 지금까지와 똑같은 경로로 진행한다. 읽기가 실패하면 참으로
+        본다 - 확인할 수 없을 때 N 보장을 포기하는 쪽이 더 나쁘다.
+        """
+        try:
+            fresh_replicas = int(
+                self.provider.read_deployment_replicas(policy["deployment_name"])
+            )
+            fresh_snapshot = self.provider.list_buffer_snapshot(compute_type)
+            fresh_room = max(
+                0, int(policy["N"]) - int(fresh_snapshot["buffer_assigned"])
+            )
+        except Exception as exc:
+            logger.debug(
+                "[BufferCapacityTrimRecheckSkipped] compute_type=%s reason=%r",
+                compute_type,
+                str(exc),
+            )
+            return True
+        if fresh_replicas > fresh_room:
+            return True
+        logger.info(
+            "[BufferCapacityTrimStale] compute_type=%s replicas=%s->%s room=%s->%s "
+            "reason=%r",
+            compute_type,
+            current,
+            fresh_replicas,
+            room,
+            fresh_room,
+            "re-read shows replicas inside the room",
+        )
+        return False
+
     def _cooldown_blocks_scale_down(
         self,
         compute_type: str,
@@ -1018,7 +1073,13 @@ class BufferCapacityReconciler:
                 waiting = self._cooldown_blocks_scale_down(
                     compute_type_value, desired, cooldown
                 )
-                if waiting is not None and current > room:
+                if (
+                    waiting is not None
+                    and current > room
+                    and self._capacity_trim_still_needed(
+                        compute_type_value, policy, current, room
+                    )
+                ):
                     logger.info(
                         "[BufferCapacityTrim] compute_type=%s replicas=%s->%s "
                         "desired=%s assigned=%s N=%s cooldown_remaining_s=%.1f",
