@@ -30,13 +30,17 @@ spec:
       failureThreshold: 3
     # requests == limits: the pod holds exactly what it may use, so its
     # footprint is unambiguous.
+    #
+    # 제안 시스템의 compute 파드와 같은 값이어야 한다. 실측 사용량이 1코어를 넘지
+    # 않아 develop 에서 2코어/4Gi 에서 내려왔고(b62d1b2), 비교군이 2배를 들고 있으면
+    # 점유량 비교가 그 차이를 재게 된다.
     resources:
       requests:
-        cpu: "2"
-        memory: "4Gi"
+        cpu: "1"
+        memory: "2Gi"
       limits:
-        cpu: "2"
-        memory: "4Gi"
+        cpu: "1"
+        memory: "2Gi"
     securityContext:
       privileged: true
     volumeMounts:
