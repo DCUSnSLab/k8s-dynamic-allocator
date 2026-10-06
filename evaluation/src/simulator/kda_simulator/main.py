@@ -18,7 +18,6 @@ from .cluster import (
     require_headroom,
 )
 from .config import (
-    CLIENT_MAX_INFLIGHT,
     COMMAND_TIMEOUT_SECONDS,
     KUBERNETES_NAMESPACE,
     SUMMARY_SCHEMA_VERSION,
@@ -378,7 +377,14 @@ async def run_simulation(
         experiment_started_wall = now_iso()
         print(f"Output: {output_dir}")
         print_server_log_export_hint(output_dir)
-        global_sem = asyncio.Semaphore(CLIENT_MAX_INFLIGHT)
+        # 동시 요청 수를 제한하지 않는다. 묶으면 적체가 깎여 설정한 λ 가 서버에
+        # 그대로 가지 않는다 - 상한 100 에 N=80 이던 실행은 포화를 의도했지만
+        # 실제로는 사용률 60~70% 였다.
+        #
+        # 대신 λ 를 서버가 감당하는 범위에서 고른다. 적체는 (λ_peak - 용량) x
+        # 포화 지속시간 으로 쌓이고 그만큼 동시 요청이 늘어난다. 실측에서 동시
+        # 300 은 안정적이었고 587 에서 swlabssh 가 전부 OOM 으로 죽었다.
+        global_sem = _Unlimited()
 
         for plan in request_plans:
             target_mono = started_mono + float(plan["planned_offset_seconds"])
@@ -516,6 +522,16 @@ async def warmup_users(config: SimulatorConfig, sessions: Any, stage: str = "War
         preview = ", ".join(f"{username}={error}" for username, error in failed[:5])
         raise RuntimeError(f"{stage} failed for {len(failed)} users: {preview}")
 
+
+
+class _Unlimited:
+    """세마포어 자리에 들어가는 빈 자물쇠. 제한을 걸지 않는다."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
 
 async def execute_request(
     *,

@@ -250,6 +250,42 @@ def split_incomplete(
     return server_failed, output_lost, unclassified
 
 
+def verify_output_lost(
+    requests: list[dict[str, Any]],
+    assignments: dict[str, dict[str, float]] | None,
+) -> tuple[int, int]:
+    """Return (recovered, unverified) among requests whose output never arrived.
+
+    status=output_lost means the client could not read the result, not that the
+    work failed: the shell reached its last line and the exit status came back on
+    the SSH channel, while the output stream delivered nothing. Measured 9 of
+    these in one pair of runs; every one had a full [Request]/[Assigned]/[Released]
+    trail in the controller log, with session_ms at the command's own length.
+
+    So the outcome is recovered from the server's own records rather than dropped.
+    The join is exact, not a guess by time: the controller logs the whole command
+    line, and the simulator's request_id rides inside it as the marker argument,
+    which is what read_assignments keys on.
+
+    The test is the one split_incomplete already applies to incompletes - a
+    session at least as long as this run's own median for that command is one
+    where the command ran to the end. Anything the logs cannot clear stays
+    unverified rather than being counted as finished.
+    """
+    baselines = command_baselines(requests)
+    recovered = unverified = 0
+    for r in requests:
+        if r.get("status") != "output_lost":
+            continue
+        session_ms = ((assignments or {}).get(r.get("request_id")) or {}).get("session_ms")
+        baseline = baselines.get(r.get("command_name") or "")
+        if session_ms is not None and baseline is not None and session_ms >= baseline:
+            recovered += 1
+        else:
+            unverified += 1
+    return recovered, unverified
+
+
 def request_metrics(
     requests: list[dict[str, Any]],
     assignments: dict[str, dict[str, float]] | None = None,
@@ -267,6 +303,7 @@ def request_metrics(
     incomplete_server, incomplete_output_lost, incomplete_unclassified = split_incomplete(
         requests, assignments
     )
+    recovered, unverified = verify_output_lost(requests, assignments)
     return {
         "count": len(requests),
         "status": statuses,
@@ -274,6 +311,16 @@ def request_metrics(
         # Work the server completed and the client never saw. Not a server
         # failure, but not a success either, so it is reported on its own.
         "output_lost": incomplete_output_lost + statuses.get("output_lost", 0),
+        # Of those, the ones the controller's own record shows ran to the end -
+        # whether the client called them output_lost or incomplete, since both
+        # are cleared by the same session_ms test. Counted as completed work: the
+        # client's blind spot is not the server's failure, and dropping them
+        # would quietly shrink the sample.
+        "server_recovered": recovered + incomplete_output_lost,
+        "unverified": unverified,
+        # Confirmed finished, whichever side saw it. This is the denominator to
+        # report: client-confirmed successes plus server-confirmed completions.
+        "completed": len(success) + recovered + incomplete_output_lost,
         "incomplete_unclassified": incomplete_unclassified,
         "start_delay_s": summarize_values([r["since_send_to_start_ms"] / 1000.0 for r in success if r.get("since_send_to_start_ms") is not None]),
         # idle-baseline only. A resume happens before the command is sent, so it
@@ -425,7 +472,12 @@ def build_pod_lives(records: Iterable[dict[str, Any]], run_end: datetime) -> lis
         if pod.get("deleting") and life.deleting_at is None:
             life.deleting_at = at
             close_span(life, at)
-        if pod.get("deletion_grace_seconds") is not None:
+        # 첫 값만 쓴다. 종료가 진행되면 grace 가 0 으로 수렴하므로, 매번 덮어쓰면
+        # ReplicaSet 삭제(grace 30)가 전부 controller(grace 0)로 집계된다.
+        if (
+            pod.get("deletion_grace_seconds") is not None
+            and life.deletion_grace_seconds is None
+        ):
             life.deletion_grace_seconds = int(pod["deletion_grace_seconds"])
         return life
 
@@ -523,6 +575,14 @@ def print_report(metrics: dict[str, Any]) -> None:
     if req.get("incomplete_unclassified"):
         line += f"  unclassified={req['incomplete_unclassified']}"
     print(line)
+    if req.get("server_recovered") or req.get("unverified"):
+        # The sample the comparison rests on, and how much of it the client could
+        # not see for itself.
+        print(
+            f"completed {req.get('completed')} / {req['count']}"
+            f"  (서버 기록으로 복구 {req.get('server_recovered', 0)},"
+            f" 확인 불가 {req.get('unverified', 0)})"
+        )
     print(f"start delay s  {_fmt(req['start_delay_s'])}")
     if req.get("rerun"):
         share = 100.0 * req["rerun"] / req["count"] if req["count"] else 0.0
