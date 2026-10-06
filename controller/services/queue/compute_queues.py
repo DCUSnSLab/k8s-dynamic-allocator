@@ -158,6 +158,49 @@ class ComputeQueues:
     def _scale_down_gate_key(self, compute_type: str) -> str:
         return f"{self.prefix}:scale-down-gate:{compute_type}"
 
+    def _churn_samples_key(self, compute_type: str, kind: str) -> str:
+        return f"{self.prefix}:churn:{kind}:{compute_type}"
+
+    def record_churn_sample(
+        self,
+        compute_type: str,
+        kind: str,
+        value: float,
+        cap: int,
+    ) -> None:
+        """쿨다운 길이를 정하는 관측 표본 하나를 남긴다.
+
+        리컨실러는 이 표본들의 p90 으로 축소 쿨다운을 정한다. 프로세스 메모리에만
+        두면 컨트롤러가 재시작되거나 리더가 바뀔 때 표본이 사라지고, 다시 쌓일 때까지
+        쿨다운이 0 이 되어 축소가 무조건 통과한다. 실험은 매번 컨트롤러를 재시작하므로
+        그 구간이 항상 생긴다.
+
+        표본은 컨트롤러 사이에 공유해도 되는 값이다 - 이 클러스터에서 파드를 세우는 데
+        걸리는 시간과 수요가 가라앉아 있는 시간이라, 누가 관측했는지는 상관이 없다.
+        리더가 아닌 쪽도 파드 이벤트를 보기 때문에 공유하면 표본이 더 빨리 모인다.
+
+        값이 밀리면 오래된 것부터 버린다. TTL 은 두지 않는다 - 부하가 없는 밤에
+        표본이 만료되면 아침 첫 축소가 쿨다운 없이 지나간다.
+        """
+        client = self._redis_client()
+        key = self._churn_samples_key(compute_type, kind)
+        with client.pipeline(transaction=False) as pipe:
+            pipe.rpush(key, repr(float(value)))
+            pipe.ltrim(key, -int(max(1, cap)), -1)
+            pipe.execute()
+
+    def churn_samples(self, compute_type: str, kind: str) -> List[float]:
+        """record_churn_sample 로 쌓인 표본. 읽을 수 없으면 빈 목록."""
+        client = self._redis_client()
+        raw = client.lrange(self._churn_samples_key(compute_type, kind), 0, -1) or []
+        values = []
+        for item in raw:
+            try:
+                values.append(float(item))
+            except (TypeError, ValueError):
+                continue
+        return values
+
     def _buffer_policy_ready_key(self) -> str:
         return f"{self.prefix}:buffer-policy-ready"
 

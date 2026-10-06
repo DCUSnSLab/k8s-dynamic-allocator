@@ -3,7 +3,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Callable, Dict, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 from config import settings
 
@@ -147,7 +147,8 @@ class BufferCapacityReconciler:
         시간만큼 기다린다. 그보다 짧게 기다리고 줄일 이유가 없다.
         """
         with self._churn_lock:
-            creates = sorted(self._churn_state(compute_type)["creates"])
+            local = list(self._churn_state(compute_type)["creates"])
+        creates = sorted(self._shared_or_local(compute_type, "create", local))
         if len(creates) < self.cooldown_min_samples:
             return 0.0
         return float(creates[min(len(creates) - 1, int(len(creates) * quantile))])
@@ -170,8 +171,54 @@ class BufferCapacityReconciler:
                 "cooldown": None,
                 # (관측 시각, 그때의 목표). 쿨다운 창 밖으로 나간 것은 버린다.
                 "targets": [],
+                # 이 프로세스가 이 타입의 목표를 보기 시작한 시각. targets 가 쿨다운
+                # 창을 아직 덮지 못했는지 판정한다.
+                "observing_since": None,
             },
         )
+
+    def _share_sample(self, compute_type: str, kind: str, value: float) -> None:
+        """표본을 컨트롤러 사이에 공유한다. 실패는 무시한다.
+
+        쿨다운 표본이 프로세스 메모리에만 있으면 컨트롤러가 재시작되거나 리더가 바뀔 때
+        사라지고, 다시 열 개가 쌓일 때까지 쿨다운이 0 이 되어 수요 축소가 무조건 통과한다.
+        표본 자체는 "이 클러스터에서 파드를 세우는 데 걸리는 시간" 과 "수요가 가라앉아
+        있는 시간" 이라 누가 관측했는지와 무관하므로 공유해도 된다.
+
+        쓰는 것은 리더만 한다. 양쪽이 같은 파드의 Ready 를 보고 각자 넣으면 같은 값이
+        두 번 들어가고, 중복 제거는 프로세스별이라 막지 못한다. 읽기는 둘 다 한다 -
+        리더가 바뀐 쪽이 이어서 쓰는 것이 이 수정의 목적이다.
+
+        실험 시작 때는 reset_server 가 Redis 를 비우므로 표본이 없는 상태로 출발한다.
+        그것은 의도된 것이다(매 실행을 같은 조건에서 시작). 이 수정이 덮는 것은 실행
+        중간의 재시작과 리더 교체다.
+        """
+        try:
+            if not self._has_write_authority():
+                return
+            self.queues.record_churn_sample(
+                compute_type, kind, float(value), self.cooldown_samples
+            )
+        except Exception as exc:
+            logger.debug(
+                "[BufferChurnSampleSkipped] compute_type=%s kind=%s reason=%r",
+                compute_type,
+                kind,
+                str(exc),
+            )
+
+    def _shared_or_local(
+        self,
+        compute_type: str,
+        kind: str,
+        local: List[float],
+    ) -> List[float]:
+        """공유 표본이 더 많으면 그것을 쓰고, 읽을 수 없으면 메모리 쪽으로 물러선다."""
+        try:
+            shared = self.queues.churn_samples(compute_type, kind)
+        except Exception:
+            return local
+        return shared if len(shared) >= len(local) else local
 
     def cooldown_seconds(self, compute_type: str) -> float:
         """관측값 두 개의 큰 쪽. 설정에 적힌 숫자가 아니다.
@@ -196,7 +243,8 @@ class BufferCapacityReconciler:
         표본이 모이기 전에는 하한을 쓴다. 기동 직후가 그 상태다.
         """
         with self._churn_lock:
-            dips = sorted(self._churn_state(compute_type)["dips"])
+            local_dips = list(self._churn_state(compute_type)["dips"])
+        dips = sorted(self._shared_or_local(compute_type, "dip", local_dips))
 
         def high(values):
             if len(values) < self.cooldown_min_samples:
@@ -220,8 +268,11 @@ class BufferCapacityReconciler:
         now = time.monotonic()
         target = int(desired)
         cutoff = now - max(0.0, cooldown)
+        shared_dip = None
         with self._churn_lock:
             state = self._churn_state(compute_type)
+            if state["observing_since"] is None:
+                state["observing_since"] = now
 
             previous = state["last_target"]
             if previous is not None:
@@ -229,16 +280,20 @@ class BufferCapacityReconciler:
                     if target < previous:
                         state["dip_started_at"] = now
                 elif target > previous:
-                    state["dips"].append(now - state["dip_started_at"])
+                    dip = now - state["dip_started_at"]
+                    state["dips"].append(dip)
                     if len(state["dips"]) > self.cooldown_samples:
                         del state["dips"][: len(state["dips"]) - self.cooldown_samples]
                     state["dip_started_at"] = None
+                    shared_dip = dip
             state["last_target"] = target
 
             targets = state["targets"]
             targets.append((now, target))
             while targets and targets[0][0] < cutoff:
                 targets.pop(0)
+        if shared_dip is not None:
+            self._share_sample(compute_type, "dip", shared_dip)
 
     def _cooldown_blocks_scale_down(
         self,
@@ -260,6 +315,18 @@ class BufferCapacityReconciler:
         with self._churn_lock:
             state = self._churn_state(compute_type)
             state["cooldown"] = cooldown
+            observing_since = state["observing_since"]
+            # 이력이 창을 아직 덮지 못했으면 "창 안에 더 높은 목표가 없었다" 를 말할 수
+            # 없다. 이 프로세스가 방금 떴거나 리더가 막 바뀐 상태이고, 직전 리더가 1초
+            # 전에 본 높은 목표를 우리는 모른다. 덮을 때까지는 기다린다 - 수요 축소를
+            # 미루는 쪽은 파드를 들고 있는 방향이라 되돌릴 수 있고, 반대로 통과시키면
+            # 되돌릴 수 없는 삭제가 된다. N 보장은 용량 트림이 따로 하므로 이 보류가
+            # 한도를 열어 두지는 않는다.
+            if observing_since is not None:
+                observed = now - observing_since
+                if observed < cooldown:
+                    state["held_back"] += 1
+                    return cooldown - observed
             higher = [(at, value) for at, value in state["targets"] if value > int(desired)]
             if not higher:
                 return None
@@ -390,6 +457,7 @@ class BufferCapacityReconciler:
             state["creates"].append(seconds)
             if len(state["creates"]) > self.cooldown_samples:
                 del state["creates"][: len(state["creates"]) - self.cooldown_samples]
+        self._share_sample(compute_type, "create", seconds)
 
     def on_deployment_event(
         self,
