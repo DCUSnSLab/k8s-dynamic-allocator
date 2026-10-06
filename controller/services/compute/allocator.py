@@ -179,6 +179,17 @@ class ComputeAllocator:
         if not reserved_tickets:
             return result
 
+        # 가져간 자리만큼 replicas 를 내린다. 라벨을 바꾼 "직후, 마운트 시작 전" 이
+        # 이 일을 할 자리다 - 아래 마운트는 수 초가 걸리고, 그 사이에 ReplicaSet 이
+        # 빈 자리를 채워 버리면 합이 N 을 넘는다.
+        self._lower_replicas_for_claims(
+            compute_type_value=compute_type_value,
+            policy=policy,
+            room_before=remaining_capacity,
+            assigned_before=int(snapshot["buffer_assigned"]),
+            claims=len(reserved_tickets),
+        )
+
         executions: List[Dict] = []
         if mount_concurrency <= 1 or len(reserved_tickets) == 1:
             for ticket in reserved_tickets:
@@ -262,6 +273,80 @@ class ComputeAllocator:
                 "status": "error",
                 "message": str(exc),
             }
+
+    def _lower_replicas_for_claims(
+        self,
+        *,
+        compute_type_value: str,
+        policy: Dict,
+        room_before: int,
+        assigned_before: int,
+        claims: int,
+    ) -> None:
+        """방금 가져간 자리만큼 replicas 를 내려 replicas <= N - assigned 를 지킨다.
+
+        할당된 파드는 compute-status 라벨이 바뀌어 Deployment selector 에서 빠지고,
+        ReplicaSet 은 그 자리를 새 파드로 채운다. replicas 가 남은 자리보다 크면 그렇게
+        채워진 파드가 N 을 넘기므로, assigned 를 늘린 쪽이 그 자리를 같이 반납해야 한다.
+
+        전에는 이 일을 리더의 리컨실러만 했다. 할당은 모든 복제본에서 일어나는데 조정은
+        리더의 다음 패스까지 기다리므로, 그 시간차가 그대로 N 초과 구간이 됐다 - 실측
+        12구간, 최장 44.4초, 최대 90개(N=80). 할당한 쪽이 그 자리에서 내리면 남는 창은
+        API 호출 한 번이고, 대개는 ReplicaSet 이 만들기 전에 끝나 생성 자체가 일어나지
+        않는다. 만들어진 뒤에 지우는 것이 아니라 만들지 않게 하는 것이다.
+
+        기준은 "천장에 붙어 있나" 가 아니라 N 불변식 하나다: replicas 가 남은 자리 안이면
+        손대지 않는다. 그 경우 채워지는 파드는 N 이 허락하는 것이고, 다음 사용자가
+        기다리지 않게 하려고 두는 버퍼다. 이 한 줄이 저부하(자리가 넉넉)와 확대 중(큐는
+        길지만 replicas 가 아직 목표보다 낮음)을 모두 올바르게 비켜 간다 - 둘 다 줄이면
+        안 되는 경우이고, 전자를 천장 판정으로 걸러도 후자는 걸러지지 않았다.
+
+        내리는 폭은 "내가 가져간 수" 로 묶는다. 지금 자리만 보고 절대값으로 쓰면, 동시에
+        할당한 복제본 둘이 같은 스냅샷에서 같은 값을 얻어 감소 하나를 잃는다. 가져간 수는
+        각자의 사실이라 조건부 패치와 합쳐지면 60 -> 59 -> 58 로 정확히 쌓인다.
+
+        실패해도 할당은 성공으로 끝낸다. 리더가 다음 패스에서 맞추므로 최악이 지금까지의
+        동작이다.
+        """
+        if claims <= 0:
+            return
+        deployment_name = policy.get("deployment_name")
+        if not deployment_name:
+            return
+        room_after = max(0, int(room_before) - int(claims))
+        try:
+            for _ in range(3):
+                current = int(self.provider.read_deployment_replicas(deployment_name))
+                if current <= room_after:
+                    # 이미 자리 안이다. 채워지는 파드는 N 이 허락하는 것이므로
+                    # 그대로 둔다 - 이것이 다음 사용자를 기다리지 않게 하는 버퍼다.
+                    return
+                target = min(current - int(claims), room_after)
+                if self.provider.lower_deployment_replicas(
+                    deployment_name,
+                    current,
+                    target,
+                ):
+                    logger.info(
+                        "[BufferSlotReturned] compute_type=%s replicas=%s->%s claims=%s "
+                        "assigned=%s room=%s->%s N=%s",
+                        compute_type_value,
+                        current,
+                        max(0, target),
+                        claims,
+                        assigned_before,
+                        room_before,
+                        room_after,
+                        policy["N"],
+                    )
+                    return
+        except Exception as exc:
+            logger.warning(
+                "[Warning] operation=buffer_slot_return compute_type=%s claims=%s reason=%r",
+                compute_type_value,
+                claims,
+                str(exc),
+            )
 
     def _reserve_compute_pod_for_ticket(
         self,

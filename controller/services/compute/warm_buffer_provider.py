@@ -674,6 +674,49 @@ class WarmBufferProvider(KubernetesClient):
         )
         return int(getattr(getattr(scale, "spec", None), "replicas", desired) or 0)
 
+    def lower_deployment_replicas(
+        self,
+        deployment_name: str,
+        expected: int,
+        desired: int,
+    ) -> bool:
+        """replicas 를 expected 에서 desired 로 내린다. 값이 달라져 있으면 아무것도 안 한다.
+
+        할당기가 부르는 자리다. 지금까지 replicas 는 리더의 리컨실러만 썼으므로
+        patch_deployment_replicas 는 조건 없이 덮어쓴다. 복제본 여러 개가 동시에
+        할당하면서 그렇게 쓰면 둘이 같은 60을 읽고 각자 59를 써서 감소 하나가
+        사라진다. 읽은 값을 test 로 확인하면 그 일이 원리적으로 생기지 않는다 -
+        assign_pod 이 파드 라벨에 쓰는 것과 같은 방식이다.
+
+        내리기만 한다. 올리는 것은 headroom 검사가 붙은 리컨실러에만 둔다.
+        값이 달라졌으면 False 를 돌려주고, 호출자가 다시 읽어 판단한다.
+        """
+        target = max(0, int(desired))
+        if target >= int(expected):
+            return False
+        patch = [
+            {"op": "test", "path": "/spec/replicas", "value": int(expected)},
+            {"op": "replace", "path": "/spec/replicas", "value": target},
+        ]
+        try:
+            self.apps_v1.api_client.call_api(
+                "/apis/apps/v1/namespaces/{namespace}/deployments/{name}/scale",
+                "PATCH",
+                path_params={"namespace": self.namespace, "name": deployment_name},
+                body=patch,
+                header_params={"Content-Type": "application/json-patch+json"},
+                auth_settings=["BearerToken"],
+                _return_http_data_only=True,
+                _preload_content=True,
+                _request_timeout=self.api_request_timeout,
+            )
+        except ApiException as exc:
+            # 409/422 는 test 가 틀렸다는 뜻이다 - 그사이 누군가 바꿨다.
+            if exc.status in (409, 422):
+                return False
+            raise
+        return True
+
     def assign_pod(
         self,
         pod_name: str,

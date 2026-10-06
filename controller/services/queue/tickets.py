@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -59,6 +60,14 @@ class Tickets:
     FINAL_STATES = {"assigned", "failed", "cancelled"}
     ACTIVE_STATES = {"queued", "allocating"}
     TRANSIENT_STATES = ACTIVE_STATES | FINAL_STATES
+
+    # 상태 전이의 낙관적 잠금 재시도. 실패의 대가가 크다 - 커밋이 깨지면 이미
+    # Ready 이고 마운트까지 끝난 파드를 버리고 요청이 큐로 돌아간다. 그래서 몇 번
+    # 더 시도하는 쪽이 싸다. 손으로 고른 숫자가 아니라 "경합이 풀릴 때까지"를
+    # 지수 백오프로 덮는 값이다: 0.01초에서 시작해 6번이면 0.3초 남짓을 덮고,
+    # 실측 경합(한 패스의 큐 쓰기 묶음)은 그보다 짧다.
+    TRANSITION_ATTEMPTS = 6
+    TRANSITION_BACKOFF_SECONDS = 0.01
 
     # HSET has no "only if the key exists" form, so guard it in one round trip.
     # A waiting ticket's TTL is renewed too, so a long queue never expires the
@@ -337,13 +346,23 @@ class Tickets:
         active_key = self.queue._active_key(queue_compute_type) if queue_compute_type else None
         expected = {status.lower() for status in expected_statuses}
 
-        for _ in range(3):
+        # 큐와 active 집합은 그 "내용을 읽어 결정을 바꾸는" 경우에만 감시한다 -
+        # ensure_in_queue 가 _queue_contains 를 트랜잭션 안에서 읽는 그 경우뿐이다.
+        # 전에는 항상 감시했는데, 그 두 키는 compute type 전체가 공유하므로 다른
+        # 티켓이 큐에 들어오거나 빠지기만 해도 내 커밋이 충돌로 깨졌다. 실측에서
+        # 8시간에 366건이 그렇게 실패했고(할당의 10.6%, 피크가 심한 구간에 150건),
+        # 실패하면 이미 Ready 이고 마운트까지 끝난 파드를 버리고 요청을 큐로 되돌린다.
+        # ZREM 과 SREM 은 멤버를 지정해 지우므로 동시 변경과 무관하게 안전하고,
+        # 감시할 이유가 없다.
+        watch_shared = bool(ensure_in_queue)
+
+        for attempt in range(self.TRANSITION_ATTEMPTS):
             try:
                 with client.pipeline() as pipe:
                     watch_keys = [ticket_key]
-                    if queue_key:
+                    if watch_shared and queue_key:
                         watch_keys.append(queue_key)
-                    if active_key:
+                    if watch_shared and active_key:
                         watch_keys.append(active_key)
                     pipe.watch(*watch_keys)
                     raw = pipe.hgetall(ticket_key)
@@ -386,6 +405,16 @@ class Tickets:
                     pipe.execute()
                     return self.get_ticket(ticket_id)
             except WatchError:
+                # 지터를 준 백오프. 전에는 대기 없이 3번이었는데, 충돌이란 곧 다른
+                # 쓰기가 진행 중이라는 뜻이라 즉시 재시도는 같은 경합에 다시 뛰어든다.
+                # 지터가 없으면 동시에 깨진 호출들이 같은 박자로 재시도해 서로를
+                # 계속 깨뜨린다.
+                if attempt + 1 < self.TRANSITION_ATTEMPTS:
+                    time.sleep(
+                        self.TRANSITION_BACKOFF_SECONDS
+                        * (2 ** attempt)
+                        * (0.5 + random.random())
+                    )
                 continue
         raise QueueUnavailableError(f"Failed to update ticket {ticket_id}: concurrent modification detected")
 
