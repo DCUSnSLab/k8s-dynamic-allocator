@@ -301,9 +301,16 @@ class ComputeAllocator:
         길지만 replicas 가 아직 목표보다 낮음)을 모두 올바르게 비켜 간다 - 둘 다 줄이면
         안 되는 경우이고, 전자를 천장 판정으로 걸러도 후자는 걸러지지 않았다.
 
-        내리는 폭은 "내가 가져간 수" 로 묶는다. 지금 자리만 보고 절대값으로 쓰면, 동시에
-        할당한 복제본 둘이 같은 스냅샷에서 같은 값을 얻어 감소 하나를 잃는다. 가져간 수는
-        각자의 사실이라 조건부 패치와 합쳐지면 60 -> 59 -> 58 로 정확히 쌓인다.
+        내릴 값은 남은 자리(N - assigned) 자체다. replicas 에서 가져간 수를 빼면 두 번
+        빼는 것이 된다 - 할당된 파드는 이미 selector 에서 빠져 available 이 그만큼 줄어
+        있고, replicas 는 그 빈자리를 채우라는 지시다. 실측에서 replicas 6, 자리 11 에서
+        6개를 가져갔을 때 5 가 아니라 0 으로 내려가 버퍼가 비었고, 리더가 다시 올리는
+        사이에 파드 272개가 Ready 전에 지워졌다.
+
+        절대값으로 써도 경합은 문제가 되지 않는다. 할당 자체가 compute type 당
+        allocator lock 아래에서 직렬화되므로 claims 는 그사이 늘지 않고, 반납으로 줄기만
+        한다(그 경우 이 값이 보수적이 되고 리더가 즉시 올린다). 패치가 test 에서 밀렸다면
+        더 최근 값을 본 쪽이 이미 썼다는 뜻이므로, 다시 읽어 자리 안이면 그대로 둔다.
 
         실패해도 할당은 성공으로 끝낸다. 리더가 다음 패스에서 맞추므로 최악이 지금까지의
         동작이다.
@@ -321,18 +328,17 @@ class ComputeAllocator:
                     # 이미 자리 안이다. 채워지는 파드는 N 이 허락하는 것이므로
                     # 그대로 둔다 - 이것이 다음 사용자를 기다리지 않게 하는 버퍼다.
                     return
-                target = min(current - int(claims), room_after)
                 if self.provider.lower_deployment_replicas(
                     deployment_name,
                     current,
-                    target,
+                    room_after,
                 ):
                     logger.info(
                         "[BufferSlotReturned] compute_type=%s replicas=%s->%s claims=%s "
                         "assigned=%s room=%s->%s N=%s",
                         compute_type_value,
                         current,
-                        max(0, target),
+                        room_after,
                         claims,
                         assigned_before,
                         room_before,
