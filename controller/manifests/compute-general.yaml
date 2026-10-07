@@ -24,8 +24,19 @@ spec:
         assigned-user: ""
     spec:
       # Same general-purpose nodes as the user pods; keeps compute pods off the GPU nodes.
+      #
+      # The second label narrows that set to the nodes this experiment may fill.
+      # n4-k8s carries kubessh=general_node like n1-n3 but its kubelet keeps the
+      # default maxPods of 110 while n1-n3 were raised to 250, and it hosts the
+      # harbor registry, prometheus and several databases on local volumes. Pod
+      # slots are an admission limit, not a resource one, so filling those 110
+      # leaves n4 unable to place a rescheduled pod however much CPU and memory
+      # are free - including the harbor pods this experiment pulls its images
+      # from. The label is ours alone, so n4 keeps serving the real user pods
+      # that select on kubessh=general_node; adding it back to n4 reverts this.
       nodeSelector:
         kubessh: general_node
+        k8s-dynamic-allocator/compute: "true"
       containers:
       - name: compute-agent
         image: harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:latest
