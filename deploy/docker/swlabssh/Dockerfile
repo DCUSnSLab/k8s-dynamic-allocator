@@ -14,6 +14,13 @@ RUN apk add libffi-dev
 RUN apk add openssh-keygen
 
 RUN pip install --upgrade pip
+# setup.py names the dependencies without versions, so an editable install on
+# its own takes whatever is newest. kubernetes 32.0 made content_type a required
+# argument of ApiClient.deserialize, which kubessh calls with two arguments in
+# serialization.py, so a cache-less build fails at make_pod_spec. dcusshk8s
+# already pins the working range in requirements.txt; install that first and the
+# editable install finds every dependency satisfied.
+RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --editable .
 
 RUN apk add vim
