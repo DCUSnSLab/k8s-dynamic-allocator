@@ -573,7 +573,6 @@ class ComputeReleaser:
                 return _delete("deleted_return_failed", reuse_count=reuse_count, **fields)
             if state == "returned":
                 self._set_compute_available_best_effort(compute_pod, available_since)
-                self._claim_replica_slot_for_return(compute_type)
                 return _finish("returned", reuse_count=reuse_count + 1, **fields)
             if state == "gone":
                 return self._ignore_release(compute_pod, target_ticket, pod_ticket, "already_released")
@@ -581,57 +580,7 @@ class ComputeReleaser:
 
         relabel_ms = _elapsed_ms(relabel_started)
         self._set_compute_available_best_effort(compute_pod, available_since)
-        self._claim_replica_slot_for_return(compute_type)
         return _finish("returned", relabel_ms=relabel_ms, reuse_count=reuse_count + 1, **scrub_fields)
-
-    def _claim_replica_slot_for_return(self, compute_type: str) -> None:
-        """되돌린 파드 한 개를 replicas 에 반영한다. 실패해도 반납은 성공으로 끝낸다.
-
-        되돌린 파드는 compute-status 가 available 로 바뀌면서 Deployment selector 안으로
-        다시 들어온다. replicas 를 그대로 두면 ReplicaSet 이 "지시보다 하나 많다" 고 보고
-        방금 되돌린(정리까지 끝낸) 파드를 지운다. 실측에서 요청 631건에 파드 667개가
-        만들어지고 666개가 지워졌다 - 재사용의 이득이 전부 거기서 사라졌다.
-
-        할당기가 할당할 때 그만큼 내려 두므로(allocator._lower_replicas_for_claims), 여기서
-        하나 올리면 숫자가 제자리로 온다. 파드를 새로 만드는 것이 아니라 이미 있는 파드를
-        숫자에 반영하는 것이라 점유량은 늘지 않는다.
-
-        리컨실러의 목표(수요에 따른 available 수)는 그대로 둔다. 수요가 꺼지면 리컨실러가
-        정책대로 줄이고, 그때는 되돌린 파드도 지워진다 - 그것은 버퍼 정책이지 이 경로의
-        몫이 아니다.
-        """
-        try:
-            policy = self.queues.get_buffer_policy(compute_type)
-            if not policy:
-                return
-            deployment_name = policy.get("deployment_name")
-            if not deployment_name:
-                return
-            ceiling = int(policy.get("N") or 0)
-            for _ in range(3):
-                current = int(self.provider.read_deployment_replicas(deployment_name))
-                target = current + 1
-                if ceiling > 0 and target > ceiling:
-                    return
-                if self.provider.raise_deployment_replicas(
-                    deployment_name,
-                    current,
-                    target,
-                ):
-                    logger.info(
-                        "[BufferSlotRestored] compute_type=%s replicas=%s->%s N=%s",
-                        compute_type,
-                        current,
-                        target,
-                        ceiling,
-                    )
-                    return
-        except Exception as exc:  # noqa: BLE001 - 숫자 보정이 반납을 막지 않는다
-            logger.warning(
-                "[Warning] operation=buffer_slot_restore compute_type=%s reason=%r",
-                compute_type,
-                str(exc),
-            )
 
     def _lock_too_old_to_relabel(self, lock_started: float) -> bool:
         """True once cleanup's stale-lock sweep could be taking the lock over.

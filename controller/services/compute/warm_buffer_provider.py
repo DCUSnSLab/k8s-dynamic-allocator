@@ -756,49 +756,6 @@ class WarmBufferProvider(KubernetesClient):
             raise
         return True
 
-    def raise_deployment_replicas(
-        self,
-        deployment_name: str,
-        expected: int,
-        desired: int,
-    ) -> bool:
-        """replicas 를 expected 에서 desired 로 올린다. 값이 달라져 있으면 아무것도 안 한다.
-
-        재사용 arm 의 반납 경로가 부른다. 되돌린 파드는 다시 selector 안으로 들어오므로,
-        그 수만큼 replicas 를 올려 두지 않으면 ReplicaSet 이 "지시보다 많다" 고 보고 방금
-        되돌린 파드를 지운다 - 재사용의 이득이 거기서 사라진다.
-
-        이 호출은 파드를 새로 만들지 않는다. 이미 존재하는(그리고 막 selector 로 돌아온)
-        파드 하나를 숫자에 반영하는 것이므로 점유량이 늘지 않는다.
-
-        조건부로 쓴다. 리컨실러와 할당기도 같은 값을 쓰기 때문에, 읽은 값이 그대로일
-        때만 바꿔야 서로의 변경을 덮지 않는다.
-        """
-        target = int(desired)
-        if target <= int(expected):
-            return False
-        patch = [
-            {"op": "test", "path": "/spec/replicas", "value": int(expected)},
-            {"op": "replace", "path": "/spec/replicas", "value": target},
-        ]
-        try:
-            self.apps_v1.api_client.call_api(
-                "/apis/apps/v1/namespaces/{namespace}/deployments/{name}/scale",
-                "PATCH",
-                path_params={"namespace": self.namespace, "name": deployment_name},
-                body=patch,
-                header_params={"Content-Type": "application/json-patch+json"},
-                auth_settings=["BearerToken"],
-                _return_http_data_only=True,
-                _preload_content=True,
-                _request_timeout=self.api_request_timeout,
-            )
-        except ApiException as exc:
-            if exc.status in (409, 422):
-                return False
-            raise
-        return True
-
     def assign_pod(
         self,
         pod_name: str,
