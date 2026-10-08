@@ -17,6 +17,10 @@ spec:
       labels:
         app: controller-queue-redis
     spec:
+      # controller.yaml 과 같은 이유로 n4 를 비워 둔다. 큐가 n4 에서 밀려
+      # 재생성되지 못하면 실행 중인 실험의 티켓이 전부 묶인다.
+      nodeSelector:
+        k8s-dynamic-allocator/workload: "true"
       containers:
       - name: redis
         image: redis:7.2-alpine
