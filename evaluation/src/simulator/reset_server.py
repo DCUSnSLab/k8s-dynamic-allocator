@@ -17,17 +17,29 @@ def main() -> None:
         )
     )
     parser.add_argument("--clear-logs", action="store_true", help="Also delete collected JSONL logs on logs-pvc.")
+    parser.add_argument(
+        "--recreate-user-pods",
+        action="store_true",
+        help=(
+            "Also delete user pods and their PVCs so the next run builds them again. "
+            "Needed when switching to an arm whose user pod shape differs, such as "
+            "between baseline and the others."
+        ),
+    )
     parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
     args = parser.parse_args()
 
     if not args.yes:
         extra = " and all collected logs" if args.clear_logs else ""
-        answer = input(f"Reset namespace {KUBERNETES_NAMESPACE}: Redis kda:* keys, compute pods{extra}. Type 'yes': ")
+        pods = ", user pods and their PVCs" if args.recreate_user_pods else ""
+        answer = input(
+            f"Reset namespace {KUBERNETES_NAMESPACE}: Redis kda:* keys, compute pods{pods}{extra}. Type 'yes': "
+        )
         if answer.strip() != "yes":
             raise SystemExit("Aborted")
 
     try:
-        reset_server(clear_logs=args.clear_logs)
+        reset_server(clear_logs=args.clear_logs, recreate_user_pods=args.recreate_user_pods)
     except ResetError as exc:
         raise SystemExit(f"Reset failed: {exc}") from exc
 

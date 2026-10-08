@@ -23,12 +23,20 @@ ROLLOUT_TIMEOUT = "5m"
 COMMAND_TIMEOUT_SECONDS = 360
 LOG_READER_POD = "kda-log-reset"
 
+# Reading this label is safe - the production service uses it too, but only in
+# its own namespace, and nothing here changes it.
+USER_POD_SELECTOR = "kubessh=userpods"
+USER_CLAIM_PREFIX = "ssh-"
+USER_CLAIM_SUFFIX = "-pvc"
+# A hundred Longhorn volumes take far longer to detach and delete than a pod.
+USER_POD_TIMEOUT_SECONDS = 900
+
 
 class ResetError(RuntimeError):
     pass
 
 
-def reset_server(*, clear_logs: bool) -> None:
+def reset_server(*, clear_logs: bool, recreate_user_pods: bool = False) -> None:
     controller_replicas = _controller_replicas()
 
     _step(f"Stop controllers (replicas {controller_replicas} -> 0)")
@@ -52,6 +60,17 @@ def reset_server(*, clear_logs: bool) -> None:
     _step("Delete compute pods outside the Deployment")
     _kubectl("delete", "pod", "-l", "app=compute-pod,compute-status=assigned", "--wait=true", "--timeout=120s")
 
+    # Arms do not share a user pod shape: the work runs inside the user pod in
+    # the baseline arm, so its shell container carries a compute pod's limits,
+    # while the other arms leave it at the shell's own small limits. A pod that
+    # survives the switch keeps the previous arm's shape, and the PVC has to go
+    # with it because the next pod would bind the same volume. Controllers are
+    # already stopped and swlabssh is restarted below, so nothing recreates a
+    # pod in between.
+    if recreate_user_pods:
+        _step("Delete user pods and their PVCs")
+        _delete_user_pods_and_claims()
+
     _step(f"Start controllers (replicas 0 -> {controller_replicas}) and restart swlabssh, compute-general")
     _kubectl("scale", "deployment/controller", f"--replicas={controller_replicas}")
     _kubectl("rollout", "restart", "deployment/swlabssh", "deployment/compute-general")
@@ -68,6 +87,52 @@ def reset_server(*, clear_logs: bool) -> None:
     settings = read_server_settings()
     print(f"\nServer: {describe_settings(settings)}")
     print(f"Redis keys matching {REDIS_KEY_PATTERN}: {_redis_key_count()} (controllers republish sessions policy)")
+
+
+def _delete_user_pods_and_claims() -> None:
+    # The claims carry no label of their own, so they are matched by the name
+    # swlabssh gives them. Narrowing on both ends keeps logs-pvc and the Redis
+    # claim out of it; deleting either would lose the collected logs or the
+    # queue's volume.
+    claims = [
+        name
+        for name in _resource_names("pvc")
+        if name.startswith(USER_CLAIM_PREFIX) and name.endswith(USER_CLAIM_SUFFIX)
+    ]
+    pods = _resource_names("pod", "-l", USER_POD_SELECTOR)
+    print(f"  pods: {len(pods)}  claims: {len(claims)}")
+
+    # Pods first. A claim still mounted by a running pod sits in Terminating
+    # until that pod goes away.
+    if pods:
+        _kubectl(
+            "delete", "pod", "-l", USER_POD_SELECTOR,
+            "--wait=true", f"--timeout={USER_POD_TIMEOUT_SECONDS}s",
+            timeout=USER_POD_TIMEOUT_SECONDS,
+        )
+    if claims:
+        _kubectl(
+            "delete", "pvc", *claims,
+            "--wait=true", f"--timeout={USER_POD_TIMEOUT_SECONDS}s",
+            timeout=USER_POD_TIMEOUT_SECONDS,
+        )
+
+    left_pods = _resource_names("pod", "-l", USER_POD_SELECTOR)
+    left_claims = [
+        name
+        for name in _resource_names("pvc")
+        if name.startswith(USER_CLAIM_PREFIX) and name.endswith(USER_CLAIM_SUFFIX)
+    ]
+    if left_pods or left_claims:
+        raise ResetError(
+            f"{len(left_pods)} user pods and {len(left_claims)} claims are still there"
+        )
+    print("  pods: 0  claims: 0")
+
+
+def _resource_names(kind: str, *selector: str) -> list[str]:
+    output = _kubectl("get", kind, *selector, "-o", "name", allow_missing=True)
+    return [line.split("/", 1)[-1] for line in output.split() if "/" in line]
 
 
 def _controller_replicas() -> int:
@@ -109,13 +174,13 @@ def _step(message: str) -> None:
     print(f"\n[{time.strftime('%H:%M:%S')}] {message}")
 
 
-def _kubectl(*args: str, allow_missing: bool = False) -> str:
+def _kubectl(*args: str, allow_missing: bool = False, timeout: int = COMMAND_TIMEOUT_SECONDS) -> str:
     # Rollouts and pod deletions take far longer than a settings read, so this
     # reuses the shared runner with a longer deadline and reports as a reset.
     try:
         return run_kubectl(
             *args,
-            timeout=COMMAND_TIMEOUT_SECONDS,
+            timeout=timeout,
             allow_missing=allow_missing,
         )
     except ServerSettingsError as exc:
