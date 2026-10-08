@@ -72,11 +72,6 @@ class BufferCapacityReconciler:
         self._status: Dict[str, Dict] = {}
 
         self.dynamic_reserve = bool(settings.BUFFER_DYNAMIC_RESERVE_ENABLED)
-        # 재사용 방식만 "지금 들고 있는 수"를 기준으로 삼는다. 삭제 방식은 쓴 파드가
-        # 사라지므로 available 을 R 로 되돌리는 것이 제안 기법의 일부다.
-        self.reuse_keeps_pool = (
-            str(getattr(settings, "COMPUTE_ALLOCATION_MODE", "")) == "warm_buffer_reuse"
-        )
         self.cooldown_samples = max(
             1,
             int(settings.BUFFER_SCALE_DOWN_COOLDOWN_SAMPLES),
@@ -119,53 +114,6 @@ class BufferCapacityReconciler:
         if queued is None:
             return min(int(buffer_reserve), room)
         return min(max(int(buffer_reserve), int(queued)), room)
-
-    def _available_target(
-        self,
-        policy: Dict,
-        assigned: int,
-        queued: Optional[int],
-    ) -> int:
-        """이 패스에서 Deployment 에 지시할 available 수.
-
-        삭제 방식은 위의 desired_replicas 그대로다. 쓴 파드는 사라지므로 비워진 자리를
-        R 개로 다시 채우는 것이 맞다.
-
-        재사용 방식은 여유분에서 일하는 중인 파드를 뺀다.
-
-            desired = min(N - assigned, max(queued, R - assigned))
-
-        R 은 "곧 들어올 요청을 위해 미리 세워 둘 파드 수"다. 재사용에서는 일하는 중인
-        파드가 곧 돌아와 그 여유분이 되므로, **새로 만들어야 할 여유분은 R - assigned**
-        이다. 할당하면 목표가 하나 줄어 ReplicaSet 이 교체를 만들지 않고, 반납하면 하나
-        늘어 돌아온 파드가 그 자리를 채운다. 한 사이클에 생성도 삭제도 없다.
-
-        이것을 빼먹은 결과가 실측에 그대로 남아 있다. REUSE_LOW(λ18, R=2, N=70)에서
-        [BufferTarget] 2443 건의 목표가 모두 2 였고, assigned 가 22 인 순간에도 2 였다.
-        22 개가 돌아온다는 사실이 수식에 없어서 할당하면 교체를 만들고 돌아오면 지웠다.
-        재사용은 296 건 중 207 건(70%) 성공했는데 생성 절감은 1.4% 였고, 한 번도 쓰이지
-        않은 파드 205 개가 전부 ReplicaSet 에 지워졌다.
-
-        수요에 따른 확대·축소는 그대로다. 큐가 쌓이면 queued 가 목표를 올리고, 수요가
-        꺼지면 assigned 가 줄면서 목표가 R 로 돌아와 노는 파드가 정리된다. 축소를 막지
-        않는다 - 막으면 포화에서 풀이 N 에 붙은 채 내려오지 않는다. 다만 이 식은 상태를
-        보지 않는 순수 함수라, 반납 자체가 축소를 부르지는 않는다. 줄어드는 것은 수요가
-        줄 때뿐이고, 그때 돌아온 파드는 줄일 몫에 포함된다.
-
-        천장 N - assigned 는 그대로 둔다. 포화에서 목표가 0 이 되어, available 을 N 만큼
-        들고 있는 일이 생기지 않는다.
-        """
-        if not self.reuse_keeps_pool:
-            return self.desired_replicas(
-                policy["R"],
-                policy["N"],
-                assigned,
-                queued,
-            )
-        room = max(0, int(policy["N"]) - int(assigned))
-        headroom = max(0, int(policy["R"]) - int(assigned))
-        demand = headroom if queued is None else max(int(queued), headroom)
-        return max(0, min(demand, room))
 
     def _queued_for_target(self, compute_type: str) -> Optional[int]:
         """대기 중인 티켓 수. 고정 정책을 유지할 때는 None.
@@ -993,8 +941,9 @@ class BufferCapacityReconciler:
 
             snapshot = self.provider.list_buffer_snapshot(compute_type_value)
             queued = self._queued_for_target(compute_type_value)
-            desired = self._available_target(
-                policy,
+            desired = self.desired_replicas(
+                policy["R"],
+                policy["N"],
                 snapshot["buffer_assigned"],
                 queued,
             )
@@ -1168,8 +1117,9 @@ class BufferCapacityReconciler:
                     "reason": "policy_unavailable",
                 }
             snapshot = self.provider.list_buffer_snapshot(compute_type)
-            desired = self._available_target(
-                policy,
+            desired = self.desired_replicas(
+                policy["R"],
+                policy["N"],
                 snapshot["buffer_assigned"],
                 self._queued_for_target(compute_type),
             )
@@ -1357,8 +1307,9 @@ class BufferCapacityReconciler:
                 # 로 천장을 씌운다. 고정 정책에서는 이 식이 예전의 재계산과 정확히 같고,
                 # 동적 경로에서는 붕괴 방지만 더해진다.
                 room = max(0, int(policy["N"]) - int(snapshot["buffer_assigned"]))
-                fresh = self._available_target(
-                    policy,
+                fresh = self.desired_replicas(
+                    policy["R"],
+                    policy["N"],
                     snapshot["buffer_assigned"],
                     self._queued_for_target(compute_type),
                 )

@@ -321,32 +321,24 @@ class ComputeAllocator:
         if not deployment_name:
             return
         room_after = max(0, int(room_before) - int(claims))
-        # 재사용 arm 에서는 천장 여부와 무관하게 가져간 수만큼 내린다. 이 arm 은 세션이
-        # 끝난 파드를 지우지 않고 되돌리므로, 할당 중에 ReplicaSet 이 빈자리를 새 파드로
-        # 채워 두면 되돌아온 파드와 둘이 남아 하나가 지워진다. 실측에서 그 때문에 요청
-        # 631건에 파드 667개가 만들어지고 666개가 지워졌다(= 재사용 이득이 0). 할당할 때
-        # 내려 두면 backfill 이 일어나지 않고, 반납이 그 자리를 채운다(releaser 가 1 올린다).
-        reuse_mode = str(getattr(settings, "COMPUTE_ALLOCATION_MODE", "")) == "warm_buffer_reuse"
         try:
             for _ in range(3):
                 current = int(self.provider.read_deployment_replicas(deployment_name))
-                target = min(current - int(claims), room_after) if reuse_mode else room_after
-                target = max(0, target)
-                if current <= target:
+                if current <= room_after:
                     # 이미 자리 안이다. 채워지는 파드는 N 이 허락하는 것이므로
                     # 그대로 둔다 - 이것이 다음 사용자를 기다리지 않게 하는 버퍼다.
                     return
                 if self.provider.lower_deployment_replicas(
                     deployment_name,
                     current,
-                    target,
+                    room_after,
                 ):
                     logger.info(
                         "[BufferSlotReturned] compute_type=%s replicas=%s->%s claims=%s "
                         "assigned=%s room=%s->%s N=%s",
                         compute_type_value,
                         current,
-                        target,
+                        room_after,
                         claims,
                         assigned_before,
                         room_before,
