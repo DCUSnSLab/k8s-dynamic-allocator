@@ -23,6 +23,17 @@ spec:
             - matchExpressions:
               - key: node-role.kubernetes.io/control-plane
                 operator: DoesNotExist
+              # 로그를 거둘 노드를 우리 라벨로 못박는다. 이 파드는 logs-pvc 를
+              # 마운트하는데 그것이 Longhorn 볼륨이라, 클러스터에 막 붙은 노드에서는
+              # Longhorn 과 CNI 가 올라오기 전까지 뜰 수 없다. 아래 tolerations 가
+              # 모든 taint 를 무시하므로 DaemonSet 은 NotReady 인 그 노드에도
+              # 파드를 넣고, FailedAttachVolume 로 영원히 ContainerCreating 에
+              # 머문다. 운영 서비스가 쓰는 라벨을 건드리지 않으려고 우리 라벨을
+              # 더하는 방식이며, 새 노드를 실험에 넣을 때 라벨을 붙이면 된다.
+              - key: k8s-dynamic-allocator/logs
+                operator: In
+                values:
+                - "true"
       tolerations:
       - operator: Exists
         effect: NoSchedule
