@@ -20,6 +20,14 @@ spec:
       labels:
         app: controller
     spec:
+      # 실험 워크로드를 올리는 노드에만 둔다. n4 는 kubelet 의 maxPods 가 기본값
+      # 110 인데 다른 노드는 250 이고, 다른 네임스페이스의 파드가 이미 80 개
+      # 올라가 있다. 그 한도는 admission 단계에서 걸리는 것이라 CPU 와 메모리가
+      # 남아 있어도 파드 생성이 막히고, n4 에 고정된 StatefulSet 이 재생성되지
+      # 못하는 일이 생긴다. 운영 서비스가 쓰는 라벨은 건드리지 않고 우리 라벨을
+      # 더하는 방식이다.
+      nodeSelector:
+        k8s-dynamic-allocator/workload: "true"
       serviceAccountName: controller-sa
       containers:
       - name: controller

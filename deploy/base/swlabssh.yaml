@@ -70,6 +70,11 @@ spec:
         app: swlabssh
         kubessh: swlabssh
     spec:
+      # controller.yaml 과 같은 이유로 n4 를 비워 둔다. user pod 자체는 더 좁게
+      # n1~n3 으로 묶여 있고(서브모듈의 pod_template), 이쪽은 그 파드를 만들어
+      # 주는 게이트웨이라 n4 만 빼면 된다.
+      nodeSelector:
+        k8s-dynamic-allocator/workload: "true"
       serviceAccountName: swlabssh
       containers:
         - name: swlabssh

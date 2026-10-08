@@ -23,14 +23,17 @@ spec:
             - matchExpressions:
               - key: node-role.kubernetes.io/control-plane
                 operator: DoesNotExist
-              # 로그를 거둘 노드를 우리 라벨로 못박는다. 이 파드는 logs-pvc 를
-              # 마운트하는데 그것이 Longhorn 볼륨이라, 클러스터에 막 붙은 노드에서는
-              # Longhorn 과 CNI 가 올라오기 전까지 뜰 수 없다. 아래 tolerations 가
-              # 모든 taint 를 무시하므로 DaemonSet 은 NotReady 인 그 노드에도
-              # 파드를 넣고, FailedAttachVolume 로 영원히 ContainerCreating 에
-              # 머문다. 운영 서비스가 쓰는 라벨을 건드리지 않으려고 우리 라벨을
-              # 더하는 방식이며, 새 노드를 실험에 넣을 때 라벨을 붙이면 된다.
-              - key: k8s-dynamic-allocator/logs
+              # 실험 워크로드를 올리는 노드에만 둔다. n4 는 kubelet 의 maxPods 가
+              # 기본값 110 인데 다른 노드는 250 이고, 고정 배치된 다른 네임스페이스의
+              # 파드가 이미 80 개 올라가 있어 우리 쪽은 n4 를 비워 둔다.
+              #
+              # 라벨로 거르는 또 다른 이유는 노드 추가다. 아래 tolerations 가 모든
+              # taint 를 무시하므로 DaemonSet 은 막 붙은 NotReady 노드에도 파드를
+              # 넣고, 그 노드의 CNI 와 Longhorn 이 올라오기 전까지 이 파드는
+              # logs-pvc 를 붙이지 못해 ContainerCreating 에 머물며 실패 이벤트만
+              # 쌓는다. 운영 서비스가 쓰는 라벨은 건드리지 않고 우리 라벨을 더하는
+              # 방식이라, 새 노드를 실험에 넣을 때 라벨만 붙이면 된다.
+              - key: k8s-dynamic-allocator/workload
                 operator: In
                 values:
                 - "true"
