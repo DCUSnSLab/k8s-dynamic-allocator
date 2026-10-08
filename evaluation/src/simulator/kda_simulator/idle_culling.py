@@ -35,6 +35,84 @@ STOP_GRACE_SECONDS = 60.0
 # a hundred kubectl processes from starting at the same instant. It no longer
 # affects how late a cull can be.
 MAX_CONCURRENT_CULLS = 25
+# Deleting a user pod was measured at about 32 seconds end to end. Generous
+# against that, because a wait that ends early puts the resume back on the
+# broken path while a slow one only reports a larger resume latency - which is
+# this arm's real cost either way.
+POD_GONE_TIMEOUT_SECONDS = 180.0
+POD_GONE_POLL_SECONDS = 2.0
+POD_GET_TIMEOUT_SECONDS = 30.0
+
+
+async def wait_for_pod_gone(
+    username: str,
+    timeout: float = POD_GONE_TIMEOUT_SECONDS,
+) -> str | None:
+    """Wait until the user's pod is out of the API. None once it is gone.
+
+    The other half of _delete_pod, which deliberately returns as soon as the
+    API server accepts the delete. Somebody has to wait out the grace period,
+    and it is whoever resumes - they are the party losing the time, and this
+    arm exists to report exactly that loss.
+
+    Waiting is not optional. While the pod object is still there swlabssh sees
+    a pod for the user and does not build a replacement, but its container is
+    already dead, so every attach returns `container not found ("shell")`. The
+    attach itself succeeds, so the resume looks fine (2-3s instead of the 20s a
+    real recreation takes) and the measured command starts inside a pod that is
+    being killed. On 10/8 that cost 3 of 91 requests, each one spending all five
+    re-run attempts on the same error: the re-run pause is 2 seconds, sized for
+    a pod that is already going, not for a 32-second grace period.
+
+    Returns a note instead of raising when the pod outlives the timeout or
+    kubectl cannot say. The caller carries on in that case: that is the old
+    behaviour, with the re-run path as the backstop, and a resume blocked here
+    forever would cost the run more than the request it is protecting.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        exists, error = await _pod_exists(username)
+        if error is not None:
+            return f"could not tell whether {pod_name(username)} is gone: {error}"
+        if not exists:
+            return None
+        if time.monotonic() >= deadline:
+            return f"{pod_name(username)} was still there after {timeout:.0f}s"
+        await asyncio.sleep(POD_GONE_POLL_SECONDS)
+
+
+async def _pod_exists(username: str) -> tuple[bool, str | None]:
+    """Whether the pod object is in the API, and why the answer is unknown."""
+    process = await asyncio.create_subprocess_exec(
+        "kubectl",
+        "--namespace",
+        KUBERNETES_NAMESPACE,
+        "get",
+        "pod",
+        pod_name(username),
+        "--ignore-not-found=true",
+        "-o",
+        "name",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=POD_GET_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        return False, "kubectl get did not return"
+    except asyncio.CancelledError:
+        process.kill()
+        raise
+    if process.returncode != 0:
+        return False, stderr.decode(errors="replace").strip() or f"kubectl exited {process.returncode}"
+    # --ignore-not-found makes an absent pod an empty success rather than an
+    # error, so there is nothing to distinguish from a name here.
+    return bool(stdout.decode(errors="replace").strip()), None
 
 
 def pod_name(username: str) -> str:

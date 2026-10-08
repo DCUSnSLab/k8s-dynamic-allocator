@@ -21,6 +21,9 @@ from .config import (
     SSH_KEEPALIVE_INTERVAL_SECONDS,
     SimulatorConfig,
 )
+# Safe in this direction only: the culler takes its session as Any precisely so
+# that it does not import this module.
+from .idle_culling import wait_for_pod_gone
 
 
 # Any CSI sequence: colors, and the "\x1b[K" line erase the PTY puts before the first line.
@@ -570,11 +573,18 @@ class SSHUserSession:
         started: float,
         restore_command: str | None,
     ) -> ResumeTiming:
+        # The culler's delete does not wait for the pod to go, so the grace
+        # period is waited for here. This used to read "if the pod is still
+        # there the attach fails and the re-run path reconnects", which is not
+        # what happens: the attach succeeds against a terminating pod and the
+        # command is killed inside it. See wait_for_pod_gone.
+        gone_note = await wait_for_pod_gone(self.username)
+        if gone_note is not None:
+            # Carry on regardless - this is the old behaviour and the re-run
+            # path is still there. Printed rather than reported on the request:
+            # it says something about the cluster, not about this user's resume.
+            print(f"Resume for {self.username} went ahead anyway: {gone_note}")
         try:
-            # No check that the old pod has gone. If it has, kubessh builds a new
-            # one; if it has not, the attach fails and run_remote's retry
-            # reconnects. Both happen in a real deployment when a user comes back
-            # exactly as their pod is being reclaimed.
             await self.connect()
             # The pod does not exist yet: authentication alone did not ask for a
             # shell. This probe is what makes swlabssh build it, so it is part of
