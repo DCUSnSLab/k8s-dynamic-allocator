@@ -1,4 +1,5 @@
 import logging
+import math
 import threading
 import time
 import uuid
@@ -92,28 +93,79 @@ class BufferCapacityReconciler:
         buffer_capacity: int,
         assigned: int,
         queued: Optional[int] = None,
+        pipeline: Optional[float] = None,
     ) -> int:
         """available 파드를 몇 개 들고 있을지.
 
         queued=None 이 고정 정책이고 기본값이다. 동적 경로를 끈 실행은 예전과 한
         글자도 다르지 않다.
 
-        대기 중인 티켓 수를 그대로 목표로 쓴다. 다른 신호를 세 번 시도했지만
+        대기 중인 티켓 수를 목표로 쓴다. 다른 신호를 세 번 시도했지만
         (도착률, 반납률, 큐 유무) 앞의 둘은 공급 병목에서 리틀의 법칙 항등식이 되어
         하한에 붙었고, 셋째는 큐가 1건만 있어도 자리를 다 채워 배정보다 많은 파드를
         버렸다. 큐 길이는 공급이 모자란 만큼 쌓이므로 그 셋과 달리 눈이 멀지 않는다.
 
-        목표가 수요를 따라 출렁이는 것은 축소 쿨다운이 막는다. 상승은 즉시, 하강은
-        쿨다운 뒤 - 모자란 비용(사용자가 기다림)과 과한 비용(파드 한 개)이 다르므로
-        비대칭이 맞다.
+        pipeline 은 그 큐 길이의 상한이다. 큐가 자리보다 길면 목표는 N - assigned
+        에 붙고, 그러면 할당 한 건마다 assigned 가 1 오를 때 목표가 1 내려간다.
+        ReplicaSet 은 그 직전에 빠져나간 available 자리를 새 파드로 채우기 시작한
+        참이라, 내려간 목표가 그 파드를 지운다. 10/9 실측에서 포화 구간 생성의
+        16~35% 가 이렇게 Ready 전에 취소됐고, 취소가 있는 분의 파드 준비 시간은
+        4초에서 12~21초로 늘었다 (취소 수와 준비 시간의 상관 0.859, 취소가 멎은
+        분에는 곧장 4초로 돌아온다). 지우는 일 자체가 같은 노드에서 세우는 중인
+        파드를 밀어낸다.
 
-        자리는 N - assigned 가 막는다. 할당과 ReplicaSet 의 backfill 사이에서 합이
-        잠깐 N 을 넘지만 (실측 한 번에 중앙값 3.4초) 곧 되돌아오는 일시적 현상이다.
+        목표를 자리가 아니라 "공급에 필요한 폭" 으로 묶으면 assigned 가 오르내려도
+        목표가 흔들리지 않아 그 취소가 생기지 않는다. 폭이 자리보다 작을 때만
+        효력이 있으므로 비포화 동작은 그대로다 (큐가 비면 R, 큐가 폭보다 짧으면
+        큐 길이).
+
+        자리는 여전히 N - assigned 가 막는다. 할당과 ReplicaSet 의 backfill 사이에서
+        합이 잠깐 N 을 넘지만 (실측 한 번에 중앙값 3.4초) 곧 되돌아오는 일시적
+        현상이다.
         """
         room = max(0, int(buffer_capacity) - int(assigned))
         if queued is None:
             return min(int(buffer_reserve), room)
-        return min(max(int(buffer_reserve), int(queued)), room)
+        want = int(queued)
+        if pipeline is not None and want > pipeline:
+            want = int(math.ceil(pipeline))
+        return min(max(int(buffer_reserve), want), room)
+
+    def pipeline_width(self, compute_type: str, buffer_capacity: int) -> Optional[float]:
+        """포화에서 공급을 유지하려면 동시에 몇 개를 세우고 있어야 하는지.
+
+        N 개 자리를 쉬지 않고 돌릴 때 파드 하나가 자리를 쥐는 시간은 세우는 시간과
+        일하는 시간의 합이고, 그때 처리율은 N / (세움 + 일) 이다. 그 속도로 파드가
+        소비되는 동안 세워지고 있어야 하는 양이 이 값이다:
+
+            N x 세움 / (세움 + 일)
+
+        관측된 할당 속도를 쓰지 않는 것이 요점이다. 공급이 막히면 할당도 같이
+        느려지므로 그것으로 목표를 정하면 모자란 상태에서 하한에 붙는다 - 도착률과
+        반납률이 폐기된 이유가 그것이다. 여기 들어가는 두 값은 공급이 막혀도 줄지
+        않는다. 세우는 시간이 길어지면 폭이 넓어져 공급을 보강하고, 일하는 시간이
+        길면 자리가 천천히 비므로 폭이 좁아진다.
+
+        표본이 모자라면 None 이고, 그때 목표는 예전처럼 큐 길이를 그대로 쓴다.
+        기동 직후가 그 상태다.
+        """
+        create = self.create_time_seconds(compute_type, quantile=0.5)
+        work = self.work_time_seconds(compute_type)
+        if create <= 0 or work <= 0:
+            return None
+        return float(buffer_capacity) * create / (create + work)
+
+    def work_time_seconds(self, compute_type: str, quantile: float = 0.5) -> float:
+        """할당된 파드가 자리를 쥐고 있던 시간의 분위수. 표본이 모자라면 0.
+
+        releaser 가 반납할 때마다 남기는 session_ms 가 표본이다. 중앙값을 쓴다 -
+        파이프라인 폭은 평균적인 회전에서 나오는 값이라, 쿨다운처럼 높은 분위를
+        쓸 이유가 없다.
+        """
+        works = sorted(self._shared_or_local(compute_type, "work", []))
+        if len(works) < self.cooldown_min_samples:
+            return 0.0
+        return float(works[min(len(works) - 1, int(len(works) * quantile))])
 
     def _queued_for_target(self, compute_type: str) -> Optional[int]:
         """대기 중인 티켓 수. 고정 정책을 유지할 때는 None.
@@ -941,11 +993,13 @@ class BufferCapacityReconciler:
 
             snapshot = self.provider.list_buffer_snapshot(compute_type_value)
             queued = self._queued_for_target(compute_type_value)
+            pipeline = self.pipeline_width(compute_type_value, policy["N"])
             desired = self.desired_replicas(
                 policy["R"],
                 policy["N"],
                 snapshot["buffer_assigned"],
                 queued,
+                pipeline,
             )
             current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]
@@ -1000,7 +1054,8 @@ class BufferCapacityReconciler:
             room = max(0, int(policy["N"]) - int(snapshot["buffer_assigned"]))
             logger.info(
                 "[BufferTarget] compute_type=%s queued=%s desired=%s current=%s "
-                "room=%s assigned=%s available=%s total=%s R=%s N=%s dynamic=%s",
+                "room=%s assigned=%s available=%s total=%s R=%s N=%s dynamic=%s "
+                "pipeline=%s create_s=%s work_s=%s",
                 compute_type_value,
                 queued,
                 desired,
@@ -1012,6 +1067,11 @@ class BufferCapacityReconciler:
                 policy["R"],
                 policy["N"],
                 self.dynamic_reserve,
+                # 폭이 왜 그 값인지는 두 관측값으로만 설명되므로 함께 남긴다.
+                # 없으면 표본이 아직 모자란 것이고 목표는 예전 경로로 간다.
+                f"{pipeline:.2f}" if pipeline is not None else "-",
+                f"{self.create_time_seconds(compute_type_value, quantile=0.5):.2f}",
+                f"{self.work_time_seconds(compute_type_value):.2f}",
             )
 
             if current > desired or snapshot["buffer_available"] > desired:
@@ -1122,6 +1182,7 @@ class BufferCapacityReconciler:
                 policy["N"],
                 snapshot["buffer_assigned"],
                 self._queued_for_target(compute_type),
+                self.pipeline_width(compute_type, policy["N"]),
             )
             current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]

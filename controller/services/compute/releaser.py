@@ -305,6 +305,25 @@ class ComputeReleaser:
                 self.queues.record_release(compute_type, compute_pod)
             except Exception as exc:  # noqa: BLE001 - 신호는 반납을 막지 않는다
                 logger.debug("[ReleaseSignalSkipped] reason=%r", str(exc))
+            # 자리를 쥐고 있던 시간. 리컨실러가 파드를 세우는 시간과 함께 공급
+            # 파이프라인의 폭을 정하는 데 쓴다. 반납 경로에서만 알 수 있는 값이라
+            # 여기서 남긴다. 실패해도 반납을 막지 않는다 - 추정기는 표본이 모자라면
+            # 스스로 비켜선다.
+            #
+            # 이 비교군은 파드를 지우지 않고 돌려쓰므로 세우는 시간이 들지 않는 반납이
+            # 섞이고, 그만큼 폭이 실제보다 넓게 잡힐 수 있다. 그래도 남기는 것은 제안
+            # 시스템과 코드를 같게 두기 위해서다 - 두 비교군이 재사용 기능 말고는
+            # 달라지지 않아야 한다.
+            if session_ms:
+                try:
+                    self.queues.record_churn_sample(
+                        compute_type,
+                        "work",
+                        session_ms / 1000.0,
+                        max(1, int(settings.BUFFER_SCALE_DOWN_COOLDOWN_SAMPLES)),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[WorkSampleSkipped] reason=%r", str(exc))
             return {
                 "status": "success",
                 "outcome": outcome,

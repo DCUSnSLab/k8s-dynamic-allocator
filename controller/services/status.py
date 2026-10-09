@@ -15,17 +15,23 @@ class ControllerStatus:
         """What the reconciler would target, so the report cannot disagree with it."""
         if self.capacity_reconciler is None:
             return min(int(policy["R"]), max(0, int(policy["N"]) - int(buffer_assigned)))
+        compute_type = policy.get("compute_type") or ""
         queued = None
         if getattr(self.capacity_reconciler, "dynamic_reserve", False):
             try:
-                queued = self.queues.queued_count(policy.get("compute_type") or "")
+                queued = self.queues.queued_count(compute_type)
             except Exception:
                 queued = None
+        try:
+            pipeline = self.capacity_reconciler.pipeline_width(compute_type, policy["N"])
+        except Exception:
+            pipeline = None
         return self.capacity_reconciler.desired_replicas(
             policy["R"],
             policy["N"],
             buffer_assigned,
             queued,
+            pipeline,
         )
 
     def get_buffer_status(self) -> Dict:
