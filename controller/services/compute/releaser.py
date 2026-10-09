@@ -4,6 +4,7 @@ from typing import Callable, Dict, Optional
 
 from kubernetes.client.rest import ApiException
 
+from config import settings
 from config.settings import request_label_scope, set_request_label
 
 from .. import ticket_format
@@ -161,6 +162,20 @@ class ComputeReleaser:
                 self.queues.record_release(compute_type, compute_pod)
             except Exception as exc:  # noqa: BLE001 - 신호는 반납을 막지 않는다
                 logger.debug("[ReleaseSignalSkipped] reason=%r", str(exc))
+            # 자리를 쥐고 있던 시간. 리컨실러가 파드를 세우는 시간과 함께 공급
+            # 파이프라인의 폭을 정하는 데 쓴다. 반납 경로에서만 알 수 있는 값이라
+            # 여기서 남긴다. 실패해도 반납을 막지 않는다 - 추정기는 표본이 모자라면
+            # 스스로 비켜선다.
+            if session_ms:
+                try:
+                    self.queues.record_churn_sample(
+                        compute_type,
+                        "work",
+                        session_ms / 1000.0,
+                        max(1, int(settings.BUFFER_SCALE_DOWN_COOLDOWN_SAMPLES)),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[WorkSampleSkipped] reason=%r", str(exc))
             cleanup_context = True
             return {
                 "status": "success",
