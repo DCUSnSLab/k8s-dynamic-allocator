@@ -111,9 +111,18 @@ pipeline {
         stage('Unit Tests') {
             steps {
                 script {
-                    docker.image('python:3.11-slim').inside('-u root') {
-                        sh 'python -m unittest discover -s controller/tests -t controller/tests -v'
-                    }
+                    // docker.image().inside() 는 이 에이전트에서 쓸 수 없다. 호스트
+                    // 도커 데몬 + emptyDir 워크스페이스 조합이라 바인드 마운트가 빈
+                    // 디렉터리가 되고 "process apparently never started" 로 죽는다
+                    // (빌드 48). 테스트는 Dockerfile 의 RUN 으로 돌려 실패를 빌드
+                    // 실패로 전파한다 - 자세한 이유는 그 파일 주석에 있다.
+                    def tests = docker.build(
+                        "kda-unit-tests:${env.IMAGE_TAG}",
+                        '-f deploy/docker/tests/Dockerfile .'
+                    )
+                    // 에이전트에 이미지가 쌓이지 않게 지운다. 실패하면 애초에
+                    // 만들어지지 않으므로 이 줄은 성공 경로에만 온다.
+                    sh "docker image rm -f ${tests.id} || true"
                 }
             }
         }
