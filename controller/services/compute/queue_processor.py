@@ -9,6 +9,67 @@ from config import settings
 from .. import ticket_format
 from ..queue import QueueUnavailableError
 
+try:
+    from .. import timing
+except ImportError:  # 단위 테스트는 이 파일 하나만 따로 읽어 패키지가 없다
+    from contextlib import nullcontext as _timing_nullcontext
+
+    class timing:  # noqa: N801 - 모듈 대역. 계측이 꺼진 것과 같게 동작한다.
+        ENABLED = False
+
+        @staticmethod
+        def timed(kind):
+            return lambda fn: fn
+
+        @staticmethod
+        def emit(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def phase(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def note(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def current_purpose():
+            return "other"
+
+        @staticmethod
+        def current_trigger():
+            return "direct"
+
+        @staticmethod
+        def lock_acquired(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def lock_missed(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def lock_released(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def set_leader_probe(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def start(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def scope(*args, **kwargs):
+            return _timing_nullcontext()
+
+        @staticmethod
+        def phase_timer():
+            return _timing_nullcontext()
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -233,7 +294,12 @@ class ComputeQueueProcessor:
             lock_retry_count = 0
             try:
                 while True:
-                    result = self.process_wait_queues(compute_type=next_compute_type)
+                    # 이 경로가 kick(즉시) 인지 재시도인지 남긴다. Ready 후 할당
+                    # 대기의 원인을 경로별로 나누는 데 쓴다.
+                    with timing.scope(
+                        trigger="retry" if lock_retry_count else "kick"
+                    ):
+                        result = self.process_wait_queues(compute_type=next_compute_type)
                     if (
                         next_compute_type
                         and self._process_result_had_lock_miss(result)

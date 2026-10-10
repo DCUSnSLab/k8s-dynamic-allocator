@@ -40,6 +40,67 @@ from .tickets import (
     safe_int,
 )
 
+try:
+    from .. import timing
+except ImportError:  # 단위 테스트는 이 파일 하나만 따로 읽어 패키지가 없다
+    from contextlib import nullcontext as _timing_nullcontext
+
+    class timing:  # noqa: N801 - 모듈 대역. 계측이 꺼진 것과 같게 동작한다.
+        ENABLED = False
+
+        @staticmethod
+        def timed(kind):
+            return lambda fn: fn
+
+        @staticmethod
+        def emit(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def phase(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def note(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def current_purpose():
+            return "other"
+
+        @staticmethod
+        def current_trigger():
+            return "direct"
+
+        @staticmethod
+        def lock_acquired(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def lock_missed(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def lock_released(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def set_leader_probe(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def start(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def scope(*args, **kwargs):
+            return _timing_nullcontext()
+
+        @staticmethod
+        def phase_timer():
+            return _timing_nullcontext()
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -836,6 +897,10 @@ class ComputeQueues:
                 nx=True,
                 ex=self.lock_ttl_seconds,
             )
+            if acquired:
+                timing.lock_acquired(token)
+            else:
+                timing.lock_missed()
             return token if acquired else None
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to acquire lock for {compute_type_value}: {exc}") from exc
@@ -869,6 +934,8 @@ class ComputeQueues:
     def release_allocator_lock(self, compute_type: str, token: Optional[str]) -> bool:
         if not token:
             return False
+
+        timing.lock_released(token)
 
         compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()
@@ -1111,3 +1178,16 @@ class ComputeQueues:
             client.zrem(self._queue_key(compute_type), ticket_id)
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to remove ticket {ticket_id} from queue {compute_type}: {exc}") from exc
+
+
+# 계측 전용. KDA_TIMING_LOG 가 꺼져 있으면 timed() 가 원본을 그대로 돌려준다.
+# 리더의 큐 정리(repair)가 claim 시간의 대부분을 차지한다는 의심이 있어, 락 안에서
+# 도는 Redis 작업을 종류별로 30초마다 집계한다.
+for _name, _kind in (
+    ("_repair_queue_membership", "redis.repair"),
+    ("claim_next_ticket", "redis.claim"),
+    ("find_stale_allocating_tickets", "redis.stale_scan"),
+    ("has_queued_tickets", "redis.has_queued"),
+    ("queued_count", "redis.queued_count"),
+):
+    setattr(ComputeQueues, _name, timing.timed(_kind)(getattr(ComputeQueues, _name)))

@@ -1,6 +1,7 @@
 """Allocation/replica correction invariants without a live Kubernetes cluster."""
 
 import ast
+import importlib.util
 import logging
 import time
 import unittest
@@ -9,6 +10,22 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Dict, List, Optional, Tuple
+
+
+def load_timing_module():
+    """계측 모듈을 경로로 직접 읽는다. stdlib 만 쓰므로 최소 환경에서도 돌아간다.
+
+    아래 로더가 ast 로 클래스 하나만 떼어내 실행하기 때문에, 모듈 수준의
+    `from .. import timing` 이 실행되지 않는다. 그래서 namespace 에 직접 넣어야
+    한다. ENABLED 는 명시적으로 끈다 - 환경변수가 켜져 있는 개발 환경에서도
+    테스트가 같은 경로를 타게 하려는 것이다.
+    """
+    path = Path(__file__).resolve().parents[1] / "services/timing.py"
+    spec = importlib.util.spec_from_file_location("kda_timing_for_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.ENABLED = False
+    return module
 
 
 def load_allocator_class():
@@ -34,6 +51,7 @@ def load_allocator_class():
         "logger": logging.getLogger("test_allocator_lock"),
         "settings": SimpleNamespace(WAIT_QUEUE_LOCK_RENEW_SECONDS=20),
         "ticket_format": SimpleNamespace(log_queue_event=lambda *args, **kwargs: None),
+        "timing": load_timing_module(),
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["ComputeAllocator"]

@@ -28,6 +28,67 @@ from .manifest_images import override_compute_agent_image
 BUFFER_RESERVE_ANNOTATION = "k8s-dynamic-allocator/buffer-reserve"
 BUFFER_CAPACITY_ANNOTATION = "k8s-dynamic-allocator/buffer-capacity"
 
+try:
+    from .. import timing
+except ImportError:  # 단위 테스트는 이 파일 하나만 따로 읽어 패키지가 없다
+    from contextlib import nullcontext as _timing_nullcontext
+
+    class timing:  # noqa: N801 - 모듈 대역. 계측이 꺼진 것과 같게 동작한다.
+        ENABLED = False
+
+        @staticmethod
+        def timed(kind):
+            return lambda fn: fn
+
+        @staticmethod
+        def emit(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def phase(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def note(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def current_purpose():
+            return "other"
+
+        @staticmethod
+        def current_trigger():
+            return "direct"
+
+        @staticmethod
+        def lock_acquired(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def lock_missed(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def lock_released(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def set_leader_probe(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def start(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def scope(*args, **kwargs):
+            return _timing_nullcontext()
+
+        @staticmethod
+        def phase_timer():
+            return _timing_nullcontext()
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -1029,3 +1090,16 @@ class WarmBufferProvider(KubernetesClient):
             }
             for pod in snapshot["pods"]
         ]
+
+
+# 계측 전용. 락을 쥔 채 도는 Kubernetes 호출의 지연을 종류별로 집계한다.
+for _name, _kind in (
+    ("list_buffer_snapshot", "k8s.list_snapshot"),
+    ("read_deployment_replicas", "k8s.get_scale"),
+    ("patch_deployment_replicas", "k8s.patch_scale"),
+    ("lower_deployment_replicas", "k8s.lower_scale"),
+    ("release_pod_scheduling_gate", "k8s.patch_gate"),
+    ("assign_pod", "k8s.patch_assign"),
+    ("release_pod", "k8s.delete_pod"),
+):
+    setattr(WarmBufferProvider, _name, timing.timed(_kind)(getattr(WarmBufferProvider, _name)))

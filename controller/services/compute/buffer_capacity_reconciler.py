@@ -9,6 +9,67 @@ from config import settings
 
 from ..queue import QueueUnavailableError
 
+try:
+    from .. import timing
+except ImportError:  # 단위 테스트는 이 파일 하나만 따로 읽어 패키지가 없다
+    from contextlib import nullcontext as _timing_nullcontext
+
+    class timing:  # noqa: N801 - 모듈 대역. 계측이 꺼진 것과 같게 동작한다.
+        ENABLED = False
+
+        @staticmethod
+        def timed(kind):
+            return lambda fn: fn
+
+        @staticmethod
+        def emit(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def phase(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def note(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def current_purpose():
+            return "other"
+
+        @staticmethod
+        def current_trigger():
+            return "direct"
+
+        @staticmethod
+        def lock_acquired(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def lock_missed(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def lock_released(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def set_leader_probe(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def start(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def scope(*args, **kwargs):
+            return _timing_nullcontext()
+
+        @staticmethod
+        def phase_timer():
+            return _timing_nullcontext()
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -818,10 +879,25 @@ class BufferCapacityReconciler:
                         or not self._has_write_authority()
                     ):
                         break
+                    pass_started = time.monotonic()
                     result = self.reconcile_type(compute_type)
+                    reconciled_at = time.monotonic()
                     gates_reconciled = False
                     if not result.get("retry") and result.get("status") != "blocked":
                         gates_reconciled = self._release_scheduling_gates(compute_type)
+                    # 공급(replicas 증가 + 게이트 해제)이 이 바퀴에 묶여 있다는 것이
+                    # 지금 의심이므로, 바퀴를 깨운 원인과 두 몫을 나눠 남긴다.
+                    timing.emit(
+                        "ReconcilePass",
+                        compute_type=compute_type,
+                        resync=int(periodic_resync),
+                        scheduled=int(scheduled_run),
+                        demand_poll=int(demand_poll_due),
+                        status=result.get("status", "-"),
+                        reason=result.get("reason", "-"),
+                        reconcile_ms=(reconciled_at - pass_started) * 1000,
+                        gate_ms=(time.monotonic() - reconciled_at) * 1000,
+                    )
                     if result.get("retry"):
                         self.request_reconcile(compute_type, retry=True)
                         if compute_type in ready_candidate_types:
@@ -920,6 +996,34 @@ class BufferCapacityReconciler:
         return changed
 
     def _release_scheduling_gates(self, compute_type: str) -> bool:
+        """계측 포장. KDA_TIMING_LOG 가 꺼져 있으면 원래 경로를 그대로 탄다.
+
+        포화 구간 424 바퀴 중 271 바퀴가 게이트를 하나도 풀지 못했는데, 지금
+        로그로는 그 이유(락 timeout / 예산 충족 / 후보 없음 / 패치 실패)를 나눌 수
+        없다. 그 사유와 1 회 소요를 남긴다.
+        """
+        if not timing.ENABLED:
+            return self._release_scheduling_gates_impl(compute_type)
+        with timing.scope(purpose="gate"), timing.phase_timer() as timer:
+            ok = None
+            try:
+                ok = self._release_scheduling_gates_impl(compute_type)
+                return ok
+            finally:
+                n = timer.notes
+                timing.emit(
+                    "GateReleasePass",
+                    compute_type=compute_type,
+                    ok=int(bool(ok)),
+                    released=n.get("released", 0),
+                    reason=n.get("reason", "-"),
+                    budget=n.get("budget", "-"),
+                    ungated=n.get("ungated", "-"),
+                    candidates=n.get("candidates", "-"),
+                    total_ms=timer.total_ms(),
+                )
+
+    def _release_scheduling_gates_impl(self, compute_type: str) -> bool:
         """Admit gated warm Pods only within the current demand and N budget.
 
         Drop the allocator lock between Pods so claims can run during a burst.
@@ -927,10 +1031,12 @@ class BufferCapacityReconciler:
         protects only that Pod, not the budget shared by all warm Pods.
         """
         if self._stop_event.is_set() or not self._has_write_authority():
+            timing.note(reason="not_leader")
             return False
         try:
             policy = self.queues.get_buffer_policy(compute_type)
             if not policy:
+                timing.note(reason="no_policy")
                 return False
             max_attempts = max(1, int(policy["N"]) * 2)
             released_count = 0
@@ -940,6 +1046,7 @@ class BufferCapacityReconciler:
                     compute_type, deadline, threading.Event()
                 )
                 if not lock_token:
+                    timing.note(reason="lock_timeout")
                     return False
                 try:
                     if (
@@ -948,10 +1055,12 @@ class BufferCapacityReconciler:
                         or not self.queues.renew_allocator_lock(compute_type, lock_token)
                         or self.queues.is_scale_down_gated(compute_type)
                     ):
+                        timing.note(reason="gated_or_lost")
                         return False
 
                     policy = self.queues.get_buffer_policy(compute_type)
                     if not policy:
+                        timing.note(reason="gated_or_lost")
                         return False
                     snapshot = self.provider.list_buffer_snapshot(compute_type)
                     current = int(
@@ -967,6 +1076,7 @@ class BufferCapacityReconciler:
                     owned_available = max(0, available - unowned)
                     if current > room or owned_available > current:
                         # Let ReplicaSet deletion and N correction settle.
+                        timing.note(reason="settling")
                         return False
                     if total > int(policy["N"]):
                         # Gated or unowned API objects do not consume this
@@ -986,6 +1096,8 @@ class BufferCapacityReconciler:
                     )
                     budget = min(current, room, desired)
                     ungated = int(snapshot["ungated_available"])
+                    timing.note(budget=budget, ungated=ungated,
+                                candidates=len(snapshot["gated_available_candidates"]))
                     if ungated >= budget:
                         if unowned and snapshot["gated_available_candidates"]:
                             logger.info(
@@ -997,10 +1109,12 @@ class BufferCapacityReconciler:
                                 budget,
                                 unowned,
                             )
+                        timing.note(reason="budget_full")
                         return True
                     candidates = snapshot["gated_available_candidates"]
                     if not candidates:
                         # The Deployment may not have created its gated Pod yet.
+                        timing.note(reason="no_candidate")
                         return False
 
                     if (
@@ -1034,6 +1148,7 @@ class BufferCapacityReconciler:
                             "patch_conflict_or_gone",
                         )
                     if not released_one:
+                        timing.note(reason="patch_failed")
                         return False
                     logger.info(
                         "[BufferGateReleased] compute_type=%s compute_pod=%s "
@@ -1046,6 +1161,7 @@ class BufferCapacityReconciler:
                         policy["N"],
                     )
                     released_count += 1
+                    timing.note(released=released_count)
                 finally:
                     try:
                         self.queues.release_allocator_lock(compute_type, lock_token)
@@ -1058,10 +1174,13 @@ class BufferCapacityReconciler:
                         )
                 # Give pending claims a chance to acquire the free lock.
                 if self._stop_event.wait(0.01):
+                    timing.note(reason="stopping")
                     return False
             if released_count:
                 self.request_reconcile(compute_type)
+                timing.note(reason="released")
                 return True
+            timing.note(reason="loop_end")
             return False
         except Exception as exc:
             logger.warning(
@@ -1069,6 +1188,7 @@ class BufferCapacityReconciler:
                 compute_type,
                 str(exc),
             )
+            timing.note(reason="exception")
             return False
 
     def sync_policies(self) -> Set[str]:
@@ -1546,6 +1666,29 @@ class BufferCapacityReconciler:
             return result
 
     def _scale_up(self, compute_type: str, base_result: Dict) -> Dict:
+        """계측 포장. replicas 가 목표보다 낮은 샘플이 40.3% 인데, 그것이 락
+        timeout 때문인지 headroom 상한 때문인지 가린다.
+        """
+        if not timing.ENABLED:
+            return self._scale_up_impl(compute_type, base_result)
+        with timing.scope(purpose="scale_up"), timing.phase_timer() as timer:
+            result = None
+            try:
+                result = self._scale_up_impl(compute_type, base_result)
+                return result
+            finally:
+                r = result or {}
+                timing.emit(
+                    "ScaleUpTiming",
+                    compute_type=compute_type,
+                    status=r.get("status", "exception"),
+                    reason=r.get("reason", "-"),
+                    current=r.get("current_replicas", "-"),
+                    desired=r.get("desired_replicas", "-"),
+                    total_ms=timer.total_ms(),
+                )
+
+    def _scale_up_impl(self, compute_type: str, base_result: Dict) -> Dict:
         deadline = time.monotonic() + min(1.0, self.wait_timeout_seconds)
         lock_token = self._acquire_allocator_lock_until(
             compute_type,
@@ -1656,6 +1799,16 @@ class BufferCapacityReconciler:
             self.queues.release_allocator_lock(compute_type, lock_token)
 
     def _scale_down(
+        self,
+        compute_type: str,
+        initial_policy: Dict,
+        base_result: Dict,
+    ) -> Dict:
+        """계측 포장. 축소가 barrier 로 잡는 락도 scale_down 으로 집계된다."""
+        with timing.scope(purpose="scale_down"):
+            return self._scale_down_impl(compute_type, initial_policy, base_result)
+
+    def _scale_down_impl(
         self,
         compute_type: str,
         initial_policy: Dict,
@@ -1960,6 +2113,7 @@ class BufferCapacityReconciler:
         gate_lost: threading.Event,
     ) -> Optional[str]:
         retry_seconds = 0.02
+        wait_started = time.monotonic()
         while (
             not self._stop_event.is_set()
             and self._has_write_authority()
@@ -1968,9 +2122,21 @@ class BufferCapacityReconciler:
         ):
             token = self.queues.acquire_allocator_lock(compute_type)
             if token:
+                timing.emit(
+                    "LockWait",
+                    purpose=timing.current_purpose(),
+                    wait_ms=(time.monotonic() - wait_started) * 1000,
+                    ok=1,
+                )
                 return token
             self._wait_for_event(min(retry_seconds, max(0.0, deadline - time.monotonic())))
             retry_seconds = min(0.2, retry_seconds * 1.5)
+        timing.emit(
+            "LockWait",
+            purpose=timing.current_purpose(),
+            wait_ms=(time.monotonic() - wait_started) * 1000,
+            ok=0,
+        )
         return None
 
     def _wait_for_assigned_orphans(

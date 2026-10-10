@@ -11,6 +11,67 @@ from ..queue import QueueUnavailableError
 from .agent_client import ComputeAgent, ComputeAgentError
 from .warm_buffer_provider import PodConflictError
 
+try:
+    from .. import timing
+except ImportError:  # 단위 테스트는 이 파일 하나만 따로 읽어 패키지가 없다
+    from contextlib import nullcontext as _timing_nullcontext
+
+    class timing:  # noqa: N801 - 모듈 대역. 계측이 꺼진 것과 같게 동작한다.
+        ENABLED = False
+
+        @staticmethod
+        def timed(kind):
+            return lambda fn: fn
+
+        @staticmethod
+        def emit(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def phase(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def note(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def current_purpose():
+            return "other"
+
+        @staticmethod
+        def current_trigger():
+            return "direct"
+
+        @staticmethod
+        def lock_acquired(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def lock_missed(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def lock_released(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def set_leader_probe(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def start(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def scope(*args, **kwargs):
+            return _timing_nullcontext()
+
+        @staticmethod
+        def phase_timer():
+            return _timing_nullcontext()
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,6 +82,54 @@ class ComputeAllocator:
         self.tickets = tickets
 
     def drain_wait_queue_for_type(
+        self,
+        compute_type: str,
+        recover_stale_ticket: Callable[[Dict], Dict],
+    ) -> Dict:
+        """계측 포장. KDA_TIMING_LOG 가 꺼져 있으면 원래 경로를 그대로 탄다.
+
+        Ready 후 할당 대기가 1.0 -> 2.8초로 늘었는데, 그것이 락을 놓쳐서인지
+        축소 게이트에 막혀서인지 후보가 없어서인지 지금 로그로는 나눌 수 없다.
+        capacity_blocked / lock_missed 는 결과 dict 에만 담겨 아무도 읽지 않는다.
+        """
+        if not timing.ENABLED:
+            return self._drain_wait_queue_for_type_impl(
+                compute_type, recover_stale_ticket
+            )
+        with timing.scope(purpose="drain"), timing.phase_timer() as timer:
+            result = None
+            try:
+                result = self._drain_wait_queue_for_type_impl(
+                    compute_type, recover_stale_ticket
+                )
+                return result
+            finally:
+                r = result or {}
+                if result is None:
+                    outcome = "exception"
+                elif r.get("claimed"):
+                    outcome = "claimed"
+                elif r.get("capacity_blocked"):
+                    outcome = r["capacity_blocked"]
+                elif r.get("lock_missed"):
+                    outcome = "lock_missed"
+                elif r.get("lock_lost"):
+                    outcome = "lock_lost"
+                else:
+                    outcome = r.get("empty_reason", "empty")
+                timing.emit(
+                    "DrainResult",
+                    trigger=timing.current_trigger(),
+                    compute_type=r.get("compute_type", compute_type),
+                    outcome=outcome,
+                    claimed=r.get("claimed", 0),
+                    assigned=r.get("assigned", 0),
+                    stale=r.get("stale_recovered", 0),
+                    total_ms=timer.total_ms(),
+                    **timer.fields(),
+                )
+
+    def _drain_wait_queue_for_type_impl(
         self,
         compute_type: str,
         recover_stale_ticket: Callable[[Dict], Dict],

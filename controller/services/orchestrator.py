@@ -19,6 +19,67 @@ from .infra import (
 from .queue import ComputeQueues
 from .status import ControllerStatus
 
+try:
+    from . import timing
+except ImportError:  # 단위 테스트는 이 파일 하나만 따로 읽어 패키지가 없다
+    from contextlib import nullcontext as _timing_nullcontext
+
+    class timing:  # noqa: N801 - 모듈 대역. 계측이 꺼진 것과 같게 동작한다.
+        ENABLED = False
+
+        @staticmethod
+        def timed(kind):
+            return lambda fn: fn
+
+        @staticmethod
+        def emit(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def phase(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def note(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def current_purpose():
+            return "other"
+
+        @staticmethod
+        def current_trigger():
+            return "direct"
+
+        @staticmethod
+        def lock_acquired(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def lock_missed(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def lock_released(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def set_leader_probe(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def start(*args, **kwargs):
+            pass
+
+        @staticmethod
+        def scope(*args, **kwargs):
+            return _timing_nullcontext()
+
+        @staticmethod
+        def phase_timer():
+            return _timing_nullcontext()
+
+
 logger = logging.getLogger(__name__)
 
 class Orchestrator:
@@ -106,6 +167,9 @@ class Orchestrator:
             self.leader_elector.has_valid_leadership
         )
         self.leader_elector.start()
+        # 계측에만 쓴다. 로그 줄마다 리더 여부를 붙여 리더/비리더 비용을 나눈다.
+        timing.set_leader_probe(self.leader_elector.has_valid_leadership)
+        timing.start()
         logger.info("Leader election initialized")
 
         self.startup_completed = True
@@ -123,7 +187,8 @@ class Orchestrator:
         while not self.queue_worker_stop_event.wait(settings.WAIT_QUEUE_WORKER_INTERVAL_SECONDS):
             set_request_label("-")
             try:
-                self.process_wait_queues()
+                with timing.scope(trigger="periodic"):
+                    self.process_wait_queues()
             except Exception as exc:
                 logger.exception("[Failed] operation=queue_worker_iteration reason=%r", str(exc))
             finally:
