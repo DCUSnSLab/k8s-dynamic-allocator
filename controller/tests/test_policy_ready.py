@@ -165,7 +165,8 @@ class RunPassHarness:
         reconciler._last_policy_sync_succeeded = True
         reconciler.sync_policies = lambda: {"general"}
         reconciler.reconcile_type = self._reconcile
-        reconciler._release_scheduling_gates = lambda compute_type: True
+        # 공급은 별도 스레드다. 이 테스트는 깃발 규칙만 본다.
+        reconciler.request_refill = lambda compute_type, **kwargs: None
         reconciler._poll_demand_changes = lambda: set()
 
     def _reconcile(self, compute_type):

@@ -133,6 +133,9 @@ class ComputeQueues:
             (default_compute_type or settings.DEFAULT_COMPUTE_TYPE).strip().lower() or "general"
         )
         self.lock_ttl_seconds = lock_ttl_seconds or settings.WAIT_QUEUE_LOCK_TTL_SECONDS
+        self.supply_lock_ttl_seconds = int(
+            getattr(settings, "BUFFER_SUPPLY_LOCK_TTL_SECONDS", 15) or 15
+        )
         self.scale_down_gate_ttl_seconds = (
             scale_down_gate_ttl_seconds or settings.BUFFER_SCALE_DOWN_GATE_TTL_SECONDS
         )
@@ -293,6 +296,9 @@ class ComputeQueues:
 
     def _lock_key(self, compute_type: str) -> str:
         return f"{self.prefix}:lock:{compute_type}"
+
+    def _supply_lock_key(self, compute_type: str) -> str:
+        return f"{self.prefix}:supply-lock:{compute_type}"
 
     def _buffer_policy_key(self, compute_type: str) -> str:
         return f"{self.prefix}:buffer-policy:{compute_type}"
@@ -886,30 +892,36 @@ class ComputeQueues:
                 f"Failed to inspect buffer policy readiness: {exc}"
             ) from exc
 
-    def acquire_allocator_lock(self, compute_type: str, owner: Optional[str] = None) -> Optional[str]:
-        compute_type_value = self.normalize_compute_type(compute_type)
+    # ---- 토큰 락 공통 (SET NX + 토큰, 토큰 비교 후 expire/del)
+    #
+    # 락이 둘이다. 할당 락(lock:{type})은 claim 과 그 직후 replicas 낮추기를,
+    # 공급 락(supply-lock:{type})은 리더의 공급(replicas 올리기 + 게이트 해제)을
+    # 직렬화한다. 공급이 할당 락을 쓰던 시절에는 포화 구간에서 그 락이 90% 차 있었고
+    # 게이트 해제가 그중 40% 를 차지했다(10/11 계측). 노드 위 파드 수(게이트 풀린
+    # available + assigned)를 늘리는 것은 게이트 해제뿐이고 claim 은 그 합을 바꾸지
+    # 않으므로 두 경로가 같은 락을 쓸 이유가 없다.
+    #
+    # 순서 규칙: 공급 락을 쥔 채 할당 락을 잡지 않는다. 둘 다 필요한 경로(축소,
+    # 정책 게시)는 할당 락 -> 공급 락 순서로 잡는다.
+
+    def _acquire_token_lock(
+        self, key: str, ttl: int, owner: Optional[str], lock: str, label: str
+    ) -> Optional[str]:
         client = self._redis_client()
         token = owner or uuid.uuid4().hex
         try:
-            acquired = client.set(
-                self._lock_key(compute_type_value),
-                token,
-                nx=True,
-                ex=self.lock_ttl_seconds,
-            )
+            acquired = client.set(key, token, nx=True, ex=ttl)
             if acquired:
-                timing.lock_acquired(token)
+                timing.lock_acquired(token, lock=lock)
             else:
-                timing.lock_missed()
+                timing.lock_missed(lock=lock)
             return token if acquired else None
         except RedisError as exc:
-            raise QueueUnavailableError(f"Failed to acquire lock for {compute_type_value}: {exc}") from exc
+            raise QueueUnavailableError(f"Failed to acquire lock for {label}: {exc}") from exc
 
-    def renew_allocator_lock(self, compute_type: str, token: Optional[str]) -> bool:
+    def _renew_token_lock(self, key: str, ttl: int, token: Optional[str], label: str) -> bool:
         if not token:
             return False
-
-        compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()
         renew_script = """
         if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -918,26 +930,14 @@ class ComputeQueues:
         return 0
         """
         try:
-            result = client.eval(
-                renew_script,
-                1,
-                self._lock_key(compute_type_value),
-                token,
-                self.lock_ttl_seconds,
-            )
-            return bool(result)
+            return bool(client.eval(renew_script, 1, key, token, ttl))
         except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to renew lock for {compute_type_value}: {exc}"
-            ) from exc
+            raise QueueUnavailableError(f"Failed to renew lock for {label}: {exc}") from exc
 
-    def release_allocator_lock(self, compute_type: str, token: Optional[str]) -> bool:
+    def _release_token_lock(self, key: str, token: Optional[str], label: str) -> bool:
         if not token:
             return False
-
         timing.lock_released(token)
-
-        compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()
         release_script = """
         if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -946,10 +946,59 @@ class ComputeQueues:
         return 0
         """
         try:
-            result = client.eval(release_script, 1, self._lock_key(compute_type_value), token)
-            return bool(result)
+            return bool(client.eval(release_script, 1, key, token))
         except RedisError as exc:
-            raise QueueUnavailableError(f"Failed to release lock for {compute_type_value}: {exc}") from exc
+            raise QueueUnavailableError(f"Failed to release lock for {label}: {exc}") from exc
+
+    def acquire_allocator_lock(self, compute_type: str, owner: Optional[str] = None) -> Optional[str]:
+        compute_type_value = self.normalize_compute_type(compute_type)
+        return self._acquire_token_lock(
+            self._lock_key(compute_type_value),
+            self.lock_ttl_seconds,
+            owner,
+            "alloc",
+            compute_type_value,
+        )
+
+    def renew_allocator_lock(self, compute_type: str, token: Optional[str]) -> bool:
+        compute_type_value = self.normalize_compute_type(compute_type)
+        return self._renew_token_lock(
+            self._lock_key(compute_type_value),
+            self.lock_ttl_seconds,
+            token,
+            compute_type_value,
+        )
+
+    def release_allocator_lock(self, compute_type: str, token: Optional[str]) -> bool:
+        compute_type_value = self.normalize_compute_type(compute_type)
+        return self._release_token_lock(
+            self._lock_key(compute_type_value), token, compute_type_value
+        )
+
+    def acquire_supply_lock(self, compute_type: str, owner: Optional[str] = None) -> Optional[str]:
+        compute_type_value = self.normalize_compute_type(compute_type)
+        return self._acquire_token_lock(
+            self._supply_lock_key(compute_type_value),
+            self.supply_lock_ttl_seconds,
+            owner,
+            "supply",
+            "supply " + compute_type_value,
+        )
+
+    def renew_supply_lock(self, compute_type: str, token: Optional[str]) -> bool:
+        compute_type_value = self.normalize_compute_type(compute_type)
+        return self._renew_token_lock(
+            self._supply_lock_key(compute_type_value),
+            self.supply_lock_ttl_seconds,
+            token,
+            "supply " + compute_type_value,
+        )
+
+    def release_supply_lock(self, compute_type: str, token: Optional[str]) -> bool:
+        compute_type_value = self.normalize_compute_type(compute_type)
+        return self._release_token_lock(
+            self._supply_lock_key(compute_type_value), token, "supply " + compute_type_value
+        )
 
     def acquire_scale_down_gate(
         self,

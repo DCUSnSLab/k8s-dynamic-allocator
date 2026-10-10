@@ -173,21 +173,25 @@ def timed(kind):
     return decorator
 
 
-# ---------------------------------------------------------------- 할당 락
+# ---------------------------------------------------------------- 할당 락 / 공급 락
 
 _lock_meta = {}
 _lock_guard = threading.Lock()
 
 
-def lock_acquired(token):
+# lock 은 "alloc"(할당 락) 또는 "supply"(공급 락). 두 락의 점유율을 따로 봐야
+# 공급 경로를 떼어 낸 효과를 잴 수 있다. 할당 락의 키·필드는 예전 그대로 둔다
+# (lock_miss.<purpose>) - 과거 run 과 같은 이름으로 비교하기 위해서다.
+def lock_acquired(token, lock="alloc"):
     if ENABLED and token:
         with _lock_guard:
-            _lock_meta[token] = (time.monotonic(), _purpose.get())
+            _lock_meta[token] = (time.monotonic(), _purpose.get(), lock)
 
 
-def lock_missed():
+def lock_missed(lock="alloc"):
     if ENABLED:
-        _stats.add("lock_miss.%s" % _purpose.get(), 0.0)
+        prefix = "lock_miss" if lock == "alloc" else "%s_lock_miss" % lock
+        _stats.add("%s.%s" % (prefix, _purpose.get()), 0.0)
 
 
 def lock_released(token):
@@ -197,7 +201,12 @@ def lock_released(token):
         meta = _lock_meta.pop(token, None)
     if meta is None:
         return
-    emit("LockHold", purpose=meta[1], hold_ms=(time.monotonic() - meta[0]) * 1000)
+    emit(
+        "LockHold",
+        purpose=meta[1],
+        hold_ms=(time.monotonic() - meta[0]) * 1000,
+        lock=meta[2],
+    )
 
 
 # ---------------------------------------------------------------- 주기 출력

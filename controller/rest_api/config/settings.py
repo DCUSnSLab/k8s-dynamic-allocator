@@ -262,6 +262,19 @@ BUFFER_SCALE_DOWN_COOLDOWN_MIN_SAMPLES = _env_int_any(
     10,
 )
 
+# 공급 락(supply-lock:{type})의 TTL. 공급 한 바퀴(목록 1회 + replicas 올리기 +
+# 게이트 몇 개)는 수 초 안에 끝나므로 짧게 둔다. 리더가 죽으면 이 시간 뒤 풀린다.
+BUFFER_SUPPLY_LOCK_TTL_SECONDS = _env_int_any(
+    ('BUFFER_SUPPLY_LOCK_TTL_SECONDS',),
+    15,
+)
+# 공급 한 바퀴에서 목록을 다시 읽기 전에 연달아 푸는 게이트 수. N 안전과는 무관하다
+# (예산 안에서만 푼다). 푸는 도중 큐가 비어 목표가 내려갔을 때 쓸데없이 들이는 파드
+# 수를 이 값 이하로 묶는다.
+BUFFER_REFILL_BATCH_LIMIT = _env_int_any(
+    ('BUFFER_REFILL_BATCH_LIMIT',),
+    4,
+)
 BUFFER_SCALE_DOWN_WAIT_TIMEOUT_SECONDS = _env_int_any(
     ('BUFFER_SCALE_DOWN_WAIT_TIMEOUT_SECONDS',),
     10,

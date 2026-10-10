@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import time
 import uuid
@@ -150,6 +151,42 @@ class BufferCapacityReconciler:
         self._initial_publish_pending = True
         # 타입 -> 축소 PATCH 로 보낸 replicas.
         self._policy_ready_holds: Dict[str, int] = {}
+
+        # ---- 공급(refill): replicas 올리기 + 게이트 해제
+        #
+        # reconcile 바퀴와 할당 락에서 떼어 낸 리더 전용 작업이다. 그 둘에 묶여
+        # 있던 시절 포화 구간에서 게이트 대기가 평균 5.0초, replicas 증가의 46% 가
+        # 할당 락 timeout 이었다(10/11 run 051521). 전용 스레드 하나에서 돌고
+        # 공급 락만 잡는다. 파드 이벤트로 바로 깨어난다.
+        self.refill_batch_limit = max(
+            1, int(getattr(settings, "BUFFER_REFILL_BATCH_LIMIT", 4) or 4)
+        )
+        # 실패·충돌·후보 없음 뒤의 재예약. 지수 백오프를 쓰지 않는다 - 포화에서는
+        # 몇 초 밀리는 것이 그대로 슬롯 손실이다.
+        self.refill_retry_seconds = 0.5
+        # 같은 순간 몰려오는 파드 이벤트를 한 바퀴로 합친다.
+        self.refill_debounce_seconds = 0.05
+        # 공급 락 대기. 공급 락을 다투는 것은 축소·정책 게시뿐이라 짧게 둔다.
+        self.supply_lock_wait_seconds = 0.5
+        self._refill_condition = threading.Condition()
+        self._refill_due: Dict[str, float] = {}
+        self._refill_requested_at: Dict[str, float] = {}
+        self._refill_trigger: Dict[str, str] = {}
+        self._refill_generation = 0
+        self._refill_not_before = 0.0
+        # 타입 -> {파드 이름: PATCH 가 test 한 resourceVersion}. 응답을 못 받은
+        # 게이트 PATCH 는 서버에 반영됐을 수 있으므로 "풀었다" 로 센다.
+        self._gate_unknown: Dict[str, Dict[str, str]] = {}
+        # 리더를 잠깐 잃었다 되찾은 경우(같은 프로세스)를 가리기 위한 값. 그 사이
+        # 다른 복제본이 리더였을 수 없는 시간 = lease 기간 - 갱신 주기
+        # (lease 는 마지막 갱신 + 기간에 만료되고, 마지막 갱신은 멈춘 시각보다 최대
+        # 갱신 주기만큼 이르다). leader.py 와 같은 env 를 읽는다.
+        self._refill_stopped_at: Optional[float] = None
+        self._same_leader_window_seconds = max(
+            0.0,
+            float(os.getenv("LEASE_DURATION_SECONDS", "15"))
+            - float(os.getenv("LEASE_RENEW_INTERVAL_SECONDS", "5")),
+        )
         self._leadership_validator: Callable[[], bool] = lambda: True
         self._status_lock = threading.Lock()
         self._status: Dict[str, Dict] = {}
@@ -632,6 +669,35 @@ class BufferCapacityReconciler:
                 name="buffer-policy-ready-renewer",
                 daemon=True,
             ).start()
+            # 공급 작업. 결과 미상 목록은 리더마다 따로라 새 리더는 이전 리더의
+            # 응답 없는 게이트 PATCH 를 모른다. 그 요청이 늦게 반영될 수 있는 시간
+            # (API 요청 timeout + 여유) 동안은 게이트를 풀지 않는다.
+            #
+            # 단 같은 프로세스가 잠깐 잃었다 되찾은 경우(lease 갱신 예외 한 번)는
+            # 그 사이 다른 리더가 있을 수 없다. 이때는 자기 미상 목록을 그대로 쓰고
+            # 기다리지 않는다 - 포화에서 갱신 예외마다 공급이 8초씩 멈추면 안 된다.
+            with self._refill_condition:
+                now = time.monotonic()
+                same_leader = (
+                    self._refill_stopped_at is not None
+                    and now - self._refill_stopped_at < self._same_leader_window_seconds
+                )
+                if same_leader:
+                    self._refill_not_before = now
+                else:
+                    self._gate_unknown.clear()
+                    self._refill_not_before = now + self._leader_refill_grace_seconds()
+                self._refill_due.clear()
+                self._refill_requested_at.clear()
+                self._refill_trigger.clear()
+                self._refill_generation += 1
+                generation = self._refill_generation
+            threading.Thread(
+                target=self._run_refill,
+                args=(generation,),
+                name="buffer-refill",
+                daemon=True,
+            ).start()
             self._condition.notify_all()
         logger.info("[BufferCapacityReconcilerStarted]")
 
@@ -650,6 +716,9 @@ class BufferCapacityReconciler:
             thread = self._thread
             self._stop_event.set()
             self._condition.notify_all()
+        with self._refill_condition:
+            self._refill_stopped_at = time.monotonic()
+            self._refill_condition.notify_all()
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(2.0, self.wait_timeout_seconds + 1.0))
         with self._condition:
@@ -659,13 +728,22 @@ class BufferCapacityReconciler:
         logger.info("[BufferCapacityReconcilerStopped]")
 
     def on_buffer_event(self, event_type: str, pod, source: str = "watch") -> None:
-        del event_type, source
+        del source
         metadata = getattr(pod, "metadata", None)
         labels = getattr(metadata, "labels", None) or {}
         compute_type = labels.get(self.provider.LABEL_COMPUTE_TYPE)
         if compute_type:
             self._note_create_time(compute_type, pod)
             self.request_reconcile(compute_type)
+            # 공급이 할 일이 생기는 순간들: ReplicaSet 이 게이트 파드를 만듦(ADDED),
+            # 파드가 사라짐(DELETED), 삭제가 시작됨(deletionTimestamp - 반납된
+            # 파드는 이때 assigned 에서 빠져 자리가 난다). 1초 타이머나 reconcile
+            # 바퀴를 기다리지 않는다. Ready 같은 상태 변화는 공급과 무관해 거른다.
+            if (
+                event_type in ("ADDED", "DELETED")
+                or getattr(metadata, "deletion_timestamp", None) is not None
+            ):
+                self.request_refill(compute_type, trigger="event")
 
     def _note_create_time(self, compute_type: str, pod) -> None:
         """파드가 Ready 가 된 순간, 스케줄 허용 이후 준비 시간을 표본에 넣는다.
@@ -935,11 +1013,12 @@ class BufferCapacityReconciler:
                     pass_started = time.monotonic()
                     result = self.reconcile_type(compute_type)
                     reconciled_at = time.monotonic()
-                    gates_reconciled = False
+                    # 공급(replicas 올리기 + 게이트 해제)은 이 바퀴에서 하지 않는다.
+                    # 바퀴가 축소 관측으로 십수 초씩 걸리는 동안 공급이 멈추고, 락
+                    # 경합으로 retry 가 나오면 그 바퀴는 게이트를 아예 안 풀었다.
+                    # 여기서는 공급 작업을 깨우기만 한다(싸다 - 합쳐진다).
                     if not result.get("retry") and result.get("status") != "blocked":
-                        gates_reconciled = self._release_scheduling_gates(compute_type)
-                    # 공급(replicas 증가 + 게이트 해제)이 이 바퀴에 묶여 있다는 것이
-                    # 지금 의심이므로, 바퀴를 깨운 원인과 두 몫을 나눠 남긴다.
+                        self.request_refill(compute_type, trigger="reconcile")
                     timing.emit(
                         "ReconcilePass",
                         compute_type=compute_type,
@@ -949,7 +1028,6 @@ class BufferCapacityReconciler:
                         status=result.get("status", "-"),
                         reason=result.get("reason", "-"),
                         reconcile_ms=(reconciled_at - pass_started) * 1000,
-                        gate_ms=(time.monotonic() - reconciled_at) * 1000,
                     )
                     # reconcile 의 결과(미뤄짐이든 오류든)는 reconcile 재시도만
                     # 일으키고 정책 깃발에는 손대지 않는다. 깃발은 할당의 1번
@@ -984,14 +1062,8 @@ class BufferCapacityReconciler:
                         # 첫 게시가 막혀 백오프(최대 60초) 중이어도, 깨끗한 바퀴가
                         # 나오면 그 백오프를 기다리지 않고 바로 다시 게시를 시도한다.
                         self.request_policy_refresh()
-                    if not gates_reconciled:
-                        # Pod creation, ReplicaSet deletion and gate CAS
-                        # conflicts commonly resolve without another event.
-                        # 못 푼 게이트는 이 1초 재시도가 가져간다.
-                        self._schedule_after(1.0, compute_type)
-                    else:
-                        with self._condition:
-                            self._retry_counts.pop(compute_type, None)
+                    with self._condition:
+                        self._retry_counts.pop(compute_type, None)
 
                 if publish_policy_ready:
                     with self._condition:
@@ -1070,151 +1142,482 @@ class BufferCapacityReconciler:
                 changed.add(compute_type)
         return changed
 
-    def _release_scheduling_gates(self, compute_type: str) -> bool:
-        """계측 포장. KDA_TIMING_LOG 가 꺼져 있으면 원래 경로를 그대로 탄다.
+    # ---------------------------------------------------------------- 공급(refill)
 
-        포화 구간 424 바퀴 중 271 바퀴가 게이트를 하나도 풀지 못했는데, 지금
-        로그로는 그 이유(락 timeout / 예산 충족 / 후보 없음 / 패치 실패)를 나눌 수
-        없다. 그 사유와 1 회 소요를 남긴다.
+    def _leader_refill_grace_seconds(self) -> float:
+        """새 리더가 게이트를 풀기 전에 기다리는 시간.
+
+        이전 리더가 응답을 못 받은 게이트 PATCH 는 그 리더의 결과 미상 목록에만
+        있다. 그 요청이 늦게 반영될 수 있는 시간(연결 + 읽기 timeout) 동안 풀지
+        않으면, 새 리더가 같은 자리에 하나 더 풀어 N+1 이 되는 일이 없다.
+        """
+        timeout = getattr(self.provider, "api_request_timeout", None)
+        try:
+            if isinstance(timeout, (tuple, list)):
+                seconds = float(sum(float(value) for value in timeout))
+            else:
+                seconds = float(timeout)
+        except (TypeError, ValueError):
+            seconds = 7.0
+        return max(0.0, seconds) + 1.0
+
+    def request_refill(
+        self,
+        compute_type: str,
+        *,
+        delay: Optional[float] = None,
+        trigger: str = "event",
+    ) -> None:
+        """공급 작업을 예약한다. 같은 타입의 요청은 가장 이른 시각 하나로 합쳐진다."""
+        compute_type_value = self.queues.normalize_compute_type(compute_type)
+        now = time.monotonic()
+        due = now + (self.refill_debounce_seconds if delay is None else max(0.0, delay))
+        with self._refill_condition:
+            current = self._refill_due.get(compute_type_value)
+            if current is None or due < current:
+                self._refill_due[compute_type_value] = due
+            self._refill_requested_at.setdefault(compute_type_value, now)
+            self._refill_trigger.setdefault(compute_type_value, trigger)
+            self._refill_condition.notify_all()
+
+    def _run_refill(self, generation: int) -> None:
+        """리더 전용 공급 스레드. 스레드가 하나라 프로세스 안의 공급은 직렬이다.
+
+        공급 락은 리더가 바뀌는 순간의 겹침과 축소·정책 게시를 막는 용도다.
+        reconcile 은 더 이상 replicas 를 올리지 않으므로 이 스레드가 죽으면 공급이
+        조용히 멈춘다. 그래서 한 바퀴의 예외가 루프를 끝내지 않게 한다.
+        """
+        streaks: Dict[str, Tuple[str, int]] = {}
+        while not self._stop_event.is_set() and generation == self._refill_generation:
+            try:
+                self._refill_round(generation, streaks)
+            except Exception:
+                logger.exception("[Failed] operation=buffer_refill_loop")
+                if self._stop_event.wait(self.refill_retry_seconds):
+                    return
+
+    def _refill_round(self, generation: int, streaks: Dict[str, Tuple[str, int]]) -> None:
+        batch = []
+        with self._refill_condition:
+            while (
+                not self._stop_event.is_set()
+                and generation == self._refill_generation
+            ):
+                now = time.monotonic()
+                ready = [
+                    compute_type
+                    for compute_type, due in self._refill_due.items()
+                    if due <= now
+                ]
+                if ready:
+                    for compute_type in sorted(ready):
+                        self._refill_due.pop(compute_type, None)
+                        batch.append(
+                            (
+                                compute_type,
+                                self._refill_trigger.pop(compute_type, "event"),
+                                self._refill_requested_at.pop(compute_type, now),
+                            )
+                        )
+                    break
+                timeout = 1.0
+                if self._refill_due:
+                    timeout = max(0.0, min(self._refill_due.values()) - now)
+                self._refill_condition.wait(timeout=timeout)
+        for compute_type, trigger, requested_at in batch:
+            if self._stop_event.is_set() or generation != self._refill_generation:
+                return
+            if not self._has_write_authority():
+                continue
+            try:
+                result = self._refill(
+                    compute_type, trigger, requested_at, generation
+                )
+            except Exception:
+                logger.exception(
+                    "[Failed] operation=buffer_refill compute_type=%s",
+                    compute_type,
+                )
+                result = {"reason": "exception", "retry_after": self.refill_retry_seconds}
+            retry_after = result.get("retry_after")
+            if retry_after is None:
+                streaks.pop(compute_type, None)
+                continue
+            # 같은 사유로 연달아 실패하면(ReplicaSet 이 파드를 못 만드는 등) 0.5초
+            # 마다 목록을 읽지 않게 상한 2초까지 늘린다. 파드 이벤트는 여전히
+            # 바로 깨우므로(가장 이른 예약이 이긴다) 정상 경로는 늦어지지 않는다.
+            reason = result.get("reason", "-")
+            previous = streaks.get(compute_type)
+            count = previous[1] + 1 if previous and previous[0] == reason else 1
+            streaks[compute_type] = (reason, count)
+            if reason in ("no_candidate", "settling", "patch_failed", "exception"):
+                retry_after = min(2.0, retry_after * (2 ** (count - 1)))
+            self.request_refill(
+                compute_type, delay=retry_after, trigger="retry"
+            )
+
+    def _refill(
+        self,
+        compute_type: str,
+        trigger: str,
+        requested_at: float,
+        generation: Optional[int] = None,
+    ) -> Dict:
+        """계측 포장. RefillPass 한 줄에 이번 공급의 내역을 남긴다.
+
+        예전 GateReleasePass(게이트 해제)와 ScaleUpTiming(replicas 증가)을 대신한다.
         """
         if not timing.ENABLED:
-            return self._release_scheduling_gates_impl(compute_type)
-        with timing.scope(purpose="gate"), timing.phase_timer() as timer:
-            ok = None
+            return self._refill_impl(compute_type, requested_at, generation)
+        with timing.scope(purpose="refill"), timing.phase_timer() as timer:
+            result = None
             try:
-                ok = self._release_scheduling_gates_impl(compute_type)
-                return ok
+                result = self._refill_impl(compute_type, requested_at, generation)
+                return result
             finally:
-                n = timer.notes
+                r = result or {}
                 timing.emit(
-                    "GateReleasePass",
+                    "RefillPass",
                     compute_type=compute_type,
-                    ok=int(bool(ok)),
-                    released=n.get("released", 0),
-                    reason=n.get("reason", "-"),
-                    budget=n.get("budget", "-"),
-                    ungated=n.get("ungated", "-"),
-                    candidates=n.get("candidates", "-"),
+                    trigger=trigger,
+                    reason=r.get("reason", "exception"),
+                    raised=r.get("raised", 0),
+                    trimmed=r.get("trimmed", 0),
+                    cas_conflicts=r.get("cas_conflicts", 0),
+                    released=r.get("released", 0),
+                    unknown=r.get("unknown", 0),
+                    budget=r.get("budget", "-"),
+                    ungated=r.get("ungated", "-"),
+                    candidates=r.get("candidates", "-"),
+                    wake_to_patch_ms=r.get("wake_to_patch_ms", "-"),
                     total_ms=timer.total_ms(),
                 )
 
-    def _release_scheduling_gates_impl(self, compute_type: str) -> bool:
-        """Admit gated warm Pods only within the current demand and N budget.
+    def _supply_still_valid(
+        self, compute_type: str, token: str, generation: Optional[int] = None
+    ) -> bool:
+        # 세대: start() 가 _stop_event 를 다시 내리면, 목록 읽기·PATCH 에 걸려 있던
+        # 옛 스레드가 깨어나 계속 쓸 수 있다. 세대가 바뀌었으면 거기서 멈춘다.
+        return (
+            not self._stop_event.is_set()
+            and (generation is None or generation == self._refill_generation)
+            and self._has_write_authority()
+            and bool(self.queues.renew_supply_lock(compute_type, token))
+            and not self.queues.is_scale_down_gated(compute_type)
+        )
 
-        Drop the allocator lock between Pods so claims can run during a burst.
-        Re-read aggregate state after each acquisition: a Pod resource version
-        protects only that Pod, not the budget shared by all warm Pods.
+    def _settle_unknown_gates(self, compute_type: str, snapshot: Dict) -> int:
+        """결과 미상 게이트 PATCH 를 방금 읽은 목록과 맞춰 보고, 남은 수를 돌려준다.
+
+        목록 읽기는 consistent read 라 판단 근거가 된다. 그 파드가
+          - 사라졌거나 삭제 중이면: 더 셀 것이 없다.
+          - 게이트가 풀려 있으면: ungated_available 에 이미 들어 있다.
+          - resourceVersion 이 PATCH 가 test 한 값과 다르면: 그 PATCH 는 test 에
+            걸려 영원히 적용되지 않는다.
+        셋 다 아니면(같은 버전에 게이트가 그대로) 아직 도착하지 않았을 수 있으므로
+        계속 "풀었다" 로 센다. 목록에 파드 정보가 없으면 판단을 못 하므로 그대로 둔다.
         """
-        if self._stop_event.is_set() or not self._has_write_authority():
-            timing.note(reason="not_leader")
-            return False
-        try:
-            policy = self.queues.get_buffer_policy(compute_type)
-            if not policy:
-                timing.note(reason="no_policy")
-                return False
-            max_attempts = max(1, int(policy["N"]) * 2)
-            released_count = 0
-            for _ in range(max_attempts):
-                deadline = time.monotonic() + min(1.0, self.wait_timeout_seconds)
-                lock_token = self._acquire_allocator_lock_until(
-                    compute_type, deadline, threading.Event()
-                )
-                if not lock_token:
-                    timing.note(reason="lock_timeout")
-                    return False
-                try:
-                    if (
-                        self._stop_event.is_set()
-                        or not self._has_write_authority()
-                        or not self.queues.renew_allocator_lock(compute_type, lock_token)
-                        or self.queues.is_scale_down_gated(compute_type)
-                    ):
-                        timing.note(reason="gated_or_lost")
-                        return False
+        with self._refill_condition:
+            unknown = dict(self._gate_unknown.get(compute_type, {}))
+        if not unknown:
+            return 0
+        pods = snapshot.get("pods")
+        if pods is None:
+            return len(unknown)
+        by_name = {pod.get("name"): pod for pod in pods}
+        remaining = {}
+        for name, version in unknown.items():
+            pod = by_name.get(name)
+            if pod is None or pod.get("terminating"):
+                continue
+            if not pod.get("scheduling_gated"):
+                continue
+            if (pod.get("resource_version") or "") != version:
+                continue
+            remaining[name] = version
+        with self._refill_condition:
+            if remaining:
+                self._gate_unknown[compute_type] = remaining
+            else:
+                self._gate_unknown.pop(compute_type, None)
+        return len(remaining)
 
-                    policy = self.queues.get_buffer_policy(compute_type)
-                    if not policy:
-                        timing.note(reason="gated_or_lost")
-                        return False
-                    snapshot = self.provider.list_buffer_snapshot(compute_type)
-                    current = int(
-                        self.provider.read_deployment_replicas(
-                            policy["deployment_name"]
-                        )
-                    )
-                    assigned = int(snapshot["buffer_assigned"])
-                    room = max(0, int(policy["N"]) - assigned)
-                    available = int(snapshot["buffer_available"])
-                    total = int(snapshot["buffer_total"])
-                    unowned = int(snapshot.get("unowned_available", 0))
-                    owned_available = max(0, available - unowned)
-                    if current > room or owned_available > current:
-                        # Let ReplicaSet deletion and N correction settle.
-                        timing.note(reason="settling")
-                        return False
-                    if total > int(policy["N"]):
-                        # Gated or unowned API objects do not consume this
-                        # admission budget; unowned Pods remain in ungated.
-                        logger.warning(
-                            "[BufferGateOvershoot] compute_type=%s total=%s N=%s "
-                            "unowned_available=%s",
+    def _refill_impl(
+        self,
+        compute_type: str,
+        requested_at: float,
+        generation: Optional[int] = None,
+    ) -> Dict:
+        """공급 락 아래에서 replicas 를 목표까지 올리고 게이트를 예산만큼 푼다.
+
+        N 안전: 노드 위 파드 수(게이트 풀린 available + assigned)를 늘리는 것은
+        게이트 해제뿐이다. claim 은 게이트 풀린 available 하나를 assigned 로 바꿀
+        뿐이라 합이 그대로이고, 반납(삭제)은 합을 줄인다. 그래서 게이트 해제끼리만
+        직렬화하면 되고(공급 락), 할당 락은 잡지 않는다. 예산은 예전 그대로
+        min(replicas, N - assigned, desired) 이다. 읽은 뒤 claim 이 끼어들어도
+        "풀린 수 + assigned" 가 그대로라 예산을 넘지 않는다.
+
+        replicas 쓰기는 CAS 로만 한다. 할당기가 claim 직후 replicas 를 내리는
+        것(할당 락)과 동시에 일어날 수 있기 때문이다.
+        """
+        out: Dict = {
+            "raised": 0,
+            "trimmed": 0,
+            "cas_conflicts": 0,
+            "released": 0,
+            "unknown": 0,
+            "reason": "-",
+            "retry_after": None,
+        }
+
+        def done(reason: str, retry: bool = False, delay: Optional[float] = None) -> Dict:
+            out["reason"] = reason
+            if retry:
+                out["retry_after"] = self.refill_retry_seconds if delay is None else delay
+            return out
+
+        if self._stop_event.is_set() or not self._has_write_authority():
+            return done("not_leader")
+        grace = self._refill_not_before - time.monotonic()
+        if grace > 0:
+            return done("leader_grace", retry=True, delay=grace)
+        policy = self.queues.get_buffer_policy(compute_type)
+        if not policy:
+            # 정책 문제는 reconcile·정책 동기화가 다룬다.
+            return done("no_policy")
+        if self.queues.is_scale_down_gated(compute_type):
+            # 축소가 진행 중이다. Redis 키 하나만 보므로 자주 다시 봐도 싸다.
+            return done("scale_down_gated", retry=True)
+
+        deadline = time.monotonic() + self.supply_lock_wait_seconds
+        token = self._acquire_supply_lock_until(compute_type, deadline, threading.Event())
+        if not token:
+            return done("supply_lock_timeout", retry=True)
+        try:
+            for _ in range(max(1, int(policy["N"]) * 2)):
+                if not self._supply_still_valid(compute_type, token, generation):
+                    return done("lost_or_gated", retry=True)
+                policy = self.queues.get_buffer_policy(compute_type)
+                if not policy:
+                    return done("no_policy")
+                snapshot = self.provider.list_buffer_snapshot(compute_type)
+                current = int(
+                    self.provider.read_deployment_replicas(policy["deployment_name"])
+                )
+                pending_unknown = self._settle_unknown_gates(compute_type, snapshot)
+                assigned = int(snapshot["buffer_assigned"])
+                room = max(0, int(policy["N"]) - assigned)
+                queued = self._queued_for_target(compute_type)
+                desired = self.desired_replicas(policy["R"], policy["N"], assigned, queued)
+
+                # 1) replicas 올리기. 계산은 예전 _scale_up 과 같다.
+                if current < desired and self._held_available(snapshot) <= desired:
+                    target = desired
+                    # N 을 넘지 않는 마지막 관문. 배정은 available 을 assigned 로
+                    # 옮길 뿐이지만 그 backfill 이 합을 올리므로, buffer_total 이 N 을
+                    # 넘게 만드는 확대는 하지 않는다.
+                    headroom = int(policy["N"]) - int(snapshot["buffer_total"])
+                    if target - current > headroom:
+                        capped = current + max(0, headroom)
+                        logger.info(
+                            "[BufferScaleUpCapped] compute_type=%s desired=%s->%s "
+                            "current=%s total=%s N=%s unowned_available=%s",
                             compute_type,
-                            total,
+                            target,
+                            capped,
+                            current,
+                            snapshot["buffer_total"],
                             policy["N"],
+                            snapshot.get("unowned_available", 0),
+                        )
+                        target = capped
+                    if target > current:
+                        if not self._supply_still_valid(compute_type, token, generation):
+                            return done("lost_or_gated", retry=True)
+                        if self.provider.raise_deployment_replicas(
+                            policy["deployment_name"], current, target
+                        ):
+                            logger.info(
+                                "[BufferScaled] compute_type=%s direction=up "
+                                "replicas=%s->%s assigned=%s R=%s N=%s",
+                                compute_type,
+                                current,
+                                target,
+                                assigned,
+                                policy["R"],
+                                policy["N"],
+                            )
+                            out["raised"] += target - current
+                            current = target
+                        else:
+                            # 그사이 할당기가 내렸다. 다시 읽고 다시 계산한다.
+                            out["cas_conflicts"] += 1
+                            if out["cas_conflicts"] >= 3:
+                                return done("cas_conflict", retry=True)
+                            continue
+
+                # 2) replicas 가 room 을 넘으면 room 까지 내린다.
+                #
+                # 공급은 할당 락 없이 목록을 읽으므로, 읽은 뒤 claim 이 끼어들면
+                # room 보다 높게 올릴 수 있다(할당기는 이미 낮추기를 마친 뒤라
+                # 다시 보지 않는다). 기다리면 reconcile 의 용량 트림이 축소 게이트를
+                # 세워 그동안 모든 claim 을 막는다. 여기서 할당기와 같은 CAS 낮추기를
+                # 한다. room 까지만 내리고 게이트 풀린 파드는 room 이하이므로,
+                # ReplicaSet 은 노드에 없는 게이트 파드(deletion-cost -100)부터 지운다.
+                if current > room:
+                    if not self._supply_still_valid(compute_type, token, generation):
+                        return done("lost_or_gated", retry=True)
+                    if self.provider.lower_deployment_replicas(
+                        policy["deployment_name"], current, room
+                    ):
+                        logger.info(
+                            "[BufferRefillTrim] compute_type=%s replicas=%s->%s "
+                            "assigned=%s n=%s",
+                            compute_type,
+                            current,
+                            room,
+                            assigned,
+                            policy["N"],
+                        )
+                        out["trimmed"] += current - room
+                    else:
+                        out["cas_conflicts"] += 1
+                        if out["cas_conflicts"] >= 3:
+                            return done("cas_conflict", retry=True)
+                    continue
+
+                # 3) 게이트 해제.
+                unowned = int(snapshot.get("unowned_available", 0))
+                owned_available = max(0, int(snapshot["buffer_available"]) - unowned)
+                if owned_available > current:
+                    # replicas 를 내린 뒤 ReplicaSet 이 아직 지우지 않았다. 삭제
+                    # 이벤트가 바로 다시 깨운다.
+                    return done("settling", retry=True)
+                if int(snapshot["buffer_total"]) > int(policy["N"]):
+                    logger.warning(
+                        "[BufferGateOvershoot] compute_type=%s total=%s N=%s "
+                        "unowned_available=%s",
+                        compute_type,
+                        snapshot["buffer_total"],
+                        policy["N"],
+                        unowned,
+                    )
+                budget = min(current, room, desired)
+                ungated = int(snapshot["ungated_available"])
+                with self._refill_condition:
+                    unknown = dict(self._gate_unknown.get(compute_type, {}))
+
+                # 결과 미상 파드는 같은 resourceVersion 으로 다시 보낸다. 두 요청이
+                # 같은 버전을 test 하므로 최대 하나만 적용된다 - 이중으로 세지 않는다.
+                # 다시 보내지 않으면, 요청이 서버에 닿지도 않은 경우(연결 실패)에는
+                # 그 파드의 버전이 바뀌지 않아 미상이 영구히 남고 예산 하나가 샌다.
+                # 그 자리는 아래 free 계산에서 이미 빼 두었으므로 새 예산을 쓰지 않는다.
+                gated_by_name = {
+                    candidate["name"]: candidate
+                    for candidate in snapshot["gated_available_candidates"]
+                }
+                for name, version in unknown.items():
+                    candidate = gated_by_name.get(name)
+                    if candidate is None or candidate["resource_version"] != version:
+                        continue
+                    if not self._supply_still_valid(compute_type, token, generation):
+                        return done("lost_or_gated", retry=True)
+                    try:
+                        ok = self.provider.release_pod_scheduling_gate(
+                            name, version, candidate["gate_index"]
+                        )
+                    except Exception:
+                        continue
+                    if ok:
+                        with self._refill_condition:
+                            entry = self._gate_unknown.get(compute_type, {})
+                            entry.pop(name, None)
+                            if not entry:
+                                self._gate_unknown.pop(compute_type, None)
+                        out["released"] += 1
+                        logger.info(
+                            "[BufferGateReleased] compute_type=%s compute_pod=%s "
+                            "ungated=%s budget=%s assigned=%s n=%s",
+                            compute_type,
+                            name,
+                            ungated + 1,
+                            budget,
+                            assigned,
+                            policy["N"],
+                        )
+
+                candidates = [
+                    candidate
+                    for candidate in snapshot["gated_available_candidates"]
+                    if candidate["name"] not in unknown
+                ]
+                out.update(budget=budget, ungated=ungated, candidates=len(candidates))
+                free = budget - ungated - pending_unknown
+                if free <= 0:
+                    if unowned and snapshot["gated_available_candidates"]:
+                        logger.info(
+                            "[BufferGateDeferred] compute_type=%s reason=%r "
+                            "ungated=%s budget=%s unowned_available=%s",
+                            compute_type,
+                            "unowned available Pods consume admission budget",
+                            ungated,
+                            budget,
                             unowned,
                         )
+                    return done("budget_full")
+                if not candidates:
+                    # ReplicaSet 이 아직 게이트 파드를 만들지 않았다. ADDED 이벤트가
+                    # 깨우지만 감시가 끊겨 있을 수 있으므로 재예약도 걸어 둔다.
+                    return done("no_candidate", retry=True)
 
-                    queued = self._queued_for_target(compute_type)
-                    desired = self.desired_replicas(
-                        policy["R"], policy["N"], assigned, queued
-                    )
-                    budget = min(current, room, desired)
-                    ungated = int(snapshot["ungated_available"])
-                    timing.note(budget=budget, ungated=ungated,
-                                candidates=len(snapshot["gated_available_candidates"]))
-                    if ungated >= budget:
-                        if unowned and snapshot["gated_available_candidates"]:
-                            logger.info(
-                                "[BufferGateDeferred] compute_type=%s reason=%r "
-                                "ungated=%s budget=%s unowned_available=%s",
-                                compute_type,
-                                "unowned available Pods consume admission budget",
-                                ungated,
-                                budget,
-                                unowned,
-                            )
-                        timing.note(reason="budget_full")
-                        return True
-                    candidates = snapshot["gated_available_candidates"]
-                    if not candidates:
-                        # The Deployment may not have created its gated Pod yet.
-                        timing.note(reason="no_candidate")
-                        return False
-
-                    if (
-                        self._stop_event.is_set()
-                        or not self._has_write_authority()
-                        or not self.queues.renew_allocator_lock(compute_type, lock_token)
-                        or self.queues.is_scale_down_gated(compute_type)
-                    ):
-                        return False
-
-                    # 후보를 하나만 보고 포기하면 안 된다. 후보는 (생성시각, 이름)
-                    # 순이라 항상 같은 파드가 맨 앞이고, 그 파드의 패치가 계속
-                    # 실패하면(어노테이션이 외부에서 바뀌어 test 가 422, 또는 파드가
-                    # 막 사라지는 중) **그 뒤의 파드가 영구히 안 풀린다**. 머리 하나가
-                    # 줄 전체를 막는다. 한 패스에서 다음 후보로 넘어가면 그 파드만
-                    # 1초 재시도에 남고 나머지는 정상 진행한다.
-                    released_one = False
-                    for candidate in candidates:
-                        if self.provider.release_pod_scheduling_gate(
+                # 후보를 하나만 보고 포기하지 않는다. 맨 앞 파드의 패치가 계속
+                # 실패하면(외부에서 어노테이션이 바뀜, 막 사라지는 중) 그 뒤가 영구히
+                # 안 풀린다. 실패한 것은 건너뛰고 다음 후보로 간다.
+                limit = min(free, self.refill_batch_limit)
+                released_now = 0
+                for candidate in candidates:
+                    if released_now >= limit:
+                        break
+                    if not self._supply_still_valid(compute_type, token, generation):
+                        return done("lost_or_gated", retry=True)
+                    try:
+                        ok = self.provider.release_pod_scheduling_gate(
                             candidate["name"],
                             candidate["resource_version"],
                             candidate["gate_index"],
-                        ):
-                            released_one = True
-                            break
+                        )
+                    except Exception as exc:
+                        status = getattr(exc, "status", None)
+                        if isinstance(status, int) and 400 <= status < 500:
+                            # 400/403/429 등은 서버가 거절했다는 확정 응답이다.
+                            # 적용되지 않았으므로 미상으로 세지 않는다(403 같은 영구
+                            # 오류에서 미상이 쌓여 예산이 새는 것을 막는다).
+                            logger.warning(
+                                "[BufferGateSkipped] compute_type=%s compute_pod=%s "
+                                "reason=%s",
+                                compute_type,
+                                candidate["name"],
+                                "http_%s" % status,
+                            )
+                            continue
+                        # timeout·연결 오류·5xx: 서버에 반영됐는지 모른다. 반영됐다고
+                        # 치고, 목록에서 결판이 날 때까지 예산에서 뺀다. 예전 코드는
+                        # 여기서 그냥 빠져나가 다음 바퀴가 같은 자리에 하나 더 풀 수
+                        # 있었다(N+1).
+                        with self._refill_condition:
+                            self._gate_unknown.setdefault(compute_type, {})[
+                                candidate["name"]
+                            ] = candidate["resource_version"]
+                        out["unknown"] += 1
+                        logger.warning(
+                            "[BufferGateUnknown] compute_type=%s compute_pod=%s "
+                            "reason=%r",
+                            compute_type,
+                            candidate["name"],
+                            str(exc),
+                        )
+                        return done("patch_unknown", retry=True)
+                    if not ok:
                         logger.info(
                             "[BufferGateSkipped] compute_type=%s compute_pod=%s "
                             "reason=%s",
@@ -1222,49 +1625,38 @@ class BufferCapacityReconciler:
                             candidate["name"],
                             "patch_conflict_or_gone",
                         )
-                    if not released_one:
-                        timing.note(reason="patch_failed")
-                        return False
+                        continue
+                    if "wake_to_patch_ms" not in out:
+                        out["wake_to_patch_ms"] = (time.monotonic() - requested_at) * 1000
+                    released_now += 1
+                    out["released"] += 1
                     logger.info(
                         "[BufferGateReleased] compute_type=%s compute_pod=%s "
                         "ungated=%s budget=%s assigned=%s n=%s",
                         compute_type,
                         candidate["name"],
-                        ungated + 1,
+                        ungated + released_now,
                         budget,
                         assigned,
                         policy["N"],
                     )
-                    released_count += 1
-                    timing.note(released=released_count)
-                finally:
-                    try:
-                        self.queues.release_allocator_lock(compute_type, lock_token)
-                    except Exception as exc:
-                        logger.warning(
-                            "[Warning] operation=buffer_gate_lock_release "
-                            "compute_type=%s reason=%r",
-                            compute_type,
-                            str(exc),
-                        )
-                # Give pending claims a chance to acquire the free lock.
-                if self._stop_event.wait(0.01):
-                    timing.note(reason="stopping")
-                    return False
-            if released_count:
-                self.request_reconcile(compute_type)
-                timing.note(reason="released")
-                return True
-            timing.note(reason="loop_end")
-            return False
-        except Exception as exc:
-            logger.warning(
-                "[Warning] operation=buffer_gate_release compute_type=%s reason=%r",
-                compute_type,
-                str(exc),
-            )
-            timing.note(reason="exception")
-            return False
+                if released_now == 0:
+                    return done("patch_failed", retry=True)
+                if released_now >= free:
+                    return done("released")
+                # 묶음 상한에 걸렸다. 목록을 다시 읽고 남은 예산을 본다 - 그사이 큐가
+                # 비어 목표가 내려갔으면 더 풀지 않는다.
+            return done("loop_end", retry=True)
+        finally:
+            try:
+                self.queues.release_supply_lock(compute_type, token)
+            except Exception as exc:
+                logger.warning(
+                    "[Warning] operation=buffer_supply_lock_release "
+                    "compute_type=%s reason=%r",
+                    compute_type,
+                    str(exc),
+                )
 
     def sync_policies(self) -> Set[str]:
         """Refresh the leader-owned Redis cache from Deployment annotations."""
@@ -1418,6 +1810,7 @@ class BufferCapacityReconciler:
             return False
 
         lock_token = None
+        supply_token = None
         changed = False
         try:
             deadline = time.monotonic() + min(
@@ -1430,6 +1823,15 @@ class BufferCapacityReconciler:
                 threading.Event(),
             )
             if not lock_token:
+                return False
+            # 공급 작업도 정책의 N 으로 게이트 예산을 센다. 정책이 바뀌는 순간
+            # 옛 N 으로 푸는 일이 없게 공급 락도 잡는다(할당 락 -> 공급 락 순서).
+            supply_token = self._acquire_supply_lock_until(
+                compute_type_value,
+                deadline,
+                threading.Event(),
+            )
+            if not supply_token:
                 return False
 
             if self._stop_event.is_set() or not self._has_write_authority():
@@ -1451,6 +1853,8 @@ class BufferCapacityReconciler:
             changed = True
             return True
         finally:
+            if supply_token:
+                self.queues.release_supply_lock(compute_type_value, supply_token)
             if lock_token:
                 self.queues.release_allocator_lock(
                     compute_type_value,
@@ -1702,10 +2106,11 @@ class BufferCapacityReconciler:
             )
 
             if current < desired:
-                result = self._scale_up(
-                    compute_type_value,
-                    base_result,
-                )
+                # 올리기는 공급 작업이 공급 락 아래서 CAS 로 한다. 여기서 할당 락을
+                # 기다리던 시절 포화에서 46% 가 timeout 으로 미뤄졌다. 재시도가
+                # 아니다 - 공급 작업이 스스로 재예약한다.
+                self.request_refill(compute_type_value, trigger="reconcile")
+                result = {**base_result, "status": "refill_requested"}
                 self._record_status(compute_type_value, **result)
                 return result
 
@@ -1871,139 +2276,6 @@ class BufferCapacityReconciler:
             self._record_status(compute_type_value, **result)
             return result
 
-    def _scale_up(self, compute_type: str, base_result: Dict) -> Dict:
-        """계측 포장. replicas 가 목표보다 낮은 샘플이 40.3% 인데, 그것이 락
-        timeout 때문인지 headroom 상한 때문인지 가린다.
-        """
-        if not timing.ENABLED:
-            return self._scale_up_impl(compute_type, base_result)
-        with timing.scope(purpose="scale_up"), timing.phase_timer() as timer:
-            result = None
-            try:
-                result = self._scale_up_impl(compute_type, base_result)
-                return result
-            finally:
-                r = result or {}
-                timing.emit(
-                    "ScaleUpTiming",
-                    compute_type=compute_type,
-                    status=r.get("status", "exception"),
-                    reason=r.get("reason", "-"),
-                    current=r.get("current_replicas", "-"),
-                    desired=r.get("desired_replicas", "-"),
-                    total_ms=timer.total_ms(),
-                )
-
-    def _scale_up_impl(self, compute_type: str, base_result: Dict) -> Dict:
-        deadline = time.monotonic() + min(1.0, self.wait_timeout_seconds)
-        lock_token = self._acquire_allocator_lock_until(
-            compute_type,
-            deadline,
-            threading.Event(),
-        )
-        if not lock_token:
-            return {
-                **base_result,
-                "status": "deferred",
-                "reason": "allocator_lock_timeout",
-                "retry": True,
-            }
-
-        try:
-            policy = self.queues.get_buffer_policy(compute_type)
-            if not policy:
-                return {
-                    **base_result,
-                    "status": "blocked",
-                    "reason": "policy_unavailable",
-                }
-            snapshot = self.provider.list_buffer_snapshot(compute_type)
-            desired = self.desired_replicas(
-                policy["R"],
-                policy["N"],
-                snapshot["buffer_assigned"],
-                self._queued_for_target(compute_type),
-            )
-            current = self.provider.read_deployment_replicas(
-                policy["deployment_name"]
-            )
-
-            # N 을 넘지 않는 마지막 관문. 목표 공식은 N - assigned 로 이미 묶여 있지만
-            # 그것만으로는 부족하다 - 파드가 배정되면 ReplicaSet 의 selector 에서 빠지고
-            # ReplicaSet 은 replicas 를 맞추려 한 개를 더 만든다. 배정 자체는 available
-            # 을 assigned 로 옮길 뿐이라 합이 그대로인데, 이 backfill 이 합을 올린다.
-            # 목표를 낮춰 두면 다음 패스가 금방 따라잡지만, 삭제가 늦거나 락이 밀리는
-            # 순간에는 그 사이에 넘을 수 있다.
-            #
-            # buffer_total 은 terminating 을 뺀 available + assigned 다. 삭제 중인 파드는
-            # 자리를 곧 비우므로 세지 않는다 - 상한이 지켜야 하는 것은 "일하고 있는 것과
-            # 그것을 기다리는 것"의 합이다. 그 수가 N 을 넘게 만드는 확대는 하지 않는다.
-            headroom = int(policy["N"]) - int(snapshot["buffer_total"])
-            if desired > current and desired - current > headroom:
-                capped = current + max(0, headroom)
-                if capped != desired:
-                    logger.info(
-                        "[BufferScaleUpCapped] compute_type=%s desired=%s->%s "
-                        "current=%s total=%s N=%s unowned_available=%s",
-                        compute_type,
-                        desired,
-                        capped,
-                        current,
-                        snapshot["buffer_total"],
-                        policy["N"],
-                        snapshot.get("unowned_available", 0),
-                    )
-                desired = capped
-
-            refreshed = {
-                **base_result,
-                "R": policy["R"],
-                "N": policy["N"],
-                "buffer_total": snapshot["buffer_total"],
-                "buffer_available": snapshot["buffer_available"],
-                "buffer_assigned": snapshot["buffer_assigned"],
-                "current_replicas": current,
-                "desired_replicas": desired,
-            }
-            if current > desired or self._held_available(snapshot) > desired:
-                return {
-                    **refreshed,
-                    "status": "deferred",
-                    "reason": "scale_down_required",
-                    "retry": True,
-                }
-            if current == desired:
-                return {**refreshed, "status": "converged"}
-            if not self._has_write_authority():
-                return {
-                    **refreshed,
-                    "status": "blocked",
-                    "reason": "leadership_not_valid",
-                    "retry": True,
-                }
-
-            patched = self.provider.patch_deployment_replicas(
-                policy["deployment_name"],
-                desired,
-            )
-            logger.info(
-                "[BufferScaled] compute_type=%s direction=up replicas=%s->%s "
-                "assigned=%s R=%s N=%s",
-                compute_type,
-                current,
-                desired,
-                snapshot["buffer_assigned"],
-                policy["R"],
-                policy["N"],
-            )
-            return {
-                **refreshed,
-                "status": "scaled_up",
-                "patched_replicas": patched,
-            }
-        finally:
-            self.queues.release_allocator_lock(compute_type, lock_token)
-
     def _scale_down(
         self,
         compute_type: str,
@@ -2084,7 +2356,23 @@ class BufferCapacityReconciler:
                     "retry": True,
                 }
 
+            supply_token = None
             try:
+                # 공급 락도 잡는다(할당 락 -> 공급 락 순서). 축소 게이트가 이미 서
+                # 있으므로 공급 작업은 다음 확인에서 멈추고 락을 놓는다. 여기서는
+                # 진행 중이던 게이트 해제 묶음이 끝나기만 기다리면 된다.
+                supply_token = self._acquire_supply_lock_until(
+                    compute_type,
+                    time.monotonic() + self.wait_timeout_seconds,
+                    heartbeat_lost,
+                )
+                if not supply_token:
+                    return {
+                        **base_result,
+                        "status": "deferred",
+                        "reason": "supply_lock_timeout",
+                        "retry": True,
+                    }
                 if heartbeat_lost.is_set():
                     return {
                         **base_result,
@@ -2209,7 +2497,11 @@ class BufferCapacityReconciler:
                 initial_policy = policy
                 base_result = refreshed_result
             finally:
-                self.queues.release_allocator_lock(compute_type, lock_token)
+                try:
+                    if supply_token:
+                        self.queues.release_supply_lock(compute_type, supply_token)
+                finally:
+                    self.queues.release_allocator_lock(compute_type, lock_token)
 
             observation_deadline = time.monotonic() + self.wait_timeout_seconds
             deletion_observed = self._wait_for_scale_down_observation(
@@ -2331,6 +2623,28 @@ class BufferCapacityReconciler:
         deadline: float,
         gate_lost: threading.Event,
     ) -> Optional[str]:
+        return self._acquire_lock_until(
+            self.queues.acquire_allocator_lock, "alloc", compute_type, deadline, gate_lost
+        )
+
+    def _acquire_supply_lock_until(
+        self,
+        compute_type: str,
+        deadline: float,
+        gate_lost: threading.Event,
+    ) -> Optional[str]:
+        return self._acquire_lock_until(
+            self.queues.acquire_supply_lock, "supply", compute_type, deadline, gate_lost
+        )
+
+    def _acquire_lock_until(
+        self,
+        acquire: Callable[[str], Optional[str]],
+        lock_name: str,
+        compute_type: str,
+        deadline: float,
+        gate_lost: threading.Event,
+    ) -> Optional[str]:
         retry_seconds = 0.02
         wait_started = time.monotonic()
         while (
@@ -2339,13 +2653,14 @@ class BufferCapacityReconciler:
             and not gate_lost.is_set()
             and time.monotonic() < deadline
         ):
-            token = self.queues.acquire_allocator_lock(compute_type)
+            token = acquire(compute_type)
             if token:
                 timing.emit(
                     "LockWait",
                     purpose=timing.current_purpose(),
                     wait_ms=(time.monotonic() - wait_started) * 1000,
                     ok=1,
+                    lock=lock_name,
                 )
                 return token
             self._wait_for_event(min(retry_seconds, max(0.0, deadline - time.monotonic())))
@@ -2355,6 +2670,7 @@ class BufferCapacityReconciler:
             purpose=timing.current_purpose(),
             wait_ms=(time.monotonic() - wait_started) * 1000,
             ok=0,
+            lock=lock_name,
         )
         return None
 

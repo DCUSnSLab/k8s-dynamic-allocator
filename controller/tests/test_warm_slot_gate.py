@@ -251,6 +251,26 @@ class WarmSlotGateTests(unittest.TestCase):
         self.assertFalse(provider.release_pod_scheduling_gate("pod-1", "", 0))
         self.assertEqual(len(api.calls), 1)
 
+    def test_raise_replicas_is_compare_and_swap(self):
+        """공급 경로의 replicas 올리기는 읽은 값을 test 하는 CAS 다.
+
+        공급은 할당 락을 잡지 않으므로 할당기의 낮추기와 겹칠 수 있다. 조건 없이
+        덮어쓰면 방금 내린 값을 되돌린다.
+        """
+        provider = self.provider()
+        api = InMemoryPodApi({"spec": {"replicas": 5}})
+        provider.apps_v1 = SimpleNamespace(api_client=api)
+        self.assertTrue(provider.raise_deployment_replicas("compute-general", 5, 9))
+        self.assertEqual(api.pod["spec"]["replicas"], 9)
+        # 그사이 다른 쪽이 바꿨으면(9 -> 8) test 가 실패하고 아무것도 쓰지 않는다.
+        api.pod["spec"]["replicas"] = 8
+        self.assertFalse(provider.raise_deployment_replicas("compute-general", 9, 12))
+        self.assertEqual(api.pod["spec"]["replicas"], 8)
+        # 올리기 전용이다. 낮추는 요청은 보내지도 않는다.
+        calls = len(api.calls)
+        self.assertFalse(provider.raise_deployment_replicas("compute-general", 8, 3))
+        self.assertEqual(len(api.calls), calls)
+
     def test_manifest_rollout_and_deletion_cost_contract(self):
         provider = self.provider()
         manifest = yaml.safe_load(MANIFEST.read_text(encoding="utf-8"))

@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -149,20 +150,20 @@ class GateQueues:
         self.scale_down_gated = False
         self.policy = {"R": 2, "N": 40, "deployment_name": "compute-general"}
         self.events = []
-        self.locked = False
-        self.on_unlock = None
+        self.supply_locked = False
 
-    def renew_allocator_lock(self, compute_type, token):
-        assert self.locked
+    def normalize_compute_type(self, value):
+        return value or "general"
+
+    def renew_supply_lock(self, compute_type, token):
+        assert self.supply_locked
         self.renew_count += 1
         self.events.append("renew")
         return self.renew_count != self.lose_on_renew
 
-    def release_allocator_lock(self, compute_type, token):
-        self.events.append("unlock")
-        self.locked = False
-        if self.on_unlock:
-            self.on_unlock()
+    def release_supply_lock(self, compute_type, token):
+        self.events.append("supply_unlock")
+        self.supply_locked = False
         return True
 
     def is_scale_down_gated(self, compute_type):
@@ -178,17 +179,33 @@ class GateQueues:
 
 
 class GateProvider:
-    def __init__(self, *, current, assigned, ungated, gated, total=None, unowned=0):
+    """게이트 파드·replicas 를 메모리에 둔 가짜. 노드 위 파드 수를 매번 검사한다."""
+
+    def __init__(self, *, current, assigned, ungated, gated, total=None, unowned=0, n=40):
         self.current = current
         self.assigned = assigned
         self.ungated = ungated
         self.gated_pods = [f"gated-{i}" for i in range(gated)]
+        self.versions = {name: "1" for name in self.gated_pods}
         self.total = total
         self.unowned = unowned
+        self.n = n
         self.released = []
+        self.raises = []
+        self.raise_conflicts = 0
+        self.lowers = []
+        self.before_raise = None
+        self.fail_release = {}
+        self.after_release = None
+        self.peak_on_node = assigned + ungated
 
     def list_buffer_snapshot(self, compute_type):
         available = self.ungated + len(self.gated_pods)
+        pods = [
+            {"name": name, "scheduling_gated": True, "terminating": False,
+             "resource_version": self.versions[name]}
+            for name in self.gated_pods
+        ]
         return {
             "buffer_assigned": self.assigned,
             "buffer_available": available,
@@ -196,20 +213,61 @@ class GateProvider:
             "ungated_available": self.ungated,
             "unowned_available": self.unowned,
             "gated_available_candidates": [
-                {"name": name, "resource_version": "1", "gate_index": 0}
+                {"name": name, "resource_version": self.versions[name], "gate_index": 0}
                 for name in self.gated_pods
             ],
+            "pods": pods,
         }
 
     def read_deployment_replicas(self, name):
         return self.current
 
+    def raise_deployment_replicas(self, name, expected, desired):
+        if self.raise_conflicts:
+            # 그사이 할당기가 낮췄다(CAS 실패).
+            self.raise_conflicts -= 1
+            self.current -= 1
+            if self.gated_pods:
+                self.gated_pods.pop()       # ReplicaSet 이 낮춘 만큼 지운다
+            return False
+        if self.before_raise:
+            hook, self.before_raise = self.before_raise, None
+            hook(self)
+        if expected != self.current or desired <= expected:
+            return False
+        self.raises.append((expected, desired))
+        added = desired - self.current
+        self.current = desired
+        start = len(self.versions)
+        for i in range(added):
+            name = f"backfill-{start + i}"
+            self.gated_pods.append(name)
+            self.versions[name] = "1"
+        return True
+
+    def lower_deployment_replicas(self, name, expected, desired):
+        if expected != self.current or desired >= expected:
+            return False
+        self.lowers.append((expected, desired))
+        # ReplicaSet 은 노드에 없는 게이트 파드부터 지운다.
+        for _ in range(expected - desired):
+            if self.gated_pods:
+                self.gated_pods.pop()
+        self.current = desired
+        return True
+
     def release_pod_scheduling_gate(self, name, resource_version, gate_index):
-        if name not in self.gated_pods:
+        failure = self.fail_release.pop(name, None)
+        if failure is not None:
+            raise failure
+        if name not in self.gated_pods or self.versions[name] != resource_version:
             return False
         self.released.append(name)
         self.gated_pods.remove(name)
         self.ungated += 1
+        self.peak_on_node = max(self.peak_on_node, self.assigned + self.ungated)
+        if self.after_release:
+            self.after_release(self)
         return True
 
 
@@ -221,68 +279,133 @@ def gate_reconciler(provider, queues):
     reconciler.wait_timeout_seconds = 1.0
     reconciler._stop_event = threading.Event()
     reconciler._leadership_validator = lambda: True
-    def acquire(*args):
-        assert not queues.locked
-        queues.locked = True
-        queues.events.append("lock")
-        return "lock-token"
-    reconciler._acquire_allocator_lock_until = acquire
+
+    def acquire_supply(*args):
+        assert not queues.supply_locked
+        queues.supply_locked = True
+        queues.events.append("supply_lock")
+        return "supply-token"
+
+    def no_alloc_lock(*args):
+        raise AssertionError("공급 경로가 할당 락을 잡았다")
+
+    reconciler._acquire_supply_lock_until = acquire_supply
+    reconciler._acquire_allocator_lock_until = no_alloc_lock
     reconciler._condition = threading.Condition()
+    reconciler._refill_condition = threading.Condition()
+    reconciler._gate_unknown = {}
+    reconciler._refill_not_before = 0.0
+    reconciler._refill_generation = 1
+    reconciler.refill_batch_limit = 4
+    reconciler.refill_retry_seconds = 0.5
+    reconciler.supply_lock_wait_seconds = 0.5
     reconciler._last_queued_counts = {}
     reconciler._known_policy_types = {"general"}
-    reconciler.request_reconcile = lambda compute_type: None
+    reconciler.request_reconcile = lambda compute_type, **kwargs: None
     return reconciler
+
+
+def refill(reconciler):
+    return reconciler._refill_impl("general", time.monotonic())
 
 
 class SchedulingGateTests(unittest.TestCase):
     def test_startup_releases_reserve(self):
         queues = GateQueues(queued=0)
         provider = GateProvider(current=2, assigned=0, ungated=0, gated=2)
-        self.assertTrue(gate_reconciler(provider, queues)._release_scheduling_gates("general"))
+        result = refill(gate_reconciler(provider, queues))
+        self.assertEqual(result["reason"], "released")
         self.assertEqual(provider.ungated, 2)
 
     def test_saturation_releases_up_to_room(self):
-        """포화에서 한 패스가 room 까지 다 푼다.
+        """포화에서 한 번의 공급이 room 까지 다 푼다.
 
         이 단정이 10/10 회귀의 재발 방지선이다. 그때 목표가 폭 추정치에 묶여 3 에
         고정됐고 자리는 평균 19.64 개가 비어 있었다. 대기 183 건에 자리 20 개면
-        예산은 20 이어야 하고, 패스당 일부만 푸는 규칙을 넣으면 같은 공급 부족이
-        다시 생긴다. 파드마다 락을 놓으므로 한 패스에 다 풀어도 할당은 끼어든다
-        (test_claim_can_interleave_between_gate_patches 가 그것을 고정한다).
+        예산은 20 이어야 한다. 묶음 상한(4)은 목록을 다시 읽는 간격일 뿐이고
+        한 번의 공급 안에서 끝까지 푼다.
         """
         queues = GateQueues(queued=183)
         provider = GateProvider(current=20, assigned=20, ungated=0, gated=20)
         reconciler = gate_reconciler(provider, queues)
-        self.assertTrue(reconciler._release_scheduling_gates("general"))
+        self.assertEqual(refill(reconciler)["reason"], "released")
         self.assertEqual(provider.ungated, 20)
-        # 두 번째 패스는 예산을 이미 채웠으므로 아무것도 풀지 않고 성공한다.
+        # 두 번째는 예산을 이미 채웠으므로 아무것도 풀지 않는다.
         released_before = len(provider.released)
-        self.assertTrue(reconciler._release_scheduling_gates("general"))
-        self.assertEqual(provider.ungated, 20)
+        self.assertEqual(refill(reconciler)["reason"], "budget_full")
         self.assertEqual(len(provider.released), released_before)
 
-    def test_claim_can_interleave_between_gate_patches(self):
+    def test_refill_never_takes_allocator_lock(self):
+        """공급은 할당 락을 잡지 않는다 - gate_reconciler 의 할당 락은 잡으면 실패한다."""
         queues = GateQueues(queued=183)
-        queues.policy["N"] = 2
-        provider = GateProvider(current=2, assigned=0, ungated=0, gated=2)
+        provider = GateProvider(current=10, assigned=30, ungated=0, gated=10)
+        refill(gate_reconciler(provider, queues))
+        self.assertNotIn("lock", queues.events)
+        self.assertEqual(queues.events[0], "supply_lock")
+        self.assertEqual(queues.events[-1], "supply_unlock")
 
-        def claim_after_first_unlock():
-            queues.on_unlock = None
-            queues.events.append("claim")
-            provider.ungated -= 1
-            provider.assigned += 1
+    def test_claims_and_releases_during_refill_never_exceed_n(self):
+        """게이트를 푸는 도중 claim 과 반납이 끼어들어도 노드 위 파드는 N 이하다.
 
-        queues.on_unlock = claim_after_first_unlock
-        self.assertFalse(gate_reconciler(provider, queues)._release_scheduling_gates("general"))
-        self.assertEqual(provider.released, ["gated-0"])
-        self.assertEqual(queues.events[:5], ["lock", "renew", "renew", "unlock", "claim"])
-        self.assertEqual(queues.events[5], "lock")
+        claim 은 게이트 풀린 available 하나를 assigned 로 옮길 뿐이고, 반납은
+        assigned 를 줄인다. 공급은 묶음마다 목록을 다시 읽어 예산을 센다.
+        """
+        import random
 
-    def test_overshoot_waits_for_replica_correction(self):
+        rng = random.Random(20261011)
+        for trial in range(200):
+            queues = GateQueues(queued=183)
+            queues.policy["N"] = 10
+            assigned = rng.randint(0, 10)
+            provider = GateProvider(
+                current=10 - assigned, assigned=assigned, ungated=0,
+                gated=10 - assigned, n=10,
+            )
+
+            def interleave(p):
+                roll = rng.random()
+                if roll < 0.4 and p.ungated > 0:
+                    p.ungated -= 1      # claim
+                    p.assigned += 1
+                    if p.current > 0:
+                        p.current -= 1  # 할당기의 replicas 낮추기
+                elif roll < 0.6 and p.assigned > 0:
+                    p.assigned -= 1     # 세션 종료 후 삭제
+
+            provider.after_release = interleave
+            refill(gate_reconciler(provider, queues))
+            with self.subTest(trial=trial):
+                self.assertLessEqual(provider.peak_on_node, 10)
+
+    def test_replicas_above_room_are_trimmed_before_release(self):
+        """replicas 가 room 을 넘으면 공급이 직접 room 까지 CAS 로 내리고 나서 푼다.
+
+        기다리면 reconcile 의 용량 트림이 축소 게이트를 세워 그동안 claim 이 막힌다.
+        """
         queues = GateQueues(queued=183)
         provider = GateProvider(current=20, assigned=21, ungated=0, gated=20)
-        self.assertFalse(gate_reconciler(provider, queues)._release_scheduling_gates("general"))
-        self.assertEqual(provider.released, [])
+        result = refill(gate_reconciler(provider, queues))
+        self.assertEqual(provider.lowers, [(20, 19)])
+        self.assertEqual(result["trimmed"], 1)
+        self.assertEqual(provider.ungated, 19)
+        self.assertLessEqual(provider.peak_on_node, 40)
+
+    def test_claim_between_list_and_raise_does_not_leave_replicas_above_room(self):
+        """목록을 읽은 뒤 claim 이 끼어들어 room 보다 높게 올라가도 같은 공급이 바로잡는다."""
+        queues = GateQueues(queued=183)
+        queues.policy["N"] = 10
+        provider = GateProvider(current=2, assigned=7, ungated=1, gated=1, n=10)
+
+        def claim(p):
+            p.ungated -= 1
+            p.assigned += 1   # room 3 -> 2. 할당기는 current(2) <= room(2) 이라 안 낮춘다.
+
+        provider.before_raise = claim
+        refill(gate_reconciler(provider, queues))
+        self.assertEqual(provider.raises, [(2, 3)])   # 낡은 room(3)으로 올렸다
+        self.assertEqual(provider.lowers, [(3, 2)])   # 다음 목록에서 room(2)으로
+        self.assertLessEqual(provider.current, 10 - provider.assigned)
+        self.assertLessEqual(provider.peak_on_node, 10)
 
     def test_unowned_objects_do_not_block_safe_owned_gate_release(self):
         queues = GateQueues(queued=183)
@@ -290,22 +413,142 @@ class SchedulingGateTests(unittest.TestCase):
             current=2, assigned=38, ungated=1, gated=2,
             unowned=1, total=41,
         )
-        self.assertTrue(gate_reconciler(provider, queues)._release_scheduling_gates("general"))
+        refill(gate_reconciler(provider, queues))
         self.assertEqual(provider.ungated, 2)
         self.assertEqual(38 + provider.ungated, 40)
 
     def test_rollout_old_ungated_pod_leaves_budget_for_new_pod(self):
         queues = GateQueues(queued=0)
         provider = GateProvider(current=2, assigned=0, ungated=1, gated=1)
-        self.assertTrue(gate_reconciler(provider, queues)._release_scheduling_gates("general"))
+        refill(gate_reconciler(provider, queues))
         self.assertEqual(provider.released, ["gated-0"])
 
-    def test_lost_lock_prevents_gate_patch(self):
+    def test_lost_supply_lock_prevents_gate_patch(self):
         queues = GateQueues(queued=0)
         queues.lose_on_renew = 2
         provider = GateProvider(current=2, assigned=0, ungated=0, gated=2)
-        self.assertFalse(gate_reconciler(provider, queues)._release_scheduling_gates("general"))
+        result = refill(gate_reconciler(provider, queues))
+        self.assertEqual(result["reason"], "lost_or_gated")
         self.assertEqual(provider.released, [])
+
+    def test_leadership_loss_prevents_gate_patch(self):
+        queues = GateQueues(queued=0)
+        provider = GateProvider(current=2, assigned=0, ungated=0, gated=2)
+        reconciler = gate_reconciler(provider, queues)
+        calls = []
+
+        def authority():
+            calls.append(1)
+            return len(calls) < 3
+
+        reconciler._leadership_validator = authority
+        refill(reconciler)
+        self.assertEqual(provider.released, [])
+
+    def test_scale_down_gate_stops_refill_before_any_write(self):
+        queues = GateQueues(queued=183)
+        queues.scale_down_gated = True
+        provider = GateProvider(current=2, assigned=0, ungated=0, gated=2)
+        result = refill(gate_reconciler(provider, queues))
+        self.assertEqual(result["reason"], "scale_down_gated")
+        self.assertIsNotNone(result["retry_after"])
+        self.assertEqual(provider.released, [])
+        self.assertEqual(queues.events, [])
+
+    def test_new_leader_waits_before_releasing(self):
+        queues = GateQueues(queued=183)
+        provider = GateProvider(current=2, assigned=0, ungated=0, gated=2)
+        reconciler = gate_reconciler(provider, queues)
+        reconciler._refill_not_before = time.monotonic() + 5.0
+        result = refill(reconciler)
+        self.assertEqual(result["reason"], "leader_grace")
+        self.assertGreater(result["retry_after"], 4.0)
+        self.assertEqual(provider.released, [])
+
+    def test_unknown_patch_counts_as_released_until_settled(self):
+        """응답 없는 게이트 PATCH 는 반영됐다고 치고 같은 자리를 다시 풀지 않는다."""
+        queues = GateQueues(queued=0)  # 목표 = R = 2
+        provider = GateProvider(current=3, assigned=0, ungated=0, gated=3)
+        provider.fail_release["gated-0"] = TimeoutError("read timed out")
+        reconciler = gate_reconciler(provider, queues)
+        result = refill(reconciler)
+        self.assertEqual(result["reason"], "patch_unknown")
+        self.assertEqual(result["unknown"], 1)
+        self.assertEqual(reconciler._gate_unknown, {"general": {"gated-0": "1"}})
+
+        # 요청이 서버에 닿지도 않았다면 버전이 그대로다. 같은 버전으로 다시 보내
+        # 결판을 낸다 - 두 요청 중 최대 하나만 적용되므로 이중으로 세지 않는다.
+        # 그 자리는 이미 예산에서 빠져 있으므로 새 예산으로는 하나만 더 푼다.
+        result = refill(reconciler)
+        self.assertEqual(provider.released, ["gated-0", "gated-1"])
+        self.assertEqual(reconciler._gate_unknown, {})
+        self.assertEqual(provider.ungated, 2)
+        self.assertEqual(refill(reconciler)["reason"], "budget_full")
+
+    def test_unknown_patch_that_landed_late_is_not_double_counted(self):
+        """늦게 적용된 원래 PATCH 가 버전을 바꾸면 다시 보낸 요청은 test 에 걸린다."""
+        queues = GateQueues(queued=0)
+        provider = GateProvider(current=3, assigned=0, ungated=0, gated=3)
+        provider.fail_release["gated-0"] = TimeoutError("read timed out")
+        reconciler = gate_reconciler(provider, queues)
+        refill(reconciler)
+        # 원래 PATCH 가 지금 도착했다: 게이트가 풀리고 버전이 바뀐다.
+        provider.gated_pods.remove("gated-0")
+        provider.ungated += 1
+        result = refill(reconciler)
+        self.assertEqual(reconciler._gate_unknown, {})
+        # 예산 2 = 늦게 풀린 gated-0 + gated-1. 셋째는 풀지 않는다.
+        self.assertEqual(provider.released, ["gated-1"])
+        self.assertEqual(provider.ungated, 2)
+        self.assertEqual(result["reason"], "released")
+
+    def test_definite_rejection_is_not_counted_as_unknown(self):
+        """403 같은 확정 거절은 적용되지 않은 것이다. 미상으로 쌓여 예산이 새지 않는다."""
+        class Rejected(Exception):
+            status = 403
+
+        queues = GateQueues(queued=0)
+        provider = GateProvider(current=2, assigned=0, ungated=0, gated=3)
+        provider.current = 3
+        provider.fail_release["gated-0"] = Rejected()
+        reconciler = gate_reconciler(provider, queues)
+        refill(reconciler)
+        self.assertEqual(reconciler._gate_unknown, {})
+        self.assertEqual(provider.released, ["gated-1", "gated-2"])
+
+    def test_old_generation_refill_stops_writing(self):
+        queues = GateQueues(queued=0)
+        provider = GateProvider(current=2, assigned=0, ungated=0, gated=2)
+        reconciler = gate_reconciler(provider, queues)
+        reconciler._refill_generation = 2
+        result = reconciler._refill_impl("general", time.monotonic(), 1)
+        self.assertEqual(result["reason"], "lost_or_gated")
+        self.assertEqual(provider.released, [])
+
+    def test_raise_uses_cas_and_rereads_on_conflict(self):
+        """올리기는 CAS 다. 할당기가 그사이 낮췄으면 덮어쓰지 않고 다시 읽는다.
+
+        GateProvider 에는 조건 없는 patch_deployment_replicas 가 없다. 부르면
+        AttributeError 로 실패한다.
+        """
+        queues = GateQueues(queued=183)
+        provider = GateProvider(current=5, assigned=30, ungated=0, gated=5)
+        provider.raise_conflicts = 1
+        result = refill(gate_reconciler(provider, queues))
+        self.assertEqual(result["cas_conflicts"], 1)
+        # 충돌 뒤 다시 읽은 값(4)에서 목표(10)까지 올렸다.
+        self.assertEqual(provider.raises, [(4, 10)])
+        self.assertEqual(provider.current, 10)
+        # 올린 뒤 생긴 게이트 파드를 같은 공급에서 푼다.
+        self.assertEqual(provider.ungated, 10)
+
+    def test_repeated_cas_conflicts_back_off(self):
+        queues = GateQueues(queued=183)
+        provider = GateProvider(current=5, assigned=30, ungated=0, gated=5)
+        provider.raise_conflicts = 5
+        result = refill(gate_reconciler(provider, queues))
+        self.assertEqual(result["reason"], "cas_conflict")
+        self.assertIsNotNone(result["retry_after"])
 
     def test_queue_failure_cannot_collapse_dynamic_target_to_reserve(self):
         queues = GateQueues(queued=OSError("Redis unavailable"))
@@ -313,8 +556,10 @@ class SchedulingGateTests(unittest.TestCase):
         reconciler = gate_reconciler(provider, queues)
         with self.assertRaises(Exception):
             reconciler._queued_for_target("general")
-        self.assertFalse(reconciler._release_scheduling_gates("general"))
+        with self.assertRaises(Exception):
+            refill(reconciler)
         self.assertEqual(provider.released, [])
+        self.assertFalse(queues.supply_locked)
 
     def test_demand_poll_keeps_its_own_comparison_baseline(self):
         queues = GateQueues(queued=1)
@@ -346,6 +591,189 @@ class SchedulingGateTests(unittest.TestCase):
         ))
         reconciler._note_create_time("general", pod)
         self.assertEqual(samples, [3.0])
+
+
+class RefillWakeTests(unittest.TestCase):
+    def reconciler(self):
+        reconciler = gate_reconciler(GateProvider(current=2, assigned=0, ungated=2, gated=0), GateQueues())
+        reconciler.provider.LABEL_COMPUTE_TYPE = "compute-type"
+        reconciler._note_create_time = lambda compute_type, pod: None
+        reconciler.refill_debounce_seconds = 0.05
+        reconciler._refill_due = {}
+        reconciler._refill_requested_at = {}
+        reconciler._refill_trigger = {}
+        return reconciler
+
+    def pod(self, deleting=False):
+        return types.SimpleNamespace(metadata=types.SimpleNamespace(
+            labels={"compute-type": "general"},
+            deletion_timestamp=datetime(2026, 10, 11, tzinfo=timezone.utc) if deleting else None,
+        ))
+
+    def test_pod_events_that_change_supply_wake_refill(self):
+        for event_type, deleting in (("ADDED", False), ("DELETED", False), ("MODIFIED", True)):
+            reconciler = self.reconciler()
+            reconciler.on_buffer_event(event_type, self.pod(deleting))
+            with self.subTest(event=event_type, deleting=deleting):
+                self.assertIn("general", reconciler._refill_due)
+                self.assertEqual(reconciler._refill_trigger["general"], "event")
+
+    def test_ready_transition_does_not_wake_refill(self):
+        reconciler = self.reconciler()
+        reconciler.on_buffer_event("MODIFIED", self.pod(False))
+        self.assertEqual(reconciler._refill_due, {})
+
+    def test_requests_coalesce_to_the_earliest(self):
+        reconciler = self.reconciler()
+        reconciler.request_refill("general", delay=5.0, trigger="retry")
+        reconciler.request_refill("general", trigger="event")
+        due = reconciler._refill_due["general"]
+        self.assertLess(due - time.monotonic(), 1.0)
+        # 처음 깨운 원인과 시각을 유지한다(wake_to_patch 측정용).
+        self.assertEqual(reconciler._refill_trigger["general"], "retry")
+
+
+class LockOrderQueues(GateQueues):
+    """락 획득·해제 순서를 기록한다."""
+
+    def __init__(self):
+        super().__init__(queued=0)
+        self.alloc_locked = False
+
+    def acquire_allocator_lock(self, compute_type):
+        if self.alloc_locked:
+            self.events.append("alloc_miss")
+            return None
+        self.alloc_locked = True
+        self.events.append("alloc_lock")
+        return "alloc-token"
+
+    def release_allocator_lock(self, compute_type, token):
+        self.alloc_locked = False
+        self.events.append("alloc_unlock")
+        return True
+
+    def acquire_supply_lock(self, compute_type):
+        assert self.alloc_locked, "공급 락을 할당 락 없이 잡았다(축소/정책 경로)"
+        self.supply_locked = True
+        self.events.append("supply_lock")
+        return "supply-token"
+
+    def acquire_scale_down_gate(self, compute_type):
+        self.scale_down_gated = True
+        return "gate-token"
+
+    def release_scale_down_gate(self, compute_type, token):
+        self.scale_down_gated = False
+        self.events.append("gate_release")
+        return True
+
+    def renew_scale_down_gate(self, compute_type, token):
+        return True
+
+    def get_buffer_policy(self, compute_type):
+        return self.current_policy
+
+    def clear_buffer_policy(self, compute_type):
+        self.current_policy = None
+
+    def set_buffer_policy(self, compute_type, deployment_name, R, N, resource_version=""):
+        self.current_policy = {"deployment_name": deployment_name, "R": R, "N": N}
+
+
+class LockOrderProvider(GateProvider):
+    def __init__(self):
+        super().__init__(current=6, assigned=0, ungated=6, gated=0)
+        self.scale_patches = []
+
+    def list_buffer_snapshot(self, compute_type):
+        snapshot = super().list_buffer_snapshot(compute_type)
+        snapshot["assigned_with_replicaset_owner"] = 0
+        snapshot["schedulable_not_ready"] = 0
+        return snapshot
+
+    def patch_deployment_replicas(self, name, replicas):
+        self.scale_patches.append(replicas)
+        self.current = replicas
+        self.ungated = min(self.ungated, replicas)
+        return replicas
+
+
+def lock_order_reconciler(queues, provider):
+    reconciler = object.__new__(BufferCapacityReconciler)
+    reconciler.provider = provider
+    reconciler.queues = queues
+    reconciler.dynamic_reserve = True
+    reconciler.wait_timeout_seconds = 1.0
+    reconciler.gate_renew_seconds = 5.0
+    reconciler._stop_event = threading.Event()
+    reconciler._leadership_validator = lambda: True
+    reconciler._condition = threading.Condition()
+    reconciler._last_queued_counts = {}
+    reconciler._known_policy_types = {"general"}
+    reconciler._policy_ready_holds = {}
+    reconciler._starting_grace_seconds = lambda compute_type: 30.0
+    reconciler.on_capacity_available = None
+    return reconciler
+
+
+class LockOrderTests(unittest.TestCase):
+    def test_scale_down_takes_alloc_then_supply_and_releases_in_reverse(self):
+        queues = LockOrderQueues()
+        queues.current_policy = {"R": 2, "N": 40, "deployment_name": "compute-general"}
+        provider = LockOrderProvider()
+        reconciler = lock_order_reconciler(queues, provider)
+        result = reconciler._scale_down_impl(
+            "general",
+            queues.current_policy,
+            {"desired_replicas": 2, "current_replicas": 6},
+        )
+        self.assertEqual(result["status"], "scaled_down")
+        self.assertEqual(provider.scale_patches, [2])
+        order = [e for e in queues.events if e in ("alloc_lock", "supply_lock", "supply_unlock", "alloc_unlock", "gate_release")]
+        # barrier(잡았다 바로 놓음) 뒤, 할당 락 -> 공급 락, 해제는 반대 순서, 축소 게이트는 마지막.
+        self.assertEqual(
+            order,
+            ["alloc_lock", "alloc_unlock", "alloc_lock", "supply_lock",
+             "supply_unlock", "alloc_unlock", "gate_release"],
+        )
+
+    def test_scale_down_patch_failure_holds_policy_and_releases_locks(self):
+        """축소 PATCH 를 보낸 뒤 예외가 나도 안전 정지(보류 + 깃발 해제)가 걸린다."""
+        queues = LockOrderQueues()
+        queues.current_policy = {"R": 2, "N": 40, "deployment_name": "compute-general"}
+        provider = LockOrderProvider()
+
+        def broken_patch(name, replicas):
+            raise TimeoutError("read timed out")
+
+        provider.patch_deployment_replicas = broken_patch
+        reconciler = lock_order_reconciler(queues, provider)
+        cleared = []
+        reconciler._clear_policy_ready_best_effort = lambda reason="-": cleared.append(reason)
+        reconciler.request_policy_refresh = lambda retry=False: None
+        with self.assertRaises(TimeoutError):
+            reconciler._scale_down_impl(
+                "general",
+                queues.current_policy,
+                {"desired_replicas": 2, "current_replicas": 6},
+            )
+        self.assertEqual(reconciler._policy_ready_holds, {"general": 2})
+        self.assertEqual(cleared, ["scale_down_unobserved"])
+        self.assertFalse(queues.alloc_locked)
+        self.assertFalse(queues.supply_locked)
+        # 깃발을 내린 뒤에 축소 게이트를 푼다.
+        self.assertEqual(queues.events[-1], "gate_release")
+
+    def test_policy_publish_takes_alloc_then_supply(self):
+        queues = LockOrderQueues()
+        queues.current_policy = {"R": 2, "N": 40, "deployment_name": "compute-general"}
+        reconciler = lock_order_reconciler(queues, LockOrderProvider())
+        new_policy = {"R": 2, "N": 20, "deployment_name": "compute-general"}
+        self.assertTrue(reconciler._publish_policy_serialized("general", new_policy))
+        self.assertEqual(queues.current_policy["N"], 20)
+        order = [e for e in queues.events if e in ("alloc_lock", "supply_lock", "supply_unlock", "alloc_unlock")]
+        self.assertEqual(order, ["alloc_lock", "supply_lock", "supply_unlock", "alloc_unlock"])
 
 
 if __name__ == "__main__":

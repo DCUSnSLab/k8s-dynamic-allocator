@@ -900,6 +900,45 @@ class WarmBufferProvider(KubernetesClient):
             raise
         return True
 
+    def raise_deployment_replicas(
+        self,
+        deployment_name: str,
+        expected: int,
+        desired: int,
+    ) -> bool:
+        """replicas 를 expected 에서 desired 로 올린다. 값이 달라져 있으면 아무것도 안 한다.
+
+        공급 경로는 할당 락을 잡지 않으므로, 할당기가 claim 직후 replicas 를 내리는
+        것(lower_deployment_replicas)과 동시에 일어날 수 있다. 조건 없이 덮어쓰면
+        방금 내린 값을 되돌려 ReplicaSet 이 게이트 파드를 쓸데없이 만들었다 지운다.
+        읽은 값을 test 로 확인하는 CAS 라 그 일이 생기지 않는다. 올리기만 한다.
+        값이 달라졌으면 False 를 돌려주고, 호출자가 다시 읽어 판단한다.
+        """
+        target = max(0, int(desired))
+        if target <= int(expected):
+            return False
+        patch = [
+            {"op": "test", "path": "/spec/replicas", "value": int(expected)},
+            {"op": "replace", "path": "/spec/replicas", "value": target},
+        ]
+        try:
+            self.apps_v1.api_client.call_api(
+                "/apis/apps/v1/namespaces/{namespace}/deployments/{name}/scale",
+                "PATCH",
+                path_params={"namespace": self.namespace, "name": deployment_name},
+                body=patch,
+                header_params={"Content-Type": "application/json-patch+json"},
+                auth_settings=["BearerToken"],
+                _return_http_data_only=True,
+                _preload_content=True,
+                _request_timeout=self.api_request_timeout,
+            )
+        except ApiException as exc:
+            if exc.status in (409, 422):
+                return False
+            raise
+        return True
+
     def release_pod_scheduling_gate(
         self,
         pod_name: str,
@@ -1098,6 +1137,7 @@ for _name, _kind in (
     ("read_deployment_replicas", "k8s.get_scale"),
     ("patch_deployment_replicas", "k8s.patch_scale"),
     ("lower_deployment_replicas", "k8s.lower_scale"),
+    ("raise_deployment_replicas", "k8s.raise_scale"),
     ("release_pod_scheduling_gate", "k8s.patch_gate"),
     ("assign_pod", "k8s.patch_assign"),
     ("release_pod", "k8s.delete_pod"),
