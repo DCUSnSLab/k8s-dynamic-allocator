@@ -22,16 +22,11 @@ class ControllerStatus:
                 queued = self.queues.queued_count(compute_type)
             except Exception:
                 queued = None
-        try:
-            pipeline = self.capacity_reconciler.pipeline_width(compute_type, policy["N"])
-        except Exception:
-            pipeline = None
         return self.capacity_reconciler.desired_replicas(
             policy["R"],
             policy["N"],
             buffer_assigned,
             queued,
-            pipeline,
         )
 
     def get_buffer_status(self) -> Dict:

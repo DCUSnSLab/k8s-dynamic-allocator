@@ -172,23 +172,53 @@ class ComputeAllocator:
                     result["claimed"] += 1
                     continue
                 break
+
+            if reserved_tickets:
+                # Serialize the replica correction with claims and leader scale-up.
+                # A slow batch can outlive the lock, so verify ownership inside
+                # the correction before each conditional Deployment patch.
+                try:
+                    if not self._lower_replicas_for_claims(
+                        compute_type_value=compute_type_value,
+                        policy=policy,
+                        claims=len(reserved_tickets),
+                        lock_token=lock_token,
+                    ):
+                        result["lock_lost"] = True
+                        logger.warning(
+                            "[Warning] operation=buffer_slot_return compute_type=%s "
+                            "claims=%s reason=%r",
+                            compute_type_value,
+                            len(reserved_tickets),
+                            "allocator lock lost before replica correction",
+                        )
+                except Exception as exc:
+                    # Reserved tickets still need their mounts. The leader will
+                    # reconcile replicas if Redis or the Kubernetes API fails.
+                    logger.warning(
+                        "[Warning] operation=buffer_slot_return compute_type=%s "
+                        "claims=%s reason=%r",
+                        compute_type_value,
+                        len(reserved_tickets),
+                        str(exc),
+                    )
         finally:
             if lock_token:
-                self.queues.release_allocator_lock(compute_type_value, lock_token)
+                try:
+                    self.queues.release_allocator_lock(compute_type_value, lock_token)
+                except Exception as exc:
+                    if not reserved_tickets:
+                        raise
+                    logger.warning(
+                        "[Warning] operation=allocator_lock_release compute_type=%s "
+                        "claims=%s reason=%r",
+                        compute_type_value,
+                        len(reserved_tickets),
+                        str(exc),
+                    )
 
         if not reserved_tickets:
             return result
-
-        # 가져간 자리만큼 replicas 를 내린다. 라벨을 바꾼 "직후, 마운트 시작 전" 이
-        # 이 일을 할 자리다 - 아래 마운트는 수 초가 걸리고, 그 사이에 ReplicaSet 이
-        # 빈 자리를 채워 버리면 합이 N 을 넘는다.
-        self._lower_replicas_for_claims(
-            compute_type_value=compute_type_value,
-            policy=policy,
-            room_before=remaining_capacity,
-            assigned_before=int(snapshot["buffer_assigned"]),
-            claims=len(reserved_tickets),
-        )
 
         executions: List[Dict] = []
         if mount_concurrency <= 1 or len(reserved_tickets) == 1:
@@ -279,80 +309,59 @@ class ComputeAllocator:
         *,
         compute_type_value: str,
         policy: Dict,
-        room_before: int,
-        assigned_before: int,
         claims: int,
-    ) -> None:
-        """방금 가져간 자리만큼 replicas 를 내려 replicas <= N - assigned 를 지킨다.
+        lock_token: str,
+    ) -> bool:
+        """Keep replicas within the latest N - assigned room while locked.
 
-        할당된 파드는 compute-status 라벨이 바뀌어 Deployment selector 에서 빠지고,
-        ReplicaSet 은 그 자리를 새 파드로 채운다. replicas 가 남은 자리보다 크면 그렇게
-        채워진 파드가 N 을 넘기므로, assigned 를 늘린 쪽이 그 자리를 같이 반납해야 한다.
-
-        전에는 이 일을 리더의 리컨실러만 했다. 할당은 모든 복제본에서 일어나는데 조정은
-        리더의 다음 패스까지 기다리므로, 그 시간차가 그대로 N 초과 구간이 됐다 - 실측
-        12구간, 최장 44.4초, 최대 90개(N=80). 할당한 쪽이 그 자리에서 내리면 남는 창은
-        API 호출 한 번이고, 대개는 ReplicaSet 이 만들기 전에 끝나 생성 자체가 일어나지
-        않는다. 만들어진 뒤에 지우는 것이 아니라 만들지 않게 하는 것이다.
-
-        기준은 "천장에 붙어 있나" 가 아니라 N 불변식 하나다: replicas 가 남은 자리 안이면
-        손대지 않는다. 그 경우 채워지는 파드는 N 이 허락하는 것이고, 다음 사용자가
-        기다리지 않게 하려고 두는 버퍼다. 이 한 줄이 저부하(자리가 넉넉)와 확대 중(큐는
-        길지만 replicas 가 아직 목표보다 낮음)을 모두 올바르게 비켜 간다 - 둘 다 줄이면
-        안 되는 경우이고, 전자를 천장 판정으로 걸러도 후자는 걸러지지 않았다.
-
-        내릴 값은 남은 자리(N - assigned) 자체다. replicas 에서 가져간 수를 빼면 두 번
-        빼는 것이 된다 - 할당된 파드는 이미 selector 에서 빠져 available 이 그만큼 줄어
-        있고, replicas 는 그 빈자리를 채우라는 지시다. 실측에서 replicas 6, 자리 11 에서
-        6개를 가져갔을 때 5 가 아니라 0 으로 내려가 버퍼가 비었고, 리더가 다시 올리는
-        사이에 파드 272개가 Ready 전에 지워졌다.
-
-        절대값으로 써도 경합은 문제가 되지 않는다. 할당 자체가 compute type 당
-        allocator lock 아래에서 직렬화되므로 claims 는 그사이 늘지 않고, 반납으로 줄기만
-        한다(그 경우 이 값이 보수적이 되고 리더가 즉시 올린다). 패치가 test 에서 밀렸다면
-        더 최근 값을 본 쪽이 이미 썼다는 뜻이므로, 다시 읽어 자리 안이면 그대로 둔다.
-
-        실패해도 할당은 성공으로 끝낸다. 리더가 다음 패스에서 맞추므로 최악이 지금까지의
-        동작이다.
+        A claim removes its Pod from the Deployment selector, allowing a
+        ReplicaSet backfill. Re-list before each conditional patch because a
+        concurrent release can increase room during the claim batch. False
+        means the allocator lock expired, so the caller must not patch.
         """
         if claims <= 0:
-            return
+            return True
         deployment_name = policy.get("deployment_name")
         if not deployment_name:
-            return
-        room_after = max(0, int(room_before) - int(claims))
-        try:
-            for _ in range(3):
-                current = int(self.provider.read_deployment_replicas(deployment_name))
-                if current <= room_after:
-                    # 이미 자리 안이다. 채워지는 파드는 N 이 허락하는 것이므로
-                    # 그대로 둔다 - 이것이 다음 사용자를 기다리지 않게 하는 버퍼다.
-                    return
-                if self.provider.lower_deployment_replicas(
-                    deployment_name,
-                    current,
-                    room_after,
-                ):
-                    logger.info(
-                        "[BufferSlotReturned] compute_type=%s replicas=%s->%s claims=%s "
-                        "assigned=%s room=%s->%s N=%s",
-                        compute_type_value,
-                        current,
-                        room_after,
-                        claims,
-                        assigned_before,
-                        room_before,
-                        room_after,
-                        policy["N"],
-                    )
-                    return
-        except Exception as exc:
-            logger.warning(
-                "[Warning] operation=buffer_slot_return compute_type=%s claims=%s reason=%r",
-                compute_type_value,
-                claims,
-                str(exc),
+            return True
+        for _ in range(3):
+            if not self.queues.renew_allocator_lock(compute_type_value, lock_token):
+                return False
+            snapshot = self.provider.list_buffer_snapshot(
+                compute_type=compute_type_value,
             )
+            assigned = int(snapshot["buffer_assigned"])
+            room = max(0, int(policy["N"]) - assigned)
+            current = int(self.provider.read_deployment_replicas(deployment_name))
+            if current <= room:
+                return True
+            if not self.queues.renew_allocator_lock(compute_type_value, lock_token):
+                return False
+            if self.provider.lower_deployment_replicas(
+                deployment_name,
+                current,
+                room,
+            ):
+                logger.info(
+                    "[BufferSlotReturned] compute_type=%s replicas=%s->%s claims=%s "
+                    "assigned=%s room=%s N=%s",
+                    compute_type_value,
+                    current,
+                    room,
+                    claims,
+                    assigned,
+                    room,
+                    policy["N"],
+                )
+                return True
+        logger.warning(
+            "[Warning] operation=buffer_slot_return compute_type=%s claims=%s "
+            "reason=%r",
+            compute_type_value,
+            claims,
+            "replica compare-and-swap retries exhausted",
+        )
+        return True
 
     def _reserve_compute_pod_for_ticket(
         self,

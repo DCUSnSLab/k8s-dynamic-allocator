@@ -1,5 +1,4 @@
 import logging
-import math
 import threading
 import time
 import uuid
@@ -63,6 +62,7 @@ class BufferCapacityReconciler:
         self._policy_refresh_pending = True
         self._next_run_at: Optional[float] = None
         self._known_policy_types: Set[str] = set()
+        self._last_queued_counts: Dict[str, int] = {}
         self._retry_counts: Dict[str, int] = {}
         self._policy_retry_count = 0
         self._policy_ready_token = ""
@@ -93,62 +93,152 @@ class BufferCapacityReconciler:
         buffer_capacity: int,
         assigned: int,
         queued: Optional[int] = None,
-        pipeline: Optional[float] = None,
     ) -> int:
-        """available 파드를 몇 개 들고 있을지.
+        """R, 대기 수요, 남은 N 자리로 available 목표를 정한다."""
+        return BufferCapacityReconciler.desired_replicas_detail(
+            buffer_reserve,
+            buffer_capacity,
+            assigned,
+            queued,
+        )["desired"]
 
-        queued=None 이 고정 정책이고 기본값이다. 동적 경로를 끈 실행은 예전과 한
-        글자도 다르지 않다.
+    @staticmethod
+    def desired_replicas_detail(
+        buffer_reserve: int,
+        buffer_capacity: int,
+        assigned: int,
+        queued: Optional[int] = None,
+    ) -> Dict:
+        """목표 복제 수와 그것을 제한한 항목을 돌려준다.
 
-        대기 중인 티켓 수를 목표로 쓴다. 다른 신호를 세 번 시도했지만
-        (도착률, 반납률, 큐 유무) 앞의 둘은 공급 병목에서 리틀의 법칙 항등식이 되어
-        하한에 붙었고, 셋째는 큐가 1건만 있어도 자리를 다 채워 배정보다 많은 파드를
-        버렸다. 큐 길이는 공급이 모자란 만큼 쌓이므로 그 셋과 달리 눈이 멀지 않는다.
-
-        pipeline 은 그 큐 길이의 상한이다. 큐가 자리보다 길면 목표는 N - assigned
-        에 붙고, 그러면 할당 한 건마다 assigned 가 1 오를 때 목표가 1 내려간다.
-        ReplicaSet 은 그 직전에 빠져나간 available 자리를 새 파드로 채우기 시작한
-        참이라, 내려간 목표가 그 파드를 지운다. 10/9 실측에서 포화 구간 생성의
-        16~35% 가 이렇게 Ready 전에 취소됐고, 취소가 있는 분의 파드 준비 시간은
-        4초에서 12~21초로 늘었다 (취소 수와 준비 시간의 상관 0.859, 취소가 멎은
-        분에는 곧장 4초로 돌아온다). 지우는 일 자체가 같은 노드에서 세우는 중인
-        파드를 밀어낸다.
-
-        목표를 자리가 아니라 "공급에 필요한 폭" 으로 묶으면 assigned 가 오르내려도
-        목표가 흔들리지 않아 그 취소가 생기지 않는다. 폭이 자리보다 작을 때만
-        효력이 있으므로 비포화 동작은 그대로다 (큐가 비면 R, 큐가 폭보다 짧으면
-        큐 길이).
-
-        자리는 여전히 N - assigned 가 막는다. 할당과 ReplicaSet 의 backfill 사이에서
-        합이 잠깐 N 을 넘지만 (실측 한 번에 중앙값 3.4초) 곧 되돌아오는 일시적
-        현상이다.
+        queued=None 은 고정 정책이다. 동적 정책은 대기 수요를 R 이상으로 반영하고
+        두 정책 모두 N-assigned 를 넘지 않는다. 생성 파이프라인 추정치는 Deployment
+        복제 수와 단위가 달라 목표의 상한이나 하한으로 사용하지 않는다.
         """
+        reserve = int(buffer_reserve)
         room = max(0, int(buffer_capacity) - int(assigned))
         if queued is None:
-            return min(int(buffer_reserve), room)
+            if room < reserve:
+                return {"desired": room, "bound_by": "room"}
+            return {"desired": reserve, "bound_by": "reserve"}
+
         want = int(queued)
-        if pipeline is not None and want > pipeline:
-            want = int(math.ceil(pipeline))
-        return min(max(int(buffer_reserve), want), room)
+        bound = "queued"
+        if reserve >= want:
+            want = reserve
+            bound = "reserve"
+        if room < want:
+            return {"desired": room, "bound_by": "room"}
+        return {"desired": want, "bound_by": bound}
+
+    @staticmethod
+    def _defer_demand_scale_down(
+        current: int,
+        room: int,
+        desired: int,
+        available: int,
+        starting: int,
+        starting_age_seconds: Optional[float],
+        grace_seconds: float,
+    ) -> bool:
+        """수요가 줄어 생긴 축소를, 방금 들인 파드가 Ready 가 될 때까지만 미룬다.
+
+        게이트를 푼 직후의 파드를 지우면 노드가 이미 시작한 일을 버리게 되고, 그
+        삭제가 같은 노드에서 세우는 중인 다른 파드까지 밀어낸다 (10/9 실측에서
+        취소 236건, 생성 후 중앙값 1.5초). 그래서 "들였지만 아직 Ready 가 아닌"
+        파드가 있으면 수요 축소를 미룬다.
+
+        **반드시 나이 상한이 있어야 한다.** 상한이 없으면 끝내 Ready 가 되지 않는
+        파드 하나가 축소를 영구히 막는다. 그 교착은 이론이 아니다:
+
+          - 스케줄 불가 파드(노드 자리 없음)는 `status.startTime` 이 nil 이라
+            cleanup 의 회수 판정(`_pod_not_ready_since`)이 None 을 돌려주고, 그
+            함수는 "한 번도 Ready 가 된 적 없는 파드" 를 **의도적으로** 제외한다.
+            즉 cleanup 이 치워 줄 것이라는 기대는 성립하지 않는다.
+          - 축소가 영구히 막히면 replicas 가 고정되고, 그러면 게이트 해제 예산
+            (min(replicas, N-assigned, desired))도 고정되어 남은 게이트 파드가
+            영구히 안 풀린다. 그 상태에서는 롤링 업데이트의 maxUnavailable 이
+            회복되지 않아 이미지 전개까지 멈춘다.
+
+        상한은 grace_seconds 로 받는다. 호출자가 관측값으로 만든다
+        (_starting_grace_seconds). 나이를 알 수 없으면 미루지 않는다 - 상한을
+        걸 수 없는 보류는 위의 교착과 같아지고, 미루지 않아서 생기는 손해는
+        되돌릴 수 있는 재생성뿐이다.
+
+        나이의 기준은 파드 생성이 아니라 **게이트를 푼 시각**이다. 생성 시각으로
+        재면 포화에서 오래 게이트에 묶여 있던 파드가 들이는 순간 이미 상한을
+        넘어 보호를 전혀 못 받는다.
+
+        용량 보정(current > room)은 이 보류를 타지 않는다. N 보장은 늦출 수 없다.
+        """
+        if starting <= 0:
+            return False
+        if current > room:
+            return False
+        if not (current > desired or available > desired):
+            return False
+        if starting_age_seconds is None:
+            return False
+        return float(starting_age_seconds) <= float(grace_seconds)
+
+    def _starting_grace_seconds(self, compute_type: str) -> float:
+        """들인 파드가 Ready 가 될 때까지 기다려 줄 시간. 관측값에서 만든다.
+
+        건강한 파드가 Ready 가 되는 데 걸리는 시간의 p90 과, cleanup 이 미준비
+        파드를 회수하는 기준(COMPUTE_NOT_READY_GRACE_SECONDS) 중 큰 쪽이다.
+
+        p90 만 쓰면 혼잡 구간에서 상한이 너무 짧아진다 - 실측 생성 시간이 4초와
+        12~21초의 두 봉으로 갈리므로, 표본이 빠른 봉에 몰린 순간의 p90 으로
+        자르면 정상적으로 늦게 뜨는 파드를 지워 10/9 의 취소가 되살아난다.
+        반대로 회수 기준만 쓰면 관측과 무관한 고정값이 된다. 큰 쪽을 쓰면 둘 중
+        어느 쪽이 커도 안전하다.
+
+        표본이 모자라면 p90 이 0 이고 회수 기준만 남는다. 기동 직후가 그 상태다.
+        """
+        observed = self.create_time_seconds(compute_type)
+        grace = float(getattr(settings, "COMPUTE_NOT_READY_GRACE_SECONDS", 0) or 0)
+        return max(float(observed or 0.0), grace)
+
+    @staticmethod
+    def _held_available(snapshot: Dict) -> int:
+        """목표와 견줄 "들고 있는 미할당 파드" 수. 게이트 걸린 파드는 뺀다.
+
+        게이트를 도입하면서 buffer_available 의 의미가 바뀌었다. 이제 그 안에는
+        아직 노드에 올라가지도 않은 게이트 파드가 섞여 있고, ReplicaSet 은
+        selector 수가 replicas 보다 적으면 곧바로 그런 파드를 하나 만든다. 그래서
+        포화에서는 buffer_available = room + backfill > desired = room 이 거의
+        항상 참이 된다.
+
+        그 값을 목표와 비교하던 자리들을 그대로 두면 이런 일이 생긴다:
+          - 줄일 것이 없는데 축소 분기에 들어가고,
+          - _scale_down 이 **축소 게이트를 쥔 채** "available 이 목표 아래로
+            내려오는 것" 을 최대 10초 기다린다. 그 10초 동안 모든 복제본의 할당이
+            capacity_blocked=scale_down 으로 막힌다.
+          - 수렴 판정이 서지 않아 같은 일이 매 패스 반복된다.
+
+        목표가 통제하려는 것은 노드 자원을 쥔 파드 수다. 게이트 파드는 자원을 0
+        쓰고, replicas 를 내릴 때 가장 먼저(미스케줄 + deletion-cost -100) 지워질
+        대상이므로 이 비교에 넣지 않는다.
+
+        키가 없는 스냅샷(게이트 이전 형태)은 buffer_available 로 물러선다.
+        """
+        value = snapshot.get("ungated_available")
+        if value is None:
+            return int(snapshot["buffer_available"])
+        return int(value)
+
+    @staticmethod
+    def _starting_age_seconds(oldest_started_at) -> Optional[float]:
+        """가장 오래 들여둔 미준비 파드의 경과 시간. 알 수 없으면 None."""
+        if not isinstance(oldest_started_at, datetime):
+            return None
+        started = oldest_started_at
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - started).total_seconds()
 
     def pipeline_width(self, compute_type: str, buffer_capacity: int) -> Optional[float]:
-        """포화에서 공급을 유지하려면 동시에 몇 개를 세우고 있어야 하는지.
-
-        N 개 자리를 쉬지 않고 돌릴 때 파드 하나가 자리를 쥐는 시간은 세우는 시간과
-        일하는 시간의 합이고, 그때 처리율은 N / (세움 + 일) 이다. 그 속도로 파드가
-        소비되는 동안 세워지고 있어야 하는 양이 이 값이다:
-
-            N x 세움 / (세움 + 일)
-
-        관측된 할당 속도를 쓰지 않는 것이 요점이다. 공급이 막히면 할당도 같이
-        느려지므로 그것으로 목표를 정하면 모자란 상태에서 하한에 붙는다 - 도착률과
-        반납률이 폐기된 이유가 그것이다. 여기 들어가는 두 값은 공급이 막혀도 줄지
-        않는다. 세우는 시간이 길어지면 폭이 넓어져 공급을 보강하고, 일하는 시간이
-        길면 자리가 천천히 비므로 폭이 좁아진다.
-
-        표본이 모자라면 None 이고, 그때 목표는 예전처럼 큐 길이를 그대로 쓴다.
-        기동 직후가 그 상태다.
-        """
+        """생성·보유 시간으로 계산한 포화 공급 폭. 진단 로그에만 사용한다."""
         create = self.create_time_seconds(compute_type, quantile=0.5)
         work = self.work_time_seconds(compute_type)
         if create <= 0 or work <= 0:
@@ -158,9 +248,7 @@ class BufferCapacityReconciler:
     def work_time_seconds(self, compute_type: str, quantile: float = 0.5) -> float:
         """할당된 파드가 자리를 쥐고 있던 시간의 분위수. 표본이 모자라면 0.
 
-        releaser 가 반납할 때마다 남기는 session_ms 가 표본이다. 중앙값을 쓴다 -
-        파이프라인 폭은 평균적인 회전에서 나오는 값이라, 쿨다운처럼 높은 분위를
-        쓸 이유가 없다.
+        releaser 가 반납할 때마다 남기는 session_ms 가 표본이다.
         """
         works = sorted(self._shared_or_local(compute_type, "work", []))
         if len(works) < self.cooldown_min_samples:
@@ -170,8 +258,8 @@ class BufferCapacityReconciler:
     def _queued_for_target(self, compute_type: str) -> Optional[int]:
         """대기 중인 티켓 수. 고정 정책을 유지할 때는 None.
 
-        Redis 가 흔들리면 이번 패스만 고정 정책으로 물러난다. R 개를 드는 것은 언제나
-        안전한 답이고 다음 패스가 다시 읽는다.
+        동적 정책에서 조회가 실패하면 목표를 알 수 없으므로 이번 패스를 재시도한다.
+        None 으로 바꾸면 대기 수요가 있어도 고정 R 까지 축소될 수 있다.
         """
         if not self.dynamic_reserve:
             return None
@@ -183,7 +271,9 @@ class BufferCapacityReconciler:
                 compute_type,
                 str(exc),
             )
-            return None
+            raise QueueUnavailableError(
+                f"Queued demand unavailable for {compute_type}: {exc}"
+            ) from exc
 
     # 쿨다운에 쓰는 분위. 높은 쪽이 맞다 - "줄였다가 되돌려지지 않으려면 얼마나
     # 기다려야 하나"의 답이고, 중앙값으로 맞추면 절반은 되돌려진다.
@@ -271,6 +361,14 @@ class BufferCapacityReconciler:
         except Exception:
             return local
         return shared if len(shared) >= len(local) else local
+
+    def _sample_count(self, compute_type: str, kind: str) -> int:
+        """진단 로그에 기록할 생성·보유 표본 수."""
+        local: List[float] = []
+        if kind == "create":
+            with self._churn_lock:
+                local = list(self._churn_state(compute_type)["creates"])
+        return len(self._shared_or_local(compute_type, kind, local))
 
     def cooldown_seconds(self, compute_type: str) -> float:
         """관측값 두 개의 큰 쪽. 설정에 적힌 숫자가 아니다.
@@ -480,7 +578,7 @@ class BufferCapacityReconciler:
             self.request_reconcile(compute_type)
 
     def _note_create_time(self, compute_type: str, pod) -> None:
-        """파드가 Ready 가 된 순간, 세우는 데 걸린 시간을 표본에 넣는다.
+        """파드가 Ready 가 된 순간, 스케줄 허용 이후 준비 시간을 표본에 넣는다.
 
         쿨다운의 바닥이 되는 값이다. Ready 이벤트는 같은 파드에 여러 번 오므로
         uid 로 한 번만 센다. 시각이 둘 다 있을 때만 쓰고, 없으면 조용히 넘어간다 -
@@ -490,11 +588,24 @@ class BufferCapacityReconciler:
             if not self.provider._pod_is_ready(pod):
                 return
             uid = getattr(getattr(pod, "metadata", None), "uid", None)
-            created = getattr(getattr(pod, "metadata", None), "creation_timestamp", None)
+            metadata = getattr(pod, "metadata", None)
+            created = getattr(metadata, "creation_timestamp", None)
             ready = self.provider._pod_ready_at(pod)
             if not uid or created is None or ready is None:
                 return
-            seconds = (ready - created).total_seconds()
+            annotations = getattr(metadata, "annotations", None) or {}
+            release_key = getattr(
+                self.provider,
+                "ANNOTATION_WARM_SLOT_RELEASED_AT",
+                "k8s-dynamic-allocator/warm-slot-released-at",
+            )
+            released_at = annotations.get(release_key)
+            started = (
+                datetime.fromisoformat(str(released_at).replace("Z", "+00:00"))
+                if released_at
+                else created
+            )
+            seconds = (ready - started).total_seconds()
             if seconds < 0:
                 return
         except Exception:
@@ -587,6 +698,7 @@ class BufferCapacityReconciler:
 
     def _run(self) -> None:
         next_resync_at = time.monotonic()
+        next_demand_poll_at = time.monotonic()
         next_ready_renew_at = float("inf")
         try:
             while not self._stop_event.is_set():
@@ -596,6 +708,7 @@ class BufferCapacityReconciler:
                     continue
                 refresh_policies = False
                 renew_policy_ready = False
+                demand_poll_due = False
                 compute_types: Set[str] = set()
 
                 with self._condition:
@@ -604,6 +717,8 @@ class BufferCapacityReconciler:
                         due_at = next_resync_at
                         if self._next_run_at is not None:
                             due_at = min(due_at, self._next_run_at)
+                        if self.dynamic_reserve and self._known_policy_types:
+                            due_at = min(due_at, next_demand_poll_at)
                         due_at = min(due_at, next_ready_renew_at)
                         if now >= due_at:
                             break
@@ -628,6 +743,13 @@ class BufferCapacityReconciler:
                         self._pending_types.clear()
                         self._policy_refresh_pending = False
                         self._next_run_at = None
+                    demand_poll_due = (
+                        self.dynamic_reserve
+                        and bool(self._known_policy_types)
+                        and now >= next_demand_poll_at
+                    )
+                    if demand_poll_due:
+                        next_demand_poll_at = now + 1.0
                     renew_policy_ready = (
                         self._policy_ready and now >= next_ready_renew_at
                     )
@@ -655,6 +777,12 @@ class BufferCapacityReconciler:
                         self._clear_policy_ready_best_effort()
                         next_ready_renew_at = float("inf")
                         self.request_policy_refresh(retry=True)
+
+                if demand_poll_due:
+                    # This leader-side poll observes tickets enqueued through a
+                    # different controller replica, even while its queue worker
+                    # is occupied by mounts. Reconcile only changed demand.
+                    compute_types.update(self._poll_demand_changes())
 
                 if renew_policy_ready and self._policy_ready:
                     if (
@@ -691,10 +819,27 @@ class BufferCapacityReconciler:
                     ):
                         break
                     result = self.reconcile_type(compute_type)
+                    gates_reconciled = False
+                    if not result.get("retry") and result.get("status") != "blocked":
+                        gates_reconciled = self._release_scheduling_gates(compute_type)
                     if result.get("retry"):
                         self.request_reconcile(compute_type, retry=True)
                         if compute_type in ready_candidate_types:
                             ready_reconcile_failed = True
+                    elif not gates_reconciled:
+                        # Pod creation, ReplicaSet deletion and gate CAS
+                        # conflicts commonly resolve without another event.
+                        #
+                        # 여기서 ready_reconcile_failed 를 세우면 안 된다. 그 깃발은
+                        # buffer_policy_ready 를 내리고, 그것은 할당의 1번 관문이라
+                        # 모든 복제본이 모든 티켓을 policy_not_ready 로 되돌린다.
+                        # 그런데 게이트 해제의 False 는 일상적·일시적 조건이다 -
+                        # 가장 흔한 것이 "ReplicaSet 이 아직 게이트 파드를 만들지
+                        # 않았다"(candidates 가 빔)이고, 포화에서는 반납->backfill
+                        # 주기마다 그 창이 열린다. 게이트 해제는 공급 쪽 최적화이고
+                        # 정책 유효성이 아니므로 같은 변수로 묶으면 심각도가 뒤집힌다.
+                        # 못 푼 게이트는 아래 1초 재시도가 가져간다.
+                        self._schedule_after(1.0, compute_type)
                     else:
                         with self._condition:
                             self._retry_counts.pop(compute_type, None)
@@ -753,6 +898,178 @@ class BufferCapacityReconciler:
             with self._condition:
                 if self._thread is threading.current_thread():
                     self._thread = None
+
+    def _poll_demand_changes(self) -> Set[str]:
+        changed: Set[str] = set()
+        for compute_type in sorted(self._known_policy_types):
+            try:
+                queued = int(self.queues.queued_count(compute_type))
+            except Exception as exc:
+                logger.warning(
+                    "[Warning] operation=buffer_demand_poll "
+                    "compute_type=%s reason=%r",
+                    compute_type,
+                    str(exc),
+                )
+                continue
+            with self._condition:
+                previous = self._last_queued_counts.get(compute_type)
+                self._last_queued_counts[compute_type] = queued
+            if previous is None or previous != queued:
+                changed.add(compute_type)
+        return changed
+
+    def _release_scheduling_gates(self, compute_type: str) -> bool:
+        """Admit gated warm Pods only within the current demand and N budget.
+
+        Drop the allocator lock between Pods so claims can run during a burst.
+        Re-read aggregate state after each acquisition: a Pod resource version
+        protects only that Pod, not the budget shared by all warm Pods.
+        """
+        if self._stop_event.is_set() or not self._has_write_authority():
+            return False
+        try:
+            policy = self.queues.get_buffer_policy(compute_type)
+            if not policy:
+                return False
+            max_attempts = max(1, int(policy["N"]) * 2)
+            released_count = 0
+            for _ in range(max_attempts):
+                deadline = time.monotonic() + min(1.0, self.wait_timeout_seconds)
+                lock_token = self._acquire_allocator_lock_until(
+                    compute_type, deadline, threading.Event()
+                )
+                if not lock_token:
+                    return False
+                try:
+                    if (
+                        self._stop_event.is_set()
+                        or not self._has_write_authority()
+                        or not self.queues.renew_allocator_lock(compute_type, lock_token)
+                        or self.queues.is_scale_down_gated(compute_type)
+                    ):
+                        return False
+
+                    policy = self.queues.get_buffer_policy(compute_type)
+                    if not policy:
+                        return False
+                    snapshot = self.provider.list_buffer_snapshot(compute_type)
+                    current = int(
+                        self.provider.read_deployment_replicas(
+                            policy["deployment_name"]
+                        )
+                    )
+                    assigned = int(snapshot["buffer_assigned"])
+                    room = max(0, int(policy["N"]) - assigned)
+                    available = int(snapshot["buffer_available"])
+                    total = int(snapshot["buffer_total"])
+                    unowned = int(snapshot.get("unowned_available", 0))
+                    owned_available = max(0, available - unowned)
+                    if current > room or owned_available > current:
+                        # Let ReplicaSet deletion and N correction settle.
+                        return False
+                    if total > int(policy["N"]):
+                        # Gated or unowned API objects do not consume this
+                        # admission budget; unowned Pods remain in ungated.
+                        logger.warning(
+                            "[BufferGateOvershoot] compute_type=%s total=%s N=%s "
+                            "unowned_available=%s",
+                            compute_type,
+                            total,
+                            policy["N"],
+                            unowned,
+                        )
+
+                    queued = self._queued_for_target(compute_type)
+                    desired = self.desired_replicas(
+                        policy["R"], policy["N"], assigned, queued
+                    )
+                    budget = min(current, room, desired)
+                    ungated = int(snapshot["ungated_available"])
+                    if ungated >= budget:
+                        if unowned and snapshot["gated_available_candidates"]:
+                            logger.info(
+                                "[BufferGateDeferred] compute_type=%s reason=%r "
+                                "ungated=%s budget=%s unowned_available=%s",
+                                compute_type,
+                                "unowned available Pods consume admission budget",
+                                ungated,
+                                budget,
+                                unowned,
+                            )
+                        return True
+                    candidates = snapshot["gated_available_candidates"]
+                    if not candidates:
+                        # The Deployment may not have created its gated Pod yet.
+                        return False
+
+                    if (
+                        self._stop_event.is_set()
+                        or not self._has_write_authority()
+                        or not self.queues.renew_allocator_lock(compute_type, lock_token)
+                        or self.queues.is_scale_down_gated(compute_type)
+                    ):
+                        return False
+
+                    # 후보를 하나만 보고 포기하면 안 된다. 후보는 (생성시각, 이름)
+                    # 순이라 항상 같은 파드가 맨 앞이고, 그 파드의 패치가 계속
+                    # 실패하면(어노테이션이 외부에서 바뀌어 test 가 422, 또는 파드가
+                    # 막 사라지는 중) **그 뒤의 파드가 영구히 안 풀린다**. 머리 하나가
+                    # 줄 전체를 막는다. 한 패스에서 다음 후보로 넘어가면 그 파드만
+                    # 1초 재시도에 남고 나머지는 정상 진행한다.
+                    released_one = False
+                    for candidate in candidates:
+                        if self.provider.release_pod_scheduling_gate(
+                            candidate["name"],
+                            candidate["resource_version"],
+                            candidate["gate_index"],
+                        ):
+                            released_one = True
+                            break
+                        logger.info(
+                            "[BufferGateSkipped] compute_type=%s compute_pod=%s "
+                            "reason=%s",
+                            compute_type,
+                            candidate["name"],
+                            "patch_conflict_or_gone",
+                        )
+                    if not released_one:
+                        return False
+                    logger.info(
+                        "[BufferGateReleased] compute_type=%s compute_pod=%s "
+                        "ungated=%s budget=%s assigned=%s n=%s",
+                        compute_type,
+                        candidate["name"],
+                        ungated + 1,
+                        budget,
+                        assigned,
+                        policy["N"],
+                    )
+                    released_count += 1
+                finally:
+                    try:
+                        self.queues.release_allocator_lock(compute_type, lock_token)
+                    except Exception as exc:
+                        logger.warning(
+                            "[Warning] operation=buffer_gate_lock_release "
+                            "compute_type=%s reason=%r",
+                            compute_type,
+                            str(exc),
+                        )
+                # Give pending claims a chance to acquire the free lock.
+                if self._stop_event.wait(0.01):
+                    return False
+            if released_count:
+                self.request_reconcile(compute_type)
+                return True
+            return False
+        except Exception as exc:
+            logger.warning(
+                "[Warning] operation=buffer_gate_release compute_type=%s reason=%r",
+                compute_type,
+                str(exc),
+            )
+            return False
 
     def sync_policies(self) -> Set[str]:
         """Refresh the leader-owned Redis cache from Deployment annotations."""
@@ -994,13 +1311,13 @@ class BufferCapacityReconciler:
             snapshot = self.provider.list_buffer_snapshot(compute_type_value)
             queued = self._queued_for_target(compute_type_value)
             pipeline = self.pipeline_width(compute_type_value, policy["N"])
-            desired = self.desired_replicas(
+            decision = self.desired_replicas_detail(
                 policy["R"],
                 policy["N"],
                 snapshot["buffer_assigned"],
                 queued,
-                pipeline,
             )
+            desired = decision["desired"]
             current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]
             )
@@ -1015,6 +1332,7 @@ class BufferCapacityReconciler:
                 "buffer_assigned": snapshot["buffer_assigned"],
                 "current_replicas": current,
                 "desired_replicas": desired,
+                "bound_by": decision["bound_by"],
             }
 
             # 목표를 먼저 적는다. 확대 패스보다 앞이어야 한다 - 전에는 축소 쪽에만
@@ -1024,6 +1342,38 @@ class BufferCapacityReconciler:
             # 쿨다운을 빠져나갔다.
             cooldown = self.cooldown_seconds(compute_type_value)
             self._note_target(compute_type_value, desired, cooldown)
+
+            # 자리는 아래 축소 분기와 로그가 함께 쓴다.
+            room = max(0, int(policy["N"]) - int(snapshot["buffer_assigned"]))
+            # 확대 패스도 포함해 목표 결정 근거를 남긴다. pipeline 은 진단값이다.
+            logger.info(
+                "[BufferTarget] compute_type=%s queued=%s desired=%s current=%s "
+                "room=%s assigned=%s available=%s ready_available=%s total=%s "
+                "R=%s N=%s dynamic=%s bound_by=%s pipeline=%s create_s=%s "
+                "create_high_s=%s work_s=%s cooldown_s=%.1f create_samples=%s "
+                "work_samples=%s min_samples=%s",
+                compute_type_value,
+                queued if queued is not None else "-",
+                desired,
+                current,
+                room,
+                snapshot["buffer_assigned"],
+                snapshot["buffer_available"],
+                snapshot.get("ready_available", "-"),
+                snapshot["buffer_total"],
+                policy["R"],
+                policy["N"],
+                self.dynamic_reserve,
+                decision["bound_by"],
+                f"{pipeline:.2f}" if pipeline is not None else "-",
+                f"{self.create_time_seconds(compute_type_value, quantile=0.5):.2f}",
+                f"{self.create_time_seconds(compute_type_value):.2f}",
+                f"{self.work_time_seconds(compute_type_value):.2f}",
+                cooldown,
+                self._sample_count(compute_type_value, "create"),
+                self._sample_count(compute_type_value, "work"),
+                self.cooldown_min_samples,
+            )
 
             if current < desired:
                 result = self._scale_up(
@@ -1051,30 +1401,72 @@ class BufferCapacityReconciler:
             # 판정은 replicas 로 한다. 실제 파드 합(buffer_total)이 N 을 넘는 것은
             # 할당과 backfill 사이의 일시적 현상이라 (한 번에 중앙값 3.4초) 그것으로
             # 줄이면 ReplicaSet 이 지우고 있는 파드를 한 번 더 지우게 된다.
-            room = max(0, int(policy["N"]) - int(snapshot["buffer_assigned"]))
-            logger.info(
-                "[BufferTarget] compute_type=%s queued=%s desired=%s current=%s "
-                "room=%s assigned=%s available=%s total=%s R=%s N=%s dynamic=%s "
-                "pipeline=%s create_s=%s work_s=%s",
-                compute_type_value,
-                queued,
-                desired,
-                current,
-                room,
-                snapshot["buffer_assigned"],
-                snapshot["buffer_available"],
-                snapshot["buffer_total"],
-                policy["R"],
-                policy["N"],
-                self.dynamic_reserve,
-                # 폭이 왜 그 값인지는 두 관측값으로만 설명되므로 함께 남긴다.
-                # 없으면 표본이 아직 모자란 것이고 목표는 예전 경로로 간다.
-                f"{pipeline:.2f}" if pipeline is not None else "-",
-                f"{self.create_time_seconds(compute_type_value, quantile=0.5):.2f}",
-                f"{self.work_time_seconds(compute_type_value):.2f}",
-            )
-
-            if current > desired or snapshot["buffer_available"] > desired:
+            if current > desired or self._held_available(snapshot) > desired:
+                # schedulable_not_ready 와 oldest_schedulable_not_ready_since 는
+                # 같은 집합(게이트가 하나도 없고 아직 Ready 가 아닌 RS 소유 파드)을
+                # 두고 함께 계산된 쌍이다. ungated_not_ready 는 "우리 게이트만"
+                # 기준이라 외부 게이트가 걸린 파드를 들여온 것으로 세고, 그 파드는
+                # 영구히 Ready 가 되지 않으므로 보류를 끊을 나이도 없다.
+                starting = int(snapshot.get("schedulable_not_ready", 0))
+                starting_age = self._starting_age_seconds(
+                    snapshot.get("oldest_schedulable_not_ready_since")
+                )
+                grace = self._starting_grace_seconds(compute_type_value)
+                if self._defer_demand_scale_down(
+                    current,
+                    room,
+                    desired,
+                    self._held_available(snapshot),
+                    starting,
+                    starting_age,
+                    grace,
+                ):
+                    result = {
+                        **base_result,
+                        "status": "deferred",
+                        "reason": "pods_starting",
+                        "schedulable_not_ready": starting,
+                    }
+                    self._record_status(compute_type_value, **result)
+                    return result
+                if starting > 0 and starting_age is not None and starting_age > grace:
+                    # 상한을 넘겼다. 더 기다리지 않고 축소를 진행한다 - 이 줄이
+                    # 없으면 끝내 Ready 가 안 되는 파드가 축소를 영구히 막는다.
+                    logger.warning(
+                        "[BufferStartingGraceExpired] compute_type=%s "
+                        "schedulable_not_ready=%s age_s=%.1f grace_s=%.1f "
+                        "current=%s desired=%s",
+                        compute_type_value,
+                        starting,
+                        starting_age,
+                        grace,
+                        current,
+                        desired,
+                    )
+                if starting > 0 and current > room:
+                    # N correction cannot wait for readiness. Gated Pods have
+                    # lower deletion cost, but ReplicaSet choice is best effort.
+                    logger.warning(
+                        "[BufferCapacityTrim] compute_type=%s replicas=%s->%s "
+                        "ungated_not_ready=%s reason=%r",
+                        compute_type_value,
+                        current,
+                        room,
+                        starting,
+                        "capacity correction while Pods are starting",
+                    )
+                    result = self._scale_down(
+                        compute_type_value,
+                        policy,
+                        {
+                            **base_result,
+                            "desired_replicas": room,
+                            "target_replicas": desired,
+                            "capacity_trim": True,
+                        },
+                    )
+                    self._record_status(compute_type_value, **result)
+                    return result
                 waiting = self._cooldown_blocks_scale_down(
                     compute_type_value, desired, cooldown
                 )
@@ -1182,7 +1574,6 @@ class BufferCapacityReconciler:
                 policy["N"],
                 snapshot["buffer_assigned"],
                 self._queued_for_target(compute_type),
-                self.pipeline_width(compute_type, policy["N"]),
             )
             current = self.provider.read_deployment_replicas(
                 policy["deployment_name"]
@@ -1204,13 +1595,14 @@ class BufferCapacityReconciler:
                 if capped != desired:
                     logger.info(
                         "[BufferScaleUpCapped] compute_type=%s desired=%s->%s "
-                        "current=%s total=%s N=%s",
+                        "current=%s total=%s N=%s unowned_available=%s",
                         compute_type,
                         desired,
                         capped,
                         current,
                         snapshot["buffer_total"],
                         policy["N"],
+                        snapshot.get("unowned_available", 0),
                     )
                 desired = capped
 
@@ -1224,7 +1616,7 @@ class BufferCapacityReconciler:
                 "current_replicas": current,
                 "desired_replicas": desired,
             }
-            if current > desired or snapshot["buffer_available"] > desired:
+            if current > desired or self._held_available(snapshot) > desired:
                 return {
                     **refreshed,
                     "status": "deferred",
@@ -1392,6 +1784,38 @@ class BufferCapacityReconciler:
                     "current_replicas": current,
                     "desired_replicas": desired,
                 }
+                starting = int(snapshot.get("schedulable_not_ready", 0))
+                starting_age = self._starting_age_seconds(
+                    snapshot.get("oldest_schedulable_not_ready_since")
+                )
+                grace = self._starting_grace_seconds(compute_type)
+                if self._defer_demand_scale_down(
+                    current,
+                    room,
+                    desired,
+                    self._held_available(snapshot),
+                    starting,
+                    starting_age,
+                    grace,
+                ):
+                    return {
+                        **refreshed_result,
+                        "status": "deferred",
+                        "reason": "pods_starting",
+                        "schedulable_not_ready": starting,
+                    }
+                if starting > 0 and current > room and desired < room:
+                    desired = room
+                    refreshed_result["desired_replicas"] = room
+                    logger.warning(
+                        "[BufferCapacityTrim] compute_type=%s replicas=%s->%s "
+                        "ungated_not_ready=%s reason=%r",
+                        compute_type,
+                        current,
+                        room,
+                        starting,
+                        "capacity correction while Pods are starting",
+                    )
                 if current < desired:
                     return {
                         **refreshed_result,
@@ -1400,7 +1824,7 @@ class BufferCapacityReconciler:
                         "retry": True,
                     }
 
-                if current == desired and snapshot["buffer_available"] <= desired:
+                if current == desired and self._held_available(snapshot) <= desired:
                     return {
                         **refreshed_result,
                         "status": "converged",
@@ -1581,7 +2005,7 @@ class BufferCapacityReconciler:
             and time.monotonic() < deadline
         ):
             snapshot = self.provider.list_buffer_snapshot(compute_type)
-            if snapshot["buffer_available"] <= desired:
+            if self._held_available(snapshot) <= desired:
                 return True
             self._wait_for_event(min(0.5, max(0.0, deadline - time.monotonic())))
         return False

@@ -10,6 +10,11 @@ metadata:
     k8s-dynamic-allocator/buffer-capacity: "5"
 spec:
   replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: compute-pod
@@ -22,7 +27,15 @@ spec:
         compute-type: general
         compute-status: available
         assigned-user: ""
+      annotations:
+        k8s-dynamic-allocator/warm-slot-released-at: ""
+        controller.kubernetes.io/pod-deletion-cost: "-100"
     spec:
+      # The controller removes this gate only after an N slot is available.
+      # Keeping excess replacements unscheduled avoids node-side setup and
+      # teardown for Pods that ReplicaSet must remove on a later downscale.
+      schedulingGates:
+      - name: k8s-dynamic-allocator/warm-slot
       # Same general-purpose nodes as the user pods; keeps compute pods off the GPU nodes.
       #
       # The second label narrows that set to the nodes this experiment may fill.

@@ -244,21 +244,46 @@ kubectl annotate deployment/compute-general \
     -n "${namespace}" --overwrite
 
 # The controller creates compute-general from its manifest only when it is
-# missing, so node placement and resources changed in the manifest later have
-# to be carried onto the live Deployment here. Same rollout as the image change.
+# missing, so template and rollout changes in the manifest have to be carried
+# onto the live Deployment here. Keep the current replicas and R/N annotations.
 compute_manifest="${WORKSPACE}/controller/manifests/compute-general.yaml"
 compute_node_selector=$(kubectl create --dry-run=client -f "${compute_manifest}" \
     -o jsonpath='{.spec.template.spec.nodeSelector}')
 compute_resources=$(kubectl create --dry-run=client -f "${compute_manifest}" \
     -o jsonpath='{.spec.template.spec.containers[?(@.name=="compute-agent")].resources}')
-if [ -z "${compute_node_selector}" ] || [ -z "${compute_resources}" ]; then
-    echo "[DeployFailed] ${compute_manifest} must set nodeSelector and compute-agent resources"
+compute_scheduling_gates=$(kubectl create --dry-run=client -f "${compute_manifest}" \
+    -o jsonpath='{.spec.template.spec.schedulingGates}')
+compute_template_annotations=$(kubectl create --dry-run=client -f "${compute_manifest}" \
+    -o jsonpath='{.spec.template.metadata.annotations}')
+compute_strategy=$(kubectl create --dry-run=client -f "${compute_manifest}" \
+    -o jsonpath='{.spec.strategy}')
+compute_strategy_type=$(kubectl create --dry-run=client -f "${compute_manifest}" \
+    -o jsonpath='{.spec.strategy.type}')
+compute_max_surge=$(kubectl create --dry-run=client -f "${compute_manifest}" \
+    -o jsonpath='{.spec.strategy.rollingUpdate.maxSurge}')
+compute_max_unavailable=$(kubectl create --dry-run=client -f "${compute_manifest}" \
+    -o jsonpath='{.spec.strategy.rollingUpdate.maxUnavailable}')
+if [ -z "${compute_node_selector}" ] || [ -z "${compute_resources}" ] || \
+   [ -z "${compute_scheduling_gates}" ] || [ -z "${compute_template_annotations}" ] || \
+   [ -z "${compute_strategy}" ]; then
+    echo "[DeployFailed] ${compute_manifest} must set nodeSelector, compute-agent resources, schedulingGates, template annotations, and strategy"
     exit 1
 fi
-echo "[Deploy] Sync compute-general image, nodeSelector=${compute_node_selector} resources=${compute_resources}"
-# Image, placement and resources in one patch, so the Deployment rolls out once.
+if [ "${compute_scheduling_gates}" != '[{"name":"k8s-dynamic-allocator/warm-slot"}]' ] || \
+   [ "${compute_strategy_type}" != RollingUpdate ] || \
+   [ "${compute_max_surge}" != 0 ] || \
+   [ "${compute_max_unavailable}" != 1 ] || \
+   ! echo "${compute_template_annotations}" | grep -Fq '"k8s-dynamic-allocator/warm-slot-released-at":""' || \
+   ! echo "${compute_template_annotations}" | grep -Fq '"controller.kubernetes.io/pod-deletion-cost":"-100"'; then
+    echo "[DeployFailed] ${compute_manifest} gate, deletion cost, or rollout strategy is unsafe"
+    exit 1
+fi
+echo "[Deploy] Sync compute-general image, scheduling gate, rollout strategy, nodeSelector, and resources"
+# Strategy and the gated template change together. With maxSurge=0 and
+# maxUnavailable=1, the first old Pod can leave before the new gated Pod needs
+# to become Ready; a 0-unavailable rollout would deadlock at the initial R.
 kubectl patch deployment/compute-general -n "${namespace}" --type=strategic \
-    -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":${compute_node_selector},\"containers\":[{\"name\":\"compute-agent\",\"image\":\"${COMPUTE_POD_IMAGE}\",\"resources\":${compute_resources}}]}}}}"
+    -p "{\"spec\":{\"strategy\":${compute_strategy},\"template\":{\"metadata\":{\"annotations\":${compute_template_annotations}},\"spec\":{\"schedulingGates\":${compute_scheduling_gates},\"nodeSelector\":${compute_node_selector},\"containers\":[{\"name\":\"compute-agent\",\"image\":\"${COMPUTE_POD_IMAGE}\",\"resources\":${compute_resources}}]}}}}"
 
 kubectl rollout status deployment/compute-general \
     -n "${namespace}" --timeout=5m

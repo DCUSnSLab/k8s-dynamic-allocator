@@ -14,6 +14,13 @@ from config import settings
 # 정하고 (실측 6.5초), 그보다 훨씬 긴 이 값은 기록이 무한히 쌓이는 것만 막는다.
 ARRIVALS_TTL_SECONDS = 900
 
+# Queue repair and claim both walk Redis-backed ticket indexes. Keep their
+# timing summaries sparse so a saturated queue can be diagnosed without a log
+# line (or a ticket identifier) for every claim.
+QUEUE_TIMING_WINDOW_SECONDS = 30.0
+QUEUE_TIMING_SLOW_MS = 100.0
+QUEUE_TIMING_SLOW_WINDOW_MS = 500.0
+
 try:
     import redis
     from redis.exceptions import RedisError
@@ -86,7 +93,81 @@ class ComputeQueues:
         self.worker_identity = worker_identity or os.getenv("HOSTNAME", "controller-unknown")
         self._client = None
         self._client_lock = threading.Lock()
+        self._queue_timing_lock = threading.Lock()
+        self._queue_timing = {}
         self.tickets = Tickets(self)
+
+    def _record_queue_timing(
+        self,
+        compute_type: str,
+        operation: str,
+        elapsed_ms: float,
+        *,
+        examined: int = 0,
+        repair_ms: float = 0.0,
+        scan_ms: float = 0.0,
+        outcome: str = "ok",
+    ) -> None:
+        """Emit one identifier-free summary per operation and time window."""
+        now = time.monotonic()
+        with self._queue_timing_lock:
+            key = (compute_type, operation)
+            state = self._queue_timing.get(key)
+            if state is None:
+                state = {
+                    "started": now,
+                    "count": 0,
+                    "total_ms": 0.0,
+                    "max_ms": 0.0,
+                    "examined": 0,
+                    "repair_ms": 0.0,
+                    "scan_ms": 0.0,
+                    "claimed": 0,
+                    "empty": 0,
+                    "errors": 0,
+                }
+                self._queue_timing[key] = state
+            state["count"] += 1
+            state["total_ms"] += elapsed_ms
+            state["max_ms"] = max(state["max_ms"], elapsed_ms)
+            state["examined"] += examined
+            state["repair_ms"] += repair_ms
+            state["scan_ms"] += scan_ms
+            state["claimed"] += int(outcome == "claimed")
+            state["empty"] += int(outcome == "empty")
+            state["errors"] += int(outcome == "error")
+            if now - state["started"] < QUEUE_TIMING_WINDOW_SECONDS:
+                return
+            summary = state.copy()
+            del self._queue_timing[key]
+
+        level = (
+            logging.WARNING
+            if summary["max_ms"] >= QUEUE_TIMING_SLOW_MS
+            or summary["total_ms"] >= QUEUE_TIMING_SLOW_WINDOW_MS
+            or summary["errors"]
+            else logging.DEBUG
+        )
+        logger.log(
+            level,
+            "[QueueTiming] compute_type=%s operation=%s window_s=%.1f "
+            "calls=%s total_ms=%.1f "
+            "avg_ms=%.1f max_ms=%.1f examined=%s repair_ms=%.1f "
+            "scan_ms=%.1f claimed=%s empty=%s errors=%s",
+            compute_type,
+            operation,
+            now - summary["started"],
+            summary["count"],
+            summary["total_ms"],
+            summary["total_ms"] / summary["count"],
+            summary["max_ms"],
+            summary["examined"],
+            summary["repair_ms"],
+            summary["scan_ms"],
+            summary["claimed"],
+            summary["empty"],
+            summary["errors"],
+        )
 
     def normalize_compute_type(self, compute_type: Optional[str]) -> str:
         value = (compute_type or self.default_compute_type).strip().lower()
@@ -380,14 +461,23 @@ class ComputeQueues:
         on every reconcile, so the repair would double the write load for nothing.
         """
         compute_type_value = self.normalize_compute_type(compute_type)
-        waiting = 0
-        for ticket_id in self._queue_ids(compute_type_value):
-            ticket = self.tickets.get_ticket_raw(ticket_id)
-            if not ticket:
-                continue
-            if str(ticket.get("status") or "").lower() == "queued":
-                waiting += 1
-        return waiting
+        ticket_ids = self._queue_ids(compute_type_value)
+        if not ticket_ids:
+            return 0
+
+        # Only the status field is needed. Pipeline the reads so a large queue
+        # costs one Redis round trip instead of one round trip per ticket.
+        client = self._redis_client()
+        try:
+            with client.pipeline(transaction=False) as pipe:
+                for ticket_id in ticket_ids:
+                    pipe.hget(self._ticket_key(ticket_id), "status")
+                statuses = pipe.execute()
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to read queued ticket statuses for {compute_type_value}: {exc}"
+            ) from exc
+        return sum(str(status or "").lower() == "queued" for status in statuses)
 
     def compute_types_with_queued_tickets(self) -> List[str]:
         queued_types = []
@@ -479,8 +569,12 @@ class ComputeQueues:
         client = self._redis_client()
         queue_key = self._queue_key(compute_type)
         active_key = self._active_key(compute_type)
+        started = time.perf_counter()
+        active_count = 0
+        outcome = "error"
         try:
             active_ids = list(client.smembers(active_key))
+            active_count = len(active_ids)
             for ticket_id in active_ids:
                 raw = client.hgetall(self._ticket_key(ticket_id))
                 if not raw:
@@ -501,8 +595,17 @@ class ComputeQueues:
                 else:
                     client.srem(active_key, ticket_id)
                     client.zrem(queue_key, ticket_id)
+            outcome = "ok"
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to repair queue state for {compute_type}: {exc}") from exc
+        finally:
+            self._record_queue_timing(
+                compute_type,
+                "repair",
+                (time.perf_counter() - started) * 1000.0,
+                examined=active_count,
+                outcome=outcome,
+            )
 
     def list_waiting_users(
         self,
@@ -919,12 +1022,18 @@ class ComputeQueues:
         return stale
 
     def claim_next_ticket(self, compute_type: str, worker_id: Optional[str] = None) -> Optional[Dict[str, object]]:
+        started = time.perf_counter()
         compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()
         worker_name = worker_id or self.worker_identity
+        repair_started = time.perf_counter()
         self._repair_queue_membership(compute_type_value)
+        repair_ms = (time.perf_counter() - repair_started) * 1000.0
 
+        scan_started = time.perf_counter()
+        examined = 0
         for ticket_id in self._queue_ids(compute_type_value):
+            examined += 1
             ticket = self.tickets.get_ticket(ticket_id)
             if not ticket:
                 self._remove_ticket_from_queue(compute_type_value, ticket_id)
@@ -972,8 +1081,28 @@ class ComputeQueues:
                 continue
             ticket["claim_token"] = claim_token
             ticket["claimed_by"] = worker_name
+            finished = time.perf_counter()
+            self._record_queue_timing(
+                compute_type_value,
+                "claim",
+                (finished - started) * 1000.0,
+                examined=examined,
+                repair_ms=repair_ms,
+                scan_ms=(finished - scan_started) * 1000.0,
+                outcome="claimed",
+            )
             return ticket
 
+        finished = time.perf_counter()
+        self._record_queue_timing(
+            compute_type_value,
+            "claim",
+            (finished - started) * 1000.0,
+            examined=examined,
+            repair_ms=repair_ms,
+            scan_ms=(finished - scan_started) * 1000.0,
+            outcome="empty",
+        )
         return None
 
     def _remove_ticket_from_queue(self, compute_type: str, ticket_id: str) -> None:

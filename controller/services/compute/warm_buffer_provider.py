@@ -10,6 +10,7 @@ import glob
 import logging
 import os
 import yaml
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from kubernetes import client
@@ -62,6 +63,9 @@ class WarmBufferProvider(KubernetesClient):
     ANNOTATION_BUFFER_CAPACITY = BUFFER_CAPACITY_ANNOTATION
     ANNOTATION_ALLOCATION_TICKET = "k8s-dynamic-allocator/allocation-ticket-id"
     ANNOTATION_ALLOCATION_CLAIM = "k8s-dynamic-allocator/allocation-claim-token"
+    SCHEDULING_GATE = "k8s-dynamic-allocator/warm-slot"
+    ANNOTATION_WARM_SLOT_RELEASED_AT = "k8s-dynamic-allocator/warm-slot-released-at"
+    ANNOTATION_POD_DELETION_COST = "controller.kubernetes.io/pod-deletion-cost"
 
     _cached_owner_ref = None
     _owner_ref_resolved = False
@@ -114,6 +118,20 @@ class WarmBufferProvider(KubernetesClient):
             .get("metadata", {})
             .get("labels", {})
         )
+        template_annotations = (
+            spec.get("spec", {})
+            .get("template", {})
+            .get("metadata", {})
+            .get("annotations", {})
+        )
+        scheduling_gates = (
+            spec.get("spec", {})
+            .get("template", {})
+            .get("spec", {})
+            .get("schedulingGates", [])
+        )
+        strategy = spec.get("spec", {}).get("strategy", {})
+        rolling_update = strategy.get("rollingUpdate", {})
 
         selector_app = selector_labels.get(self.LABEL_APP)
         template_app = template_labels.get(self.LABEL_APP)
@@ -168,6 +186,20 @@ class WarmBufferProvider(KubernetesClient):
                 "Every compute manifest must define assigned-user in "
                 "spec.template.metadata.labels"
             )
+
+        if scheduling_gates != [{"name": self.SCHEDULING_GATE}]:
+            raise ValueError("Compute manifest must create Pods with the warm-slot scheduling gate")
+        if (
+            template_annotations.get(self.ANNOTATION_WARM_SLOT_RELEASED_AT) != ""
+            or str(template_annotations.get(self.ANNOTATION_POD_DELETION_COST)) != "-100"
+        ):
+            raise ValueError("Gated Pod template must initialize release time and deletion cost")
+        if (
+            strategy.get("type") != "RollingUpdate"
+            or str(rolling_update.get("maxSurge")) != "0"
+            or str(rolling_update.get("maxUnavailable")) != "1"
+        ):
+            raise ValueError("Gated Pod rollout requires maxSurge=0 and maxUnavailable=1")
 
         self._parse_policy_values(annotations)
         return template_compute_type
@@ -533,14 +565,31 @@ class WarmBufferProvider(KubernetesClient):
         buffer_assigned = 0
         terminating = 0
         ready_available = 0
+        ungated_available = 0
+        ungated_not_ready = 0
+        schedulable_not_ready = 0
+        oldest_schedulable_not_ready_since = None
+        newest_schedulable_not_ready_since = None
+        unowned_available = 0
         assigned_with_replicaset_owner = 0
         available_candidates = []
+        gated_available_candidates = []
         pod_items = []
 
         for pod in pods.items:
             metadata = getattr(pod, "metadata", None)
             status = getattr(pod, "status", None)
             labels = getattr(metadata, "labels", None) or {}
+            annotations = getattr(metadata, "annotations", None) or {}
+            gates = getattr(getattr(pod, "spec", None), "scheduling_gates", None) or []
+            gate_index = next(
+                (
+                    index for index, gate in enumerate(gates)
+                    if getattr(gate, "name", None) == self.SCHEDULING_GATE
+                ),
+                None,
+            )
+            replicaset_owned = self._has_controller_owner(pod, "ReplicaSet")
             buffer_status = labels.get(self.LABEL_STATUS)
             deletion_timestamp = getattr(metadata, "deletion_timestamp", None)
             counted = (
@@ -553,16 +602,66 @@ class WarmBufferProvider(KubernetesClient):
             elif buffer_status == self.STATUS_AVAILABLE:
                 buffer_available += 1
                 buffer_total += 1
+                if gate_index is None:
+                    ungated_available += 1
+                if not replicaset_owned:
+                    unowned_available += 1
             elif buffer_status == self.STATUS_ASSIGNED:
                 buffer_assigned += 1
                 buffer_total += 1
-                if self._has_controller_owner(pod, "ReplicaSet"):
+                if replicaset_owned:
                     assigned_with_replicaset_owner += 1
 
             ready = self._pod_is_ready(pod)
+            if counted and buffer_status == self.STATUS_AVAILABLE:
+                if gate_index is not None and replicaset_owned:
+                    gated_available_candidates.append(
+                        {
+                            "name": getattr(metadata, "name", "") or "",
+                            "resource_version": getattr(
+                                metadata, "resource_version", None
+                            ) or "",
+                            "annotations": dict(annotations),
+                            "gate_index": gate_index,
+                            "creation_timestamp": getattr(
+                                metadata, "creation_timestamp", None
+                            ),
+                        }
+                    )
+                elif gate_index is None and not ready:
+                    ungated_not_ready += 1
+                if not gates and not ready and replicaset_owned:
+                    schedulable_not_ready += 1
+                    since = annotations.get(self.ANNOTATION_WARM_SLOT_RELEASED_AT)
+                    if since:
+                        try:
+                            since = datetime.fromisoformat(str(since).replace("Z", "+00:00"))
+                        except ValueError:
+                            since = None
+                    if not since:
+                        since = getattr(metadata, "creation_timestamp", None)
+                    if isinstance(since, str):
+                        try:
+                            since = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                        except ValueError:
+                            since = None
+                    if isinstance(since, datetime):
+                        if since.tzinfo is None:
+                            since = since.replace(tzinfo=timezone.utc)
+                        if (
+                            oldest_schedulable_not_ready_since is None
+                            or since < oldest_schedulable_not_ready_since
+                        ):
+                            oldest_schedulable_not_ready_since = since
+                        if (
+                            newest_schedulable_not_ready_since is None
+                            or since > newest_schedulable_not_ready_since
+                        ):
+                            newest_schedulable_not_ready_since = since
             if (
                 counted
                 and buffer_status == self.STATUS_AVAILABLE
+                and not gates
                 and ready
                 and getattr(status, "pod_ip", None)
             ):
@@ -585,7 +684,6 @@ class WarmBufferProvider(KubernetesClient):
                     }
                 )
 
-            annotations = getattr(metadata, "annotations", None) or {}
             pod_items.append(
                 {
                     "name": getattr(metadata, "name", "") or "",
@@ -594,11 +692,22 @@ class WarmBufferProvider(KubernetesClient):
                     "buffer_status": buffer_status or "unknown",
                     "assigned_user": labels.get(self.LABEL_USER, ""),
                     "ready": ready,
+                    "scheduling_gated": gate_index is not None,
+                    "gate_index": gate_index,
+                    "resource_version": getattr(
+                        metadata, "resource_version", None
+                    ) or "",
+                    "creation_timestamp": getattr(
+                        metadata, "creation_timestamp", None
+                    ),
+                    "gate_released_at": annotations.get(
+                        self.ANNOTATION_WARM_SLOT_RELEASED_AT, ""
+                    ),
                     "not_ready_since": self._pod_not_ready_since(pod),
                     "ip": getattr(status, "pod_ip", None),
                     "terminating": deletion_timestamp is not None,
                     "counted_in_buffer_total": counted,
-                    "replicaset_owned": self._has_controller_owner(pod, "ReplicaSet"),
+                    "replicaset_owned": replicaset_owned,
                     "allocation_ticket_id": annotations.get(
                         self.ANNOTATION_ALLOCATION_TICKET,
                         "",
@@ -616,16 +725,29 @@ class WarmBufferProvider(KubernetesClient):
                 item.get("name") or "",
             )
         )
+        gated_available_candidates.sort(
+            key=lambda item: (
+                str(item.get("creation_timestamp") or ""),
+                item.get("name") or "",
+            )
+        )
         return {
             "compute_type": (compute_type or "").strip().lower(),
             "buffer_total": buffer_total,
             "buffer_available": buffer_available,
             "buffer_assigned": buffer_assigned,
             "ready_available": ready_available,
+            "ungated_available": ungated_available,
+            "ungated_not_ready": ungated_not_ready,
+            "schedulable_not_ready": schedulable_not_ready,
+            "oldest_schedulable_not_ready_since": oldest_schedulable_not_ready_since,
+            "newest_schedulable_not_ready_since": newest_schedulable_not_ready_since,
+            "unowned_available": unowned_available,
             "terminating": terminating,
             "physical_total": len(pods.items),
             "assigned_with_replicaset_owner": assigned_with_replicaset_owner,
             "available_candidates": available_candidates,
+            "gated_available_candidates": gated_available_candidates,
             "pods": pod_items,
         }
 
@@ -713,6 +835,90 @@ class WarmBufferProvider(KubernetesClient):
         except ApiException as exc:
             # 409/422 는 test 가 틀렸다는 뜻이다 - 그사이 누군가 바꿨다.
             if exc.status in (409, 422):
+                return False
+            raise
+        return True
+
+    def release_pod_scheduling_gate(
+        self,
+        pod_name: str,
+        expected_resource_version: str,
+        gate_index: int,
+    ) -> bool:
+        """Admit one available Pod with a resource-version guarded JSON Patch.
+
+        The template gives gated Pods empty timestamp and low deletion-cost
+        annotations. Replace only those leaves in the same atomic patch that
+        removes our scheduling gate; other gates and annotations stay untouched.
+        A conflicting or disappeared Pod is retried from a fresh snapshot by
+        the caller.
+        """
+        if (
+            not pod_name
+            or not expected_resource_version
+            or not isinstance(gate_index, int)
+            or gate_index < 0
+        ):
+            return False
+
+        released_at = datetime.now(timezone.utc).isoformat()
+        patch = [
+            {
+                "op": "test",
+                "path": "/metadata/resourceVersion",
+                "value": expected_resource_version,
+            },
+            {
+                "op": "test",
+                "path": "/metadata/labels/app",
+                "value": self.APP_COMPUTE_POD,
+            },
+            {
+                "op": "test",
+                "path": "/metadata/labels/compute-status",
+                "value": self.STATUS_AVAILABLE,
+            },
+            {
+                "op": "test",
+                "path": f"/spec/schedulingGates/{gate_index}/name",
+                "value": self.SCHEDULING_GATE,
+            },
+            {
+                "op": "test",
+                "path": "/metadata/annotations/k8s-dynamic-allocator~1warm-slot-released-at",
+                "value": "",
+            },
+            {
+                "op": "test",
+                "path": "/metadata/annotations/controller.kubernetes.io~1pod-deletion-cost",
+                "value": "-100",
+            },
+            {
+                "op": "replace",
+                "path": "/metadata/annotations/k8s-dynamic-allocator~1warm-slot-released-at",
+                "value": released_at,
+            },
+            {
+                "op": "replace",
+                "path": "/metadata/annotations/controller.kubernetes.io~1pod-deletion-cost",
+                "value": "100",
+            },
+            {"op": "remove", "path": f"/spec/schedulingGates/{gate_index}"},
+        ]
+        try:
+            self.v1.api_client.call_api(
+                "/api/v1/namespaces/{namespace}/pods/{name}",
+                "PATCH",
+                path_params={"namespace": self.namespace, "name": pod_name},
+                body=patch,
+                header_params={"Content-Type": "application/json-patch+json"},
+                auth_settings=["BearerToken"],
+                _return_http_data_only=True,
+                _preload_content=True,
+                _request_timeout=self.api_request_timeout,
+            )
+        except ApiException as exc:
+            if exc.status in (404, 409, 422):
                 return False
             raise
         return True
