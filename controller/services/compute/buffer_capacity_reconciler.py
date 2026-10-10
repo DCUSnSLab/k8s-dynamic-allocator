@@ -3,7 +3,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from config import settings
 
@@ -115,6 +115,10 @@ class BufferCapacityReconciler:
             ),
         )
 
+        self.policy_ready_ttl_seconds = max(
+            1.0, float(settings.BUFFER_POLICY_READY_TTL_SECONDS)
+        )
+
         self._condition = threading.Condition()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -129,6 +133,23 @@ class BufferCapacityReconciler:
         self._policy_ready_token = ""
         self._policy_ready = False
         self._last_policy_sync_succeeded = False
+        # 깃발 게시·해제·갱신은 reconcile 스레드와 갱신 타이머 두 곳에서 일어난다.
+        # 상태 전이와 Redis 쓰기를 한 단위로 묶어야, 늦게 끝난 갱신 실패가 방금
+        # 게시한 깃발의 로컬 상태를 지우는 일이 없다.
+        self._policy_ready_lock = threading.Lock()
+        self._policy_ready_renewed_at: Optional[float] = None
+        self._renewer_generation = 0
+        # Deployment 이름별 (compute-type 라벨, R, N). replicas·status 만 바뀐
+        # 이벤트로 정책 새로고침을 하지 않기 위한 비교 기준이다.
+        self._policy_fingerprints: Dict[str, Tuple[str, ...]] = {}
+        # 깃발 게시를 막는 두 경우만 남긴다. (1) 리더가 된 뒤 첫 게시는 그 바퀴의
+        # reconcile 이 재시도 없이 끝나야 한다 - 이전 리더가 남긴 상태를 한 번은
+        # 정리하고 연다. (2) 축소 뒤 ReplicaSet 삭제를 관측하지 못한 타입은 그
+        # 타입의 reconcile 이 재시도 없이 끝날 때까지 막는다. 둘 다 아닌 reconcile
+        # 실패는 깃발에 영향을 주지 않는다.
+        self._initial_publish_pending = True
+        # 타입 -> 축소 PATCH 로 보낸 replicas.
+        self._policy_ready_holds: Dict[str, int] = {}
         self._leadership_validator: Callable[[], bool] = lambda: True
         self._status_lock = threading.Lock()
         self._status: Dict[str, Dict] = {}
@@ -575,16 +596,23 @@ class BufferCapacityReconciler:
                     )
                     self._restart_thread.start()
                 return
-            self._policy_ready_token = uuid.uuid4().hex
-            self._policy_ready = False
+            with self._policy_ready_lock:
+                self._policy_ready_token = uuid.uuid4().hex
+                self._policy_ready = False
+                self._policy_ready_renewed_at = None
+                try:
+                    self.queues.clear_buffer_policy_ready()
+                except QueueUnavailableError as exc:
+                    logger.warning(
+                        "[Warning] operation=buffer_policy_ready_invalidate reason=%r",
+                        str(exc),
+                    )
             self._last_policy_sync_succeeded = False
-            try:
-                self.queues.clear_buffer_policy_ready()
-            except QueueUnavailableError as exc:
-                logger.warning(
-                    "[Warning] operation=buffer_policy_ready_invalidate reason=%r",
-                    str(exc),
-                )
+            # 새 리더는 이전 리더가 본 Deployment 를 모른다. 비워 두면 처음 오는
+            # 이벤트(감시 재시작의 SYNC 포함)가 전부 새로고침을 일으킨다.
+            self._policy_fingerprints.clear()
+            self._initial_publish_pending = True
+            self._policy_ready_holds.clear()
             self._stop_event.clear()
             self._policy_refresh_pending = True
             self._next_run_at = time.monotonic()
@@ -594,6 +622,16 @@ class BufferCapacityReconciler:
                 daemon=True,
             )
             self._thread.start()
+            # 이전 갱신 타이머가 아직 깨어나지 않았어도 세대가 바뀌면 스스로 끝난다.
+            # Event 만으로 끝내면 stop 직후 start 가 clear 한 사이에 옛 타이머가
+            # 남거나, 반대로 새 타이머를 띄우지 못하는 경우가 생긴다.
+            self._renewer_generation += 1
+            threading.Thread(
+                target=self._run_policy_ready_renewer,
+                args=(self._renewer_generation,),
+                name="buffer-policy-ready-renewer",
+                daemon=True,
+            ).start()
             self._condition.notify_all()
         logger.info("[BufferCapacityReconcilerStarted]")
 
@@ -617,16 +655,7 @@ class BufferCapacityReconciler:
         with self._condition:
             if self._thread is thread and (not thread or not thread.is_alive()):
                 self._thread = None
-        token = self._policy_ready_token
-        if token:
-            try:
-                self.queues.clear_buffer_policy_ready(token)
-            except QueueUnavailableError as exc:
-                logger.warning(
-                    "[Warning] operation=buffer_policy_ready_clear reason=%r",
-                    str(exc),
-                )
-        self._policy_ready = False
+        self._clear_policy_ready_best_effort("stopped")
         logger.info("[BufferCapacityReconcilerStopped]")
 
     def on_buffer_event(self, event_type: str, pod, source: str = "watch") -> None:
@@ -689,7 +718,7 @@ class BufferCapacityReconciler:
         deployment,
         source: str = "watch",
     ) -> None:
-        del event_type, source
+        del source
         if not self._has_write_authority() or self._stop_event.is_set():
             return
         metadata = getattr(deployment, "metadata", None)
@@ -698,7 +727,55 @@ class BufferCapacityReconciler:
             labels.get(self.provider.LABEL_COMPUTE_TYPE)
         )
         self.request_reconcile(compute_type)
-        self.request_policy_refresh()
+        if self._policy_inputs_changed(event_type, deployment):
+            self.request_policy_refresh()
+
+    def _policy_inputs_changed(self, event_type: str, deployment) -> bool:
+        """이 이벤트가 정책 새로고침을 해야 하는지 판단한다.
+
+        replicas 를 바꿀 때마다 Deployment MODIFIED 가 온다. 예전에는 그때마다
+        새로고침을 했고, 새로고침 바퀴의 reconcile 이 락 경합으로 미뤄지면 정책
+        깃발이 내려가 모든 할당이 멈췄다(10/11 계측: 포화 구간의 약 3분의 1).
+        generation 으로 거르면 안 된다 - replicas 변경도 spec 변경이라 오른다.
+
+        sync_policies 가 읽는 입력은 Deployment 의 존재, compute-type 라벨,
+        R/N 어노테이션, 그리고 유효성 판정에 쓰는 selector·템플릿 라벨이다.
+        그래서 MODIFIED 가 아닌 이벤트(ADDED, DELETED, 감시 재시작의 SYNC)와
+        처음 보는 Deployment 는 무조건 새로고침하고, MODIFIED 는 그 값들이
+        바뀌었을 때만 한다. 놓치더라도 주기 resync 가 정책을 다시 읽는다.
+        """
+        metadata = getattr(deployment, "metadata", None)
+        name = getattr(metadata, "name", None) or ""
+        labels = getattr(metadata, "labels", None) or {}
+        annotations = getattr(metadata, "annotations", None) or {}
+        spec = getattr(deployment, "spec", None)
+        selector = getattr(getattr(spec, "selector", None), "match_labels", None) or {}
+        template_labels = (
+            getattr(
+                getattr(getattr(spec, "template", None), "metadata", None),
+                "labels",
+                None,
+            )
+            or {}
+        )
+        # parse_deployment_policy 는 selector 와 템플릿 라벨로 정책의 유효성도
+        # 판정한다. 그것이 바뀌면 정책이 무효가 되거나 다시 유효해진다.
+        fingerprint = (
+            str(labels.get(self.provider.LABEL_COMPUTE_TYPE) or ""),
+            str(annotations.get(self.provider.ANNOTATION_BUFFER_RESERVE) or ""),
+            str(annotations.get(self.provider.ANNOTATION_BUFFER_CAPACITY) or ""),
+            repr(sorted((str(k), str(v)) for k, v in dict(selector).items())),
+            repr(sorted((str(k), str(v)) for k, v in dict(template_labels).items())),
+        )
+        with self._condition:
+            if event_type == "DELETED":
+                self._policy_fingerprints.pop(name, None)
+                return True
+            previous = self._policy_fingerprints.get(name)
+            self._policy_fingerprints[name] = fingerprint
+        if event_type != "MODIFIED" or not name:
+            return True
+        return previous != fingerprint
 
     def request_reconcile(self, compute_type: str, *, retry: bool = False) -> None:
         compute_type_value = self.queues.normalize_compute_type(compute_type)
@@ -760,15 +837,21 @@ class BufferCapacityReconciler:
     def _run(self) -> None:
         next_resync_at = time.monotonic()
         next_demand_poll_at = time.monotonic()
-        next_ready_renew_at = float("inf")
+        had_authority = True
         try:
             while not self._stop_event.is_set():
                 if not self._has_write_authority():
-                    self._clear_policy_ready_best_effort()
+                    self._clear_policy_ready_best_effort("leadership_lost")
+                    had_authority = False
                     self._stop_event.wait(1.0)
                     continue
+                if not had_authority:
+                    # 리더 유효성이 잠깐 끊겼다 돌아오면 stop/start 콜백 없이
+                    # 이어진다. 깃발은 새로고침 바퀴에서만 다시 게시되므로 여기서
+                    # 바로 예약하지 않으면 주기 resync(60초)까지 할당이 멈춘다.
+                    had_authority = True
+                    self.request_policy_refresh()
                 refresh_policies = False
-                renew_policy_ready = False
                 demand_poll_due = False
                 compute_types: Set[str] = set()
 
@@ -780,7 +863,6 @@ class BufferCapacityReconciler:
                             due_at = min(due_at, self._next_run_at)
                         if self.dynamic_reserve and self._known_policy_types:
                             due_at = min(due_at, next_demand_poll_at)
-                        due_at = min(due_at, next_ready_renew_at)
                         if now >= due_at:
                             break
                         self._condition.wait(timeout=max(0.0, due_at - now))
@@ -811,9 +893,6 @@ class BufferCapacityReconciler:
                     )
                     if demand_poll_due:
                         next_demand_poll_at = now + 1.0
-                    renew_policy_ready = (
-                        self._policy_ready and now >= next_ready_renew_at
-                    )
 
                 ready_candidate_types: Set[str] = set()
                 publish_policy_ready = False
@@ -828,15 +907,13 @@ class BufferCapacityReconciler:
                 if refresh_policies:
                     ready_candidate_types = self.sync_policies()
                     compute_types.update(ready_candidate_types)
-                    renew_policy_ready = False
                     publish_policy_ready = (
                         self._last_policy_sync_succeeded
                         and not self._stop_event.is_set()
                         and self._has_write_authority()
                     )
                     if not publish_policy_ready:
-                        self._clear_policy_ready_best_effort()
-                        next_ready_renew_at = float("inf")
+                        self._clear_policy_ready_best_effort("policy_sync_failed")
                         self.request_policy_refresh(retry=True)
 
                 if demand_poll_due:
@@ -845,34 +922,10 @@ class BufferCapacityReconciler:
                     # is occupied by mounts. Reconcile only changed demand.
                     compute_types.update(self._poll_demand_changes())
 
-                if renew_policy_ready and self._policy_ready:
-                    if (
-                        self._stop_event.is_set()
-                        or not self._has_write_authority()
-                    ):
-                        self._clear_policy_ready_best_effort()
-                        next_ready_renew_at = float("inf")
-                        continue
-                    try:
-                        renewed = self.queues.renew_buffer_policy_ready(
-                            self._policy_ready_token
-                        )
-                    except QueueUnavailableError as exc:
-                        renewed = False
-                        logger.warning(
-                            "[Warning] operation=buffer_policy_ready_renew reason=%r",
-                            str(exc),
-                        )
-                    if renewed:
-                        next_ready_renew_at = (
-                            time.monotonic() + self.policy_ready_renew_seconds
-                        )
-                    else:
-                        self._policy_ready = False
-                        next_ready_renew_at = float("inf")
-                        self.request_policy_refresh()
-
-                ready_reconcile_failed = False
+                # 깃발 갱신은 _run_policy_ready_renewer 가 따로 한다. 여기서 하면
+                # 한 바퀴가 TTL 보다 길어질 때(10/11 계측: 최대 17초) 갱신이
+                # 빠져 깃발이 만료되고 할당이 멈춘다.
+                initial_reconcile_failed = False
                 for compute_type in sorted(compute_types):
                     if (
                         self._stop_event.is_set()
@@ -898,47 +951,69 @@ class BufferCapacityReconciler:
                         reconcile_ms=(reconciled_at - pass_started) * 1000,
                         gate_ms=(time.monotonic() - reconciled_at) * 1000,
                     )
+                    # reconcile 의 결과(미뤄짐이든 오류든)는 reconcile 재시도만
+                    # 일으키고 정책 깃발에는 손대지 않는다. 깃발은 할당의 1번
+                    # 관문이라, 내리면 두 복제본의 모든 티켓이 policy_not_ready 로
+                    # 돌아간다. 그런데 reconcile 실패는 대부분 일시적이다 - 락
+                    # 경합(allocator_lock_timeout), 아직 안 끝난 확대·축소, API
+                    # timeout. 10/11 계측에서 이 경로로 포화 구간의 약 3분의 1 동안
+                    # 할당이 멈췄다. 깃발이 지켜야 하는 것은 "정책이 동기화됐다" 뿐이고
+                    # 그것은 sync_policies 의 성공 여부가 판정한다. N 은 할당이 락
+                    # 안에서 N - assigned 를 다시 세고 게이트 예산이 노드 위 파드를
+                    # 묶으므로, reconcile 이 늦어도 넘지 않는다.
+                    # 예외는 __init__ 의 _initial_publish_pending / _policy_ready_holds
+                    # 두 가지뿐이다.
                     if result.get("retry"):
                         self.request_reconcile(compute_type, retry=True)
-                        if compute_type in ready_candidate_types:
-                            ready_reconcile_failed = True
-                    elif not gates_reconciled:
+                        if (
+                            self._initial_publish_pending
+                            and compute_type in ready_candidate_types
+                        ):
+                            initial_reconcile_failed = True
+                        continue
+
+                    with self._condition:
+                        hold_target = self._policy_ready_holds.get(compute_type)
+                    if hold_target is not None and self._scale_down_hold_resolved(
+                        compute_type, hold_target
+                    ):
+                        with self._condition:
+                            self._policy_ready_holds.pop(compute_type, None)
+                        self.request_policy_refresh()
+                    elif self._initial_publish_pending and not refresh_policies:
+                        # 첫 게시가 막혀 백오프(최대 60초) 중이어도, 깨끗한 바퀴가
+                        # 나오면 그 백오프를 기다리지 않고 바로 다시 게시를 시도한다.
+                        self.request_policy_refresh()
+                    if not gates_reconciled:
                         # Pod creation, ReplicaSet deletion and gate CAS
                         # conflicts commonly resolve without another event.
-                        #
-                        # 여기서 ready_reconcile_failed 를 세우면 안 된다. 그 깃발은
-                        # buffer_policy_ready 를 내리고, 그것은 할당의 1번 관문이라
-                        # 모든 복제본이 모든 티켓을 policy_not_ready 로 되돌린다.
-                        # 그런데 게이트 해제의 False 는 일상적·일시적 조건이다 -
-                        # 가장 흔한 것이 "ReplicaSet 이 아직 게이트 파드를 만들지
-                        # 않았다"(candidates 가 빔)이고, 포화에서는 반납->backfill
-                        # 주기마다 그 창이 열린다. 게이트 해제는 공급 쪽 최적화이고
-                        # 정책 유효성이 아니므로 같은 변수로 묶으면 심각도가 뒤집힌다.
-                        # 못 푼 게이트는 아래 1초 재시도가 가져간다.
+                        # 못 푼 게이트는 이 1초 재시도가 가져간다.
                         self._schedule_after(1.0, compute_type)
                     else:
                         with self._condition:
                             self._retry_counts.pop(compute_type, None)
 
                 if publish_policy_ready:
+                    with self._condition:
+                        held = bool(self._policy_ready_holds)
+                    blocked_reason = None
                     if (
-                        ready_reconcile_failed
-                        or self._stop_event.is_set()
+                        self._stop_event.is_set()
                         or not self._has_write_authority()
                     ):
-                        self._clear_policy_ready_best_effort()
-                        next_ready_renew_at = float("inf")
+                        blocked_reason = "leadership_lost"
+                    elif initial_reconcile_failed:
+                        blocked_reason = "initial_reconcile_pending"
+                    elif held:
+                        blocked_reason = "scale_down_unobserved"
+                    if blocked_reason:
+                        self._clear_policy_ready_best_effort(blocked_reason)
                         self.request_policy_refresh(retry=True)
                     else:
                         try:
-                            self.queues.publish_buffer_policy_ready(
-                                self._policy_ready_token
-                            )
-                            self._policy_ready = True
-                            next_ready_renew_at = (
-                                time.monotonic()
-                                + self.policy_ready_renew_seconds
-                            )
+                            if not self._publish_policy_ready("policy_synced"):
+                                continue
+                            self._initial_publish_pending = False
                             self._policy_retry_count = 0
                             if self.on_capacity_available is not None:
                                 for compute_type in sorted(
@@ -956,8 +1031,8 @@ class BufferCapacityReconciler:
                                             str(exc),
                                         )
                         except QueueUnavailableError as exc:
-                            self._policy_ready = False
-                            next_ready_renew_at = float("inf")
+                            with self._policy_ready_lock:
+                                self._policy_ready = False
                             logger.warning(
                                 "[Warning] operation=buffer_policy_ready_publish "
                                 "reason=%r",
@@ -970,7 +1045,7 @@ class BufferCapacityReconciler:
                 str(exc),
             )
         finally:
-            self._clear_policy_ready_best_effort()
+            self._clear_policy_ready_best_effort("reconciler_exit")
             with self._condition:
                 if self._thread is threading.current_thread():
                     self._thread = None
@@ -1395,18 +1470,149 @@ class BufferCapacityReconciler:
                         str(exc),
                     )
 
-    def _clear_policy_ready_best_effort(self) -> None:
-        token = self._policy_ready_token
-        self._policy_ready = False
-        if not token:
+    def _publish_policy_ready(self, reason: str) -> bool:
+        """깃발을 게시한다. 실패하면 QueueUnavailableError 를 그대로 올린다.
+
+        권한 검사와 게시 사이에 리더를 잃었으면 게시하지 않고 False 를 돌려준다.
+        """
+        with self._policy_ready_lock:
+            if self._stop_event.is_set() or not self._has_write_authority():
+                return False
+            was_ready = self._policy_ready
+            self.queues.publish_buffer_policy_ready(self._policy_ready_token)
+            self._policy_ready = True
+            self._policy_ready_renewed_at = time.monotonic()
+        if not was_ready:
+            # 깃발이 없던 시간을 run 로그에서 구간으로 재려고 ms 시각을 싣는다.
+            logger.info(
+                "[BufferPolicyReadyPublished] at_ms=%d reason=%s",
+                int(time.time() * 1000),
+                reason,
+            )
+        return True
+
+    def _clear_policy_ready_best_effort(self, reason: str = "-") -> None:
+        with self._policy_ready_lock:
+            token = self._policy_ready_token
+            was_ready = self._policy_ready
+            self._policy_ready = False
+            self._policy_ready_renewed_at = None
+            if token:
+                try:
+                    self.queues.clear_buffer_policy_ready(token)
+                except QueueUnavailableError as exc:
+                    logger.warning(
+                        "[Warning] operation=buffer_policy_ready_clear reason=%r",
+                        str(exc),
+                    )
+        if was_ready:
+            logger.info(
+                "[BufferPolicyReadyCleared] at_ms=%d reason=%s",
+                int(time.time() * 1000),
+                reason,
+            )
+
+    def _renew_policy_ready_once(self) -> None:
+        """게시된 깃발의 TTL 을 한 번 연장한다.
+
+        연장이 실패하면 키가 이미 없다는 뜻이다(TTL 만료, 또는 다른 토큰으로
+        바뀜). 그 사이 할당은 이미 policy_not_ready 로 막혔으므로, 새로고침을
+        요청해 reconcile 바퀴가 다시 게시하게 한다.
+        """
+        if self._stop_event.is_set():
             return
+        if not self._has_write_authority():
+            with self._policy_ready_lock:
+                was_ready = self._policy_ready
+            self._clear_policy_ready_best_effort("leadership_lost")
+            if was_ready:
+                # 유효성이 잠깐 끊긴 경우 _run 이 그 순간을 못 볼 수 있다. 권한이
+                # 돌아오면 바로 다시 게시하도록 새로고침을 걸어 둔다.
+                self.request_policy_refresh()
+            return
+        with self._policy_ready_lock:
+            if not self._policy_ready:
+                return
+            renewed_at = self._policy_ready_renewed_at
+            try:
+                renewed = self.queues.renew_buffer_policy_ready(
+                    self._policy_ready_token
+                )
+                reason = "expired_or_replaced"
+            except QueueUnavailableError as exc:
+                renewed = False
+                reason = "redis_error"
+                logger.warning(
+                    "[Warning] operation=buffer_policy_ready_renew reason=%r",
+                    str(exc),
+                )
+            now = time.monotonic()
+            if renewed:
+                self._policy_ready_renewed_at = now
+                return
+            if (
+                reason == "redis_error"
+                and renewed_at is not None
+                and now - renewed_at < self.policy_ready_ttl_seconds
+            ):
+                # 키는 아직 TTL 안에 살아 있을 수 있다. 여기서 로컬 상태를 버리면
+                # 이후 갱신이 멈춰 키가 정말로 만료된다. 다음 틱에 다시 시도한다.
+                return
+            self._policy_ready = False
+            self._policy_ready_renewed_at = None
+        gap_ms = (now - renewed_at) * 1000 if renewed_at is not None else -1
+        logger.warning(
+            "[BufferPolicyReadyLost] at_ms=%d reason=%s since_renew_ms=%.0f",
+            int(time.time() * 1000),
+            reason,
+            gap_ms,
+        )
+        self.request_policy_refresh()
+
+    def _scale_down_hold_resolved(self, compute_type: str, target: int) -> bool:
+        """관측 못 한 축소가 이제 끝났는지 본다.
+
+        "reconcile 이 재시도 없이 끝났다" 로 풀면 안 된다. 관측 timeout 직후의
+        바퀴는 쿨다운·pods_starting 보류처럼 재시도 없이 끝나는 경로를 타는데,
+        그때도 ReplicaSet 은 아직 옛 캐시로 고른 파드를 지울 수 있다. 그래서
+        삭제가 실제로 보일 때만 푼다. 들고 있는 파드가 보낸 목표 이하이거나,
+        이후 replicas 가 그 수 이상으로 올라가 ReplicaSet 이 더 지울 이유가 없을
+        때다. 읽기가 실패하면 보류를 유지한다(fail-closed).
+        """
         try:
-            self.queues.clear_buffer_policy_ready(token)
-        except QueueUnavailableError as exc:
+            snapshot = self.provider.list_buffer_snapshot(compute_type)
+            policy = self.queues.get_buffer_policy(compute_type)
+            current = (
+                int(self.provider.read_deployment_replicas(policy["deployment_name"]))
+                if policy
+                else int(target)
+            )
+        except Exception as exc:
             logger.warning(
-                "[Warning] operation=buffer_policy_ready_clear reason=%r",
+                "[Warning] operation=buffer_scale_down_hold_check compute_type=%s "
+                "reason=%r",
+                compute_type,
                 str(exc),
             )
+            return False
+        return self._held_available(snapshot) <= max(int(target), current)
+
+    def _run_policy_ready_renewer(self, generation: int) -> None:
+        """reconcile 바퀴와 독립된 깃발 갱신 타이머.
+
+        갱신이 reconcile 루프 안에 있으면 바퀴 하나가 TTL 을 넘길 때 깃발이
+        만료된다. 10/11 계측 run 에서 17.5초 바퀴가 실제로 있었고(TTL 15초),
+        그 직후 할당 7건이 policy_not_ready 로 막혔다. 여기서는 Redis 키 하나만
+        만지므로 allocator 락이나 Kubernetes 호출에 묶이지 않는다.
+        """
+        while (
+            not self._stop_event.wait(self.policy_ready_renew_seconds)
+            and generation == self._renewer_generation
+        ):
+            try:
+                self._renew_policy_ready_once()
+            except Exception:
+                logger.exception("[Failed] operation=buffer_policy_ready_renewer")
 
     def reconcile_type(self, compute_type: str) -> Dict:
         """Synchronously reconcile one compute type; safe to unit test directly."""
@@ -1834,6 +2040,7 @@ class BufferCapacityReconciler:
         heartbeat.start()
 
         patched = False
+        patch_attempted = False
         deletion_observed = False
         desired = int(base_result["desired_replicas"])
         try:
@@ -1991,6 +2198,9 @@ class BufferCapacityReconciler:
                             "reason": "leadership_or_gate_lost",
                             "retry": True,
                         }
+                    # 응답이 timeout 나도 서버에는 반영됐을 수 있으므로 "보냈다" 를
+                    # 먼저 적는다. 삭제를 관측하기 전에는 이것이 안전 정지의 근거다.
+                    patch_attempted = True
                     self.provider.patch_deployment_replicas(
                         policy["deployment_name"],
                         desired,
@@ -2022,8 +2232,7 @@ class BufferCapacityReconciler:
                 # from its older cache. Stop every allocator before releasing
                 # the per-type gate; the next successful policy sync and
                 # observation will publish readiness again.
-                self._clear_policy_ready_best_effort()
-                self.request_policy_refresh(retry=True)
+                # (정지 자체는 아래 finally 에서 게이트를 풀기 전에 한다.)
                 result.update(
                     {
                         "status": "deferred",
@@ -2044,6 +2253,16 @@ class BufferCapacityReconciler:
         finally:
             heartbeat_stop.set()
             heartbeat.join(timeout=max(1.0, self.gate_renew_seconds + 0.5))
+            if patch_attempted and not deletion_observed:
+                # 안전 정지 - 일시적 경합이 아니다. 축소 PATCH 를 보낸 뒤 삭제를
+                # 관측하지 못했으면(관측 timeout 이든 그 사이 예외든) 게이트를
+                # 풀기 전에 깃발을 내리고, 이 타입을 보류로 남긴다. 보류는 삭제가
+                # 실제로 관측될 때만 풀린다(reconcile 바퀴의 hold 해제 조건).
+                # reconcile 결과와 깃발을 떼어 낸 뒤 남은 두 예외 중 하나다.
+                with self._condition:
+                    self._policy_ready_holds[compute_type] = desired
+                self._clear_policy_ready_best_effort("scale_down_unobserved")
+                self.request_policy_refresh(retry=True)
             try:
                 self.queues.release_scale_down_gate(compute_type, gate_token)
             finally:
