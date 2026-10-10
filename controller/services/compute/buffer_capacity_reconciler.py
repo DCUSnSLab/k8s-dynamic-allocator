@@ -177,6 +177,12 @@ class BufferCapacityReconciler:
         # 타입 -> {파드 이름: PATCH 가 test 한 resourceVersion}. 응답을 못 받은
         # 게이트 PATCH 는 서버에 반영됐을 수 있으므로 "풀었다" 로 센다.
         self._gate_unknown: Dict[str, Dict[str, str]] = {}
+        # (타입, 파드) -> 처음 미상이 된 시각. 요청이 서버에 남아 있을 수 있는 시간은
+        # apiserver 의 요청 timeout(기본 --request-timeout 60s)이 상한이다. 그 뒤에는
+        # 서버가 요청을 끝냈으므로 더 적용될 수 없다. 그보다 오래된 미상은 정리해
+        # 예산이 영구히 새지 않게 한다(재전송이 계속 거절되는 경우 등).
+        self._gate_unknown_since: Dict[Tuple[str, str], float] = {}
+        self.gate_unknown_max_age_seconds = 60.0
         # 리더를 잠깐 잃었다 되찾은 경우(같은 프로세스)를 가리기 위한 값. 그 사이
         # 다른 복제본이 리더였을 수 없는 시간 = lease 기간 - 갱신 주기
         # (lease 는 마지막 갱신 + 기간에 만료되고, 마지막 갱신은 멈춘 시각보다 최대
@@ -686,6 +692,7 @@ class BufferCapacityReconciler:
                     self._refill_not_before = now
                 else:
                     self._gate_unknown.clear()
+                    self._gate_unknown_since.clear()
                     self._refill_not_before = now + self._leader_refill_grace_seconds()
                 self._refill_due.clear()
                 self._refill_requested_at.clear()
@@ -1326,7 +1333,17 @@ class BufferCapacityReconciler:
             return len(unknown)
         by_name = {pod.get("name"): pod for pod in pods}
         remaining = {}
+        now = time.monotonic()
         for name, version in unknown.items():
+            since = self._gate_unknown_since.get((compute_type, name), now)
+            if now - since > self.gate_unknown_max_age_seconds:
+                logger.warning(
+                    "[BufferGateUnknownExpired] compute_type=%s compute_pod=%s age_s=%.1f",
+                    compute_type,
+                    name,
+                    now - since,
+                )
+                continue
             pod = by_name.get(name)
             if pod is None or pod.get("terminating"):
                 continue
@@ -1340,6 +1357,9 @@ class BufferCapacityReconciler:
                 self._gate_unknown[compute_type] = remaining
             else:
                 self._gate_unknown.pop(compute_type, None)
+            for name in unknown:
+                if name not in remaining:
+                    self._gate_unknown_since.pop((compute_type, name), None)
         return len(remaining)
 
     def _refill_impl(
@@ -1527,6 +1547,10 @@ class BufferCapacityReconciler:
                             name, version, candidate["gate_index"]
                         )
                     except Exception:
+                        # 재전송이 실패해도(403 같은 확정 거절이라도) 첫 PATCH 는 아직
+                        # 서버에서 처리 중일 수 있으므로 미상에서 빼지 않는다. 대신
+                        # _settle_unknown_gates 가 나이 상한으로 정리해 예산이 영구히
+                        # 새지 않게 한다.
                         continue
                     if ok:
                         with self._refill_condition:
@@ -1534,6 +1558,7 @@ class BufferCapacityReconciler:
                             entry.pop(name, None)
                             if not entry:
                                 self._gate_unknown.pop(compute_type, None)
+                            self._gate_unknown_since.pop((compute_type, name), None)
                         out["released"] += 1
                         logger.info(
                             "[BufferGateReleased] compute_type=%s compute_pod=%s "
@@ -1608,6 +1633,9 @@ class BufferCapacityReconciler:
                             self._gate_unknown.setdefault(compute_type, {})[
                                 candidate["name"]
                             ] = candidate["resource_version"]
+                            self._gate_unknown_since.setdefault(
+                                (compute_type, candidate["name"]), time.monotonic()
+                            )
                         out["unknown"] += 1
                         logger.warning(
                             "[BufferGateUnknown] compute_type=%s compute_pod=%s "

@@ -294,6 +294,8 @@ def gate_reconciler(provider, queues):
     reconciler._condition = threading.Condition()
     reconciler._refill_condition = threading.Condition()
     reconciler._gate_unknown = {}
+    reconciler._gate_unknown_since = {}
+    reconciler.gate_unknown_max_age_seconds = 60.0
     reconciler._refill_not_before = 0.0
     reconciler._refill_generation = 1
     reconciler.refill_batch_limit = 4
@@ -501,6 +503,32 @@ class SchedulingGateTests(unittest.TestCase):
         self.assertEqual(provider.released, ["gated-1"])
         self.assertEqual(provider.ungated, 2)
         self.assertEqual(result["reason"], "released")
+
+    def test_unknown_that_keeps_failing_expires_after_request_timeout(self):
+        """재전송이 계속 거절돼도 apiserver 요청 timeout 뒤에는 미상을 정리한다.
+
+        그 뒤로는 첫 PATCH 가 서버에 남아 있을 수 없으므로 더 적용되지 않는다.
+        정리하지 않으면 그 파드가 지워질 때까지 예산 하나가 샌다.
+        """
+        class Rejected(Exception):
+            status = 403
+
+        queues = GateQueues(queued=0)   # 목표 = R = 2
+        provider = GateProvider(current=3, assigned=0, ungated=0, gated=3)
+        provider.fail_release["gated-0"] = TimeoutError("read timed out")
+        reconciler = gate_reconciler(provider, queues)
+        refill(reconciler)
+        provider.fail_release["gated-0"] = Rejected()
+        refill(reconciler)
+        # 아직 60초 안이다. gated-0 은 미상으로 남고 예산 하나를 잡는다.
+        self.assertIn("gated-0", reconciler._gate_unknown["general"])
+        self.assertEqual(provider.released, ["gated-1"])
+        reconciler._gate_unknown_since[("general", "gated-0")] -= 61.0
+        refill(reconciler)
+        self.assertEqual(reconciler._gate_unknown, {})
+        self.assertEqual(reconciler._gate_unknown_since, {})
+        # 정리된 자리로 하나를 더 푼다(예산 2 = gated-1 + 하나).
+        self.assertEqual(provider.ungated, 2)
 
     def test_definite_rejection_is_not_counted_as_unknown(self):
         """403 같은 확정 거절은 적용되지 않은 것이다. 미상으로 쌓여 예산이 새지 않는다."""
