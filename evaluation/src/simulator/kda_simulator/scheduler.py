@@ -22,7 +22,39 @@ def iter_schedule(config: SimulatorConfig, rng: random.Random) -> Iterator[Sched
     if config.workload.mode == "nhpp":
         yield from _iter_nhpp_schedule(config, rng)
         return
+    if config.workload.mode == "piecewise":
+        yield from _iter_piecewise_schedule(config, rng)
+        return
     raise ValueError(f"Unsupported workload mode: {config.workload.mode}")
+
+
+def _iter_piecewise_schedule(config: SimulatorConfig, rng: random.Random) -> Iterator[ScheduledRequest]:
+    """설계한 부하 모양(계단·산·파도). 계획의 각 상수 구간 안에서 포아송 도착을 만든다.
+
+    구간마다 시작점에서 다시 지수 간격을 뽑는다. 포아송 과정은 기억이 없으므로
+    구간 경계에서 끊었다 이어도 각 구간의 도착은 그 구간의 lambda 를 따른다.
+    seed 가 같으면 모든 비교군이 같은 도착을 받는다(같은 rng 순서).
+    """
+    sequence = 0
+    for piece in config.workload.piecewise_plan:
+        start = piece["start_min"] * 60.0
+        end = piece["end_min"] * 60.0
+        rate_per_second = piece["lambda_per_minute"] / 60.0
+        if rate_per_second <= 0:
+            continue
+        planned = start
+        while True:
+            planned += rng.expovariate(rate_per_second)
+            if planned >= end:
+                break
+            sequence += 1
+            yield ScheduledRequest(
+                sequence=sequence,
+                planned_offset_seconds=planned,
+                username=_assign_user(config, rng),
+            )
+            if config.workload.max_requests is not None and sequence >= config.workload.max_requests:
+                return
 
 
 def _apply_scope(config: SimulatorConfig, lambda_per_minute: float) -> float:

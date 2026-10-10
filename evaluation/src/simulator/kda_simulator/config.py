@@ -119,6 +119,15 @@ class WorkloadConfig:
     scenario: str
     lambda_per_minute: float
     nhpp_profile_per_minute: list[float] = field(default_factory=list)
+    # piecewise 모드 - 설계한 부하 모양(계단·산·파도). 실제 하루 곡선을 시간 압축하면
+    # 이미 실제 부하가 아니므로, 해석하기 쉬운 모양을 직접 정한다. 부하 단위는
+    # rho(cold 기준 슬롯 점유율)이고 lambda = rho * capacity_slots * 60 / slot_seconds.
+    # slot_seconds 는 "부하의 정의" 라 실행마다 바꾸지 않는다(시스템 상수가 아니다).
+    capacity_slots: int | None = None
+    slot_seconds: float | None = None
+    segments: list[Any] = field(default_factory=list)
+    # segments 를 펼친 계획. [{start_min, end_min, rho, lambda_per_minute}, ...]
+    piecewise_plan: list[dict[str, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -298,18 +307,47 @@ def _load_workload(data: dict[str, Any]) -> WorkloadConfig:
             "nhpp_time_compression",
             "nhpp_start_hour",
             "nhpp_rate_scale",
+            "capacity_slots",
+            "slot_seconds",
+            "segments",
         },
     )
     profile = _required_value(data, "profile", "workload")
-    mode = "nhpp" if profile == "nhpp_daily" else "constant"
+    mode = _mode_for_profile(profile)
     scenario = str(profile)
-    lambda_per_minute = _lambda_for_profile(profile)
+    plan: list[dict[str, float]] = []
+    capacity_slots = _optional_int(data.get("capacity_slots"), "workload.capacity_slots")
+    slot_seconds = _optional_float(data.get("slot_seconds"), "workload.slot_seconds")
+    segments = data.get("segments") or []
+    if mode == "piecewise":
+        if not capacity_slots or capacity_slots <= 0:
+            raise ValueError("piecewise workload needs a positive workload.capacity_slots")
+        if not slot_seconds or slot_seconds <= 0:
+            raise ValueError("piecewise workload needs a positive workload.slot_seconds")
+        plan = build_piecewise_plan(segments, capacity_slots, slot_seconds)
+        lambda_per_minute = max(item["lambda_per_minute"] for item in plan)
+    else:
+        if segments or capacity_slots is not None or slot_seconds is not None:
+            raise ValueError(
+                "workload.segments/capacity_slots/slot_seconds are only for profile: piecewise"
+            )
+        lambda_per_minute = _lambda_for_profile(profile)
+    duration_minutes = _optional_float(
+        data.get("duration_minutes"), "workload.duration_minutes"
+    )
+    if mode == "piecewise":
+        total = plan[-1]["end_min"]
+        if duration_minutes is None:
+            duration_minutes = total
+        elif abs(duration_minutes - total) > 1e-6:
+            raise ValueError(
+                f"workload.duration_minutes ({duration_minutes}) must equal the "
+                f"segments total ({total}) or be null"
+            )
     return WorkloadConfig(
         profile=profile,
         lambda_scope=str(data.get("lambda_scope") or "system"),
-        duration_minutes=_optional_float(
-            data.get("duration_minutes"), "workload.duration_minutes"
-        ),
+        duration_minutes=duration_minutes,
         max_requests=_optional_int(data.get("max_requests"), "workload.max_requests"),
         random_seed=_optional_int(data.get("random_seed"), "workload.random_seed"),
         trace_file=_optional_str(data.get("trace_file"), "workload.trace_file"),
@@ -320,7 +358,96 @@ def _load_workload(data: dict[str, Any]) -> WorkloadConfig:
         scenario=scenario,
         lambda_per_minute=lambda_per_minute,
         nhpp_profile_per_minute=list(NHPP_DAILY_PROFILE) if mode == "nhpp" else [],
+        capacity_slots=capacity_slots,
+        slot_seconds=slot_seconds,
+        segments=list(segments),
+        piecewise_plan=plan,
     )
+
+
+def _mode_for_profile(profile: Any) -> str:
+    if profile == "nhpp_daily":
+        return "nhpp"
+    if profile == "piecewise":
+        return "piecewise"
+    return "constant"
+
+
+def build_piecewise_plan(
+    segments: Any,
+    capacity_slots: int,
+    slot_seconds: float,
+) -> list[dict[str, float]]:
+    """segments 를 상수 rho 구간 목록으로 펼친다.
+
+    구간 종류:
+      {minutes: m, rho: r}                          상수
+      {minutes: m, rho_start: a, rho_end: b}        선형. 1분 단위 계단으로 나누고
+                                                    각 계단의 rho 는 그 구간 중앙값
+      {repeat: k, segments: [...]}                  안쪽 구간을 k 번 반복
+
+    lambda(/분) = rho * capacity_slots * 60 / slot_seconds.
+    """
+    if not isinstance(segments, list) or not segments:
+        raise ValueError("piecewise workload needs a non-empty workload.segments list")
+    flat: list[tuple[float, float]] = []
+
+    def walk(items: Any, where: str) -> None:
+        if not isinstance(items, list) or not items:
+            raise ValueError(f"{where} must be a non-empty list")
+        for index, item in enumerate(items):
+            label = f"{where}[{index}]"
+            if not isinstance(item, dict):
+                raise ValueError(f"{label} must be a mapping")
+            if "repeat" in item:
+                if set(item) - {"repeat", "segments"}:
+                    raise ValueError(f"{label}: repeat takes only repeat and segments")
+                times = int(item["repeat"])
+                if times <= 0:
+                    raise ValueError(f"{label}.repeat must be positive")
+                for _ in range(times):
+                    walk(item.get("segments"), f"{label}.segments")
+                continue
+            minutes = float(item.get("minutes", 0))
+            if minutes <= 0:
+                raise ValueError(f"{label}.minutes must be positive")
+            if "rho" in item:
+                if set(item) - {"minutes", "rho"}:
+                    raise ValueError(f"{label}: constant takes only minutes and rho")
+                rho = float(item["rho"])
+                if rho < 0:
+                    raise ValueError(f"{label}.rho must not be negative")
+                flat.append((minutes, rho))
+                continue
+            if "rho_start" in item and "rho_end" in item:
+                if set(item) - {"minutes", "rho_start", "rho_end"}:
+                    raise ValueError(f"{label}: linear takes minutes, rho_start, rho_end")
+                start, end = float(item["rho_start"]), float(item["rho_end"])
+                if start < 0 or end < 0:
+                    raise ValueError(f"{label}: rho must not be negative")
+                done = 0.0
+                while done < minutes - 1e-9:
+                    step = min(1.0, minutes - done)
+                    middle = done + step / 2.0
+                    flat.append((step, start + (end - start) * (middle / minutes)))
+                    done += step
+                continue
+            raise ValueError(f"{label} needs rho, rho_start/rho_end, or repeat")
+
+    walk(segments, "workload.segments")
+    plan: list[dict[str, float]] = []
+    clock = 0.0
+    for minutes, rho in flat:
+        plan.append(
+            {
+                "start_min": round(clock, 6),
+                "end_min": round(clock + minutes, 6),
+                "rho": round(rho, 6),
+                "lambda_per_minute": rho * capacity_slots * 60.0 / slot_seconds,
+            }
+        )
+        clock += minutes
+    return plan
 
 
 def _load_commands(data: dict[str, Any]) -> CommandsConfig:
@@ -434,7 +561,9 @@ def _lambda_for_profile(profile: str | float | int) -> float:
         return CONSTANT_WORKLOAD_PROFILES[str(profile)]
     if profile == "nhpp_daily":
         return CONSTANT_WORKLOAD_PROFILES["avg"]
-    choices = ", ".join([*CONSTANT_WORKLOAD_PROFILES.keys(), "nhpp_daily", "<number>"])
+    if profile == "piecewise":
+        raise ValueError("profile: piecewise is set in the YAML with its segments, not overridden")
+    choices = ", ".join([*CONSTANT_WORKLOAD_PROFILES.keys(), "nhpp_daily", "piecewise", "<number>"])
     raise ValueError(f"Unsupported workload.profile: {profile}. Choices: {choices}")
 
 
@@ -477,8 +606,13 @@ def validate_config(config: SimulatorConfig) -> None:
             0 <= config.workload.nhpp_start_hour <= 23
         ):
             raise ValueError("workload.nhpp_start_hour must be between 0 and 23 or null")
+    elif config.workload.mode == "piecewise":
+        if config.workload.lambda_scope != "system":
+            raise ValueError("piecewise workload is defined system-wide (lambda_scope: system)")
+        if not config.workload.piecewise_plan:
+            raise ValueError("piecewise workload produced an empty plan")
     else:
-        raise ValueError("workload.profile must resolve to constant or nhpp mode")
+        raise ValueError("workload.profile must resolve to constant, nhpp or piecewise mode")
     if not config.commands.items:
         raise ValueError("commands.items must contain at least one command")
     if any(item.weight <= 0 for item in config.commands.items):

@@ -136,6 +136,7 @@ def apply_overrides(config: SimulatorConfig, args: argparse.Namespace) -> None:
         profile = parse_profile_override(args.profile)
         config.workload.profile = profile
         config.workload.scenario = str(profile)
+        # piecewise 는 구간 목록과 함께 YAML 에서만 정한다(_lambda_for_profile 이 거절한다).
         config.workload.mode = "nhpp" if profile == "nhpp_daily" else "constant"
         config.workload.lambda_per_minute = _lambda_for_profile(profile)
         config.workload.nhpp_profile_per_minute = (
@@ -246,6 +247,22 @@ def print_dry_run(
             f"nhpp_time_compression={config.workload.nhpp_time_compression} "
             f"nhpp_rate_scale={config.workload.nhpp_rate_scale}"
         )
+    if config.workload.mode == "piecewise":
+        plan = config.workload.piecewise_plan
+        expected = sum(
+            item["lambda_per_minute"] * (item["end_min"] - item["start_min"]) for item in plan
+        )
+        print(
+            f"capacity_slots={config.workload.capacity_slots} "
+            f"slot_seconds={config.workload.slot_seconds} "
+            f"pieces={len(plan)} total_min={plan[-1]['end_min']} "
+            f"expected_requests={expected:.1f}"
+        )
+        for item in plan:
+            print(
+                f"  {item['start_min']:6.2f}-{item['end_min']:6.2f}min "
+                f"rho={item['rho']:.3f} lambda={item['lambda_per_minute']:.2f}/min"
+            )
     print(f"lambda_scope={config.workload.lambda_scope}")
     if trace_file:
         print(f"trace_file={trace_file}")
@@ -469,6 +486,10 @@ async def run_simulation(
             "scenario": config.workload.scenario,
             "lambda_scope": config.workload.lambda_scope,
             "trace_file": trace_file,
+            # piecewise 의 계획 rho·lambda(구간별). 그래프와 구간 분석의 기준이다.
+            "capacity_slots": config.workload.capacity_slots,
+            "slot_seconds": config.workload.slot_seconds,
+            "plan": config.workload.piecewise_plan or None,
         },
         "execution": config.execution.__dict__,
         "background_activity": config.background_activity.__dict__,
