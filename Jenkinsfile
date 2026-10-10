@@ -101,6 +101,23 @@ pipeline {
             }
         }
 
+        // 이미지 빌드보다 앞이고, 수동 빌드 조건을 걸지 않는다. 870d536 은 포화에서
+        // 목표 replicas 를 3 에 고정시켜 처리량을 39% 깎았는데, 그 회귀가 배포까지
+        // 간 이유가 "테스트를 돌리는 단계가 파이프라인에 없었다" 는 것이다. 자동
+        // SCM 빌드에서도 걸려야 그 역할을 한다.
+        //
+        // 에이전트에 python 이 깔려 있다고 가정하지 않는다. 테스트는 importlib 로
+        // 대상 모듈만 직접 읽어 Redis/HTTP 런타임 없이 돌므로 의존성 설치가 없다.
+        stage('Unit Tests') {
+            steps {
+                script {
+                    docker.image('python:3.11-slim').inside('-u root') {
+                        sh 'python -m unittest discover -s controller/tests -t controller/tests -v'
+                    }
+                }
+            }
+        }
+
         stage('Build Base Images') {
             when {
                 expression { env.IS_MANUAL_BUILD == 'true' }
