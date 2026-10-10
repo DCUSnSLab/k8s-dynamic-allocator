@@ -1409,21 +1409,33 @@ class BufferCapacityReconciler:
             # 축소가 진행 중이다. Redis 키 하나만 보므로 자주 다시 봐도 싸다.
             return done("scale_down_gated", retry=True)
 
-        deadline = time.monotonic() + self.supply_lock_wait_seconds
-        token = self._acquire_supply_lock_until(compute_type, deadline, threading.Event())
-        if not token:
-            return done("supply_lock_timeout", retry=True)
-        try:
-            for _ in range(max(1, int(policy["N"]) * 2)):
+        for _ in range(max(1, int(policy["N"]) * 2)):
+            # 바퀴마다 공급 락을 잡고 놓는다. 공급 락을 함께 쓰는 쪽(축소, 정책 게시,
+            # 그리고 재사용 비교군의 반납)이 공급의 여러 바퀴 사이에 끼어들 수 있어야
+            # 한다. 포화에서 공급이 락을 한 번에 몇 초씩 쥐면 그쪽이 굶는다.
+            deadline = time.monotonic() + self.supply_lock_wait_seconds
+            token = self._acquire_supply_lock_until(
+                compute_type, deadline, threading.Event()
+            )
+            if not token:
+                return done("supply_lock_timeout", retry=True)
+            try:
                 if not self._supply_still_valid(compute_type, token, generation):
                     return done("lost_or_gated", retry=True)
                 policy = self.queues.get_buffer_policy(compute_type)
                 if not policy:
                     return done("no_policy")
-                snapshot = self.provider.list_buffer_snapshot(compute_type)
+                # replicas 를 먼저, 목록을 나중에 읽는다. 반대 순서였을 때(d6cb40c) 두
+                # 읽기 사이에 claim 과 할당기의 낮추기가 끼어들면, claim 전 목록(assigned
+                # 가 하나 적음)으로 계산한 목표로 방금 낮춘 replicas 를 다시 올렸다.
+                # 포화 6분 사전 점검에서 이 진동이 용량 교정 42번을 불렀다. 이 순서면
+                # 낮추기가 replicas 읽기 뒤에 오면 CAS 가 실패하고, 앞에 왔다면 그 앞의
+                # claim 이 나중에 읽은 목록에 이미 들어 있다. 목록 뒤 CAS 전에 claim 만
+                # 끼어드는 좁은 틈은 남으므로 아래 room 초과 낮추기가 안전망이다.
                 current = int(
                     self.provider.read_deployment_replicas(policy["deployment_name"])
                 )
+                snapshot = self.provider.list_buffer_snapshot(compute_type)
                 pending_unknown = self._settle_unknown_gates(compute_type, snapshot)
                 assigned = int(snapshot["buffer_assigned"])
                 room = max(0, int(policy["N"]) - assigned)
@@ -1485,6 +1497,14 @@ class BufferCapacityReconciler:
                 # 한다. room 까지만 내리고 게이트 풀린 파드는 room 이하이므로,
                 # ReplicaSet 은 노드에 없는 게이트 파드(deletion-cost -100)부터 지운다.
                 if current > room:
+                    # 게이트 없이 내려도 되는 근거는 "게이트 풀린 파드 <= room" 이다. 그러면
+                    # 지울 수만큼 노드에 없는 게이트 파드가 있고 ReplicaSet 은 그것부터
+                    # 지운다(노드 미배치가 deletion-cost 보다 앞선 순위). 평소에는 N
+                    # 불변식이 이를 보장하지만 운영자가 N 을 낮춘 직후에는 깨진다. 그때는
+                    # Ready 파드(claim 중일 수도 있다)가 지워질 수 있으므로 여기서 내리지
+                    # 않고 reconcile 의 축소(축소 게이트로 할당을 막는다)에 맡긴다.
+                    if self._held_available(snapshot) > room:
+                        return done("needs_scale_down")
                     if not self._supply_still_valid(compute_type, token, generation):
                         return done("lost_or_gated", retry=True)
                     if self.provider.lower_deployment_replicas(
@@ -1546,11 +1566,18 @@ class BufferCapacityReconciler:
                         ok = self.provider.release_pod_scheduling_gate(
                             name, version, candidate["gate_index"]
                         )
-                    except Exception:
+                    except Exception as exc:
                         # 재전송이 실패해도(403 같은 확정 거절이라도) 첫 PATCH 는 아직
                         # 서버에서 처리 중일 수 있으므로 미상에서 빼지 않는다. 대신
                         # _settle_unknown_gates 가 나이 상한으로 정리해 예산이 영구히
-                        # 새지 않게 한다.
+                        # 새지 않게 한다. 재전송 자체가 응답 없이 끝났으면(timeout·5xx)
+                        # 그 요청도 늦게 적용될 수 있으므로 나이를 그 시각부터 다시 잰다.
+                        status = getattr(exc, "status", None)
+                        if not (isinstance(status, int) and 400 <= status < 500):
+                            with self._refill_condition:
+                                self._gate_unknown_since[(compute_type, name)] = (
+                                    time.monotonic()
+                                )
                         continue
                     if ok:
                         with self._refill_condition:
@@ -1674,17 +1701,17 @@ class BufferCapacityReconciler:
                     return done("released")
                 # 묶음 상한에 걸렸다. 목록을 다시 읽고 남은 예산을 본다 - 그사이 큐가
                 # 비어 목표가 내려갔으면 더 풀지 않는다.
-            return done("loop_end", retry=True)
-        finally:
-            try:
-                self.queues.release_supply_lock(compute_type, token)
-            except Exception as exc:
-                logger.warning(
-                    "[Warning] operation=buffer_supply_lock_release "
-                    "compute_type=%s reason=%r",
-                    compute_type,
-                    str(exc),
-                )
+            finally:
+                try:
+                    self.queues.release_supply_lock(compute_type, token)
+                except Exception as exc:
+                    logger.warning(
+                        "[Warning] operation=buffer_supply_lock_release "
+                        "compute_type=%s reason=%r",
+                        compute_type,
+                        str(exc),
+                    )
+        return done("loop_end", retry=True)
 
     def sync_policies(self) -> Set[str]:
         """Refresh the leader-owned Redis cache from Deployment annotations."""
@@ -2161,6 +2188,23 @@ class BufferCapacityReconciler:
             # 할당과 backfill 사이의 일시적 현상이라 (한 번에 중앙값 3.4초) 그것으로
             # 줄이면 ReplicaSet 이 지우고 있는 파드를 한 번 더 지우게 된다.
             if current > desired or self._held_available(snapshot) > desired:
+                # 용량 교정(replicas > room)은 축소 게이트 없이 공급 작업이 CAS 로 한다.
+                # 축소 게이트를 세우는 경로가 셋(시작 중 파드, 쿨다운 대기, 그리고 목표가
+                # room 과 같은 포화의 일반 축소)이었고, 포화 6분 사전 점검에서 이것이
+                # 42번 서서 그때마다 할당과 공급이 모두 멈췄다(할당이 막힌 시간 8.6%).
+                # room 까지 내리는 것은 할당기가 claim 직후 게이트 없이 하는 것과 같은
+                # 조작이다. 단 게이트 풀린 파드가 room 이하일 때만 - 아니면(N 을 낮춘
+                # 직후) Ready 파드가 지워질 수 있으므로 아래 축소 경로로 간다. room 아래
+                # 목표까지의 수요 축소는 다음 바퀴에서 지금처럼 쿨다운과 게이트를 거친다.
+                if current > room and self._held_available(snapshot) <= room:
+                    self.request_refill(compute_type_value, trigger="reconcile")
+                    result = {
+                        **base_result,
+                        "status": "refill_requested",
+                        "reason": "capacity_trim",
+                    }
+                    self._record_status(compute_type_value, **result)
+                    return result
                 # schedulable_not_ready 와 oldest_schedulable_not_ready_since 는
                 # 같은 집합(게이트가 하나도 없고 아직 Ready 가 아닌 RS 소유 파드)을
                 # 두고 함께 계산된 쌍이다. ungated_not_ready 는 "우리 게이트만"

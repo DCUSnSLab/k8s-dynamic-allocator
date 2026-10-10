@@ -804,5 +804,159 @@ class LockOrderTests(unittest.TestCase):
         self.assertEqual(order, ["alloc_lock", "supply_lock", "supply_unlock", "alloc_unlock"])
 
 
+class SupplyOscillationTests(unittest.TestCase):
+    """사전 점검(20261011-071750_DEVSMOKE)에서 본 진동의 재발 방지.
+
+    공급이 목록을 먼저 읽고 replicas 를 나중에 읽던 시절, 두 읽기 사이에 claim 과
+    할당기의 낮추기가 끼어들면 낡은 assigned 로 room 위까지 다시 올렸다. 그러면
+    reconcile 이 축소 게이트로 바로잡으며 할당과 공급을 멈췄다(포화 6분에 42번).
+    """
+
+    def interleave_between_reads(self, provider, action):
+        """먼저 불린 읽기(replicas 또는 목록)가 끝난 직후 action 을 끼워 넣는다."""
+        state = {"done": False}
+        read_replicas = provider.read_deployment_replicas
+        list_snapshot = provider.list_buffer_snapshot
+
+        def once():
+            if not state["done"]:
+                state["done"] = True
+                action(provider)
+
+        def replicas(name):
+            value = read_replicas(name)
+            once()
+            return value
+
+        def snapshot(compute_type):
+            value = list_snapshot(compute_type)
+            once()
+            return value
+
+        provider.read_deployment_replicas = replicas
+        provider.list_buffer_snapshot = snapshot
+
+    def test_claim_and_lowering_between_reads_never_raise_above_room(self):
+        queues = GateQueues(queued=183)
+        queues.policy["N"] = 10
+        # assigned 6, room 4, replicas 4 = room (포화). Ready 1 + 게이트 1 - ReplicaSet 이
+        # 아직 backfill 을 다 만들지 않아 headroom(N - total = 2)이 올리기를 막지 않는다.
+        # (headroom 이 0 이면 옛 순서에서도 우연히 막혀 이 테스트가 판별력을 잃는다.)
+        provider = GateProvider(current=4, assigned=6, ungated=1, gated=1, n=10)
+
+        def claim_and_lower(p):
+            p.ungated -= 1
+            p.assigned += 1          # room 4 -> 3
+            p.current -= 1           # 할당기: replicas 4 > room 3 이라 낮춘다
+
+        self.interleave_between_reads(provider, claim_and_lower)
+        refill(gate_reconciler(provider, queues))
+        # 낡은 room(4)으로 다시 올리지 않는다.
+        self.assertEqual(provider.raises, [])
+        self.assertLessEqual(provider.current, 10 - provider.assigned)
+
+    def test_lowered_n_is_left_to_gated_scale_down(self):
+        """N 을 낮춘 직후(게이트 풀린 파드 > room)에는 게이트 없이 내리지 않는다.
+
+        그때 내리면 ReplicaSet 이 Ready 파드(claim 중일 수 있다)를 지울 수 있다.
+        """
+        queues = GateQueues(queued=183)
+        queues.policy["N"] = 10
+        provider = GateProvider(current=8, assigned=5, ungated=7, gated=1, n=10)
+        result = refill(gate_reconciler(provider, queues))
+        self.assertEqual(result["reason"], "needs_scale_down")
+        self.assertEqual(provider.lowers, [])
+        self.assertEqual(provider.released, [])
+
+    def test_supply_lock_is_released_between_rounds(self):
+        """여러 바퀴를 돌 때 바퀴마다 공급 락을 놓는다(축소·반납이 끼어들 수 있게)."""
+        queues = GateQueues(queued=183)
+        provider = GateProvider(current=20, assigned=20, ungated=0, gated=20)
+        refill(gate_reconciler(provider, queues))
+        locks = queues.events.count("supply_lock")
+        unlocks = queues.events.count("supply_unlock")
+        self.assertGreaterEqual(locks, 5)            # 20개를 4개씩 -> 5바퀴 이상
+        self.assertEqual(locks, unlocks)
+        self.assertEqual(provider.ungated, 20)
+
+    def test_resend_timeout_restarts_unknown_age(self):
+        queues = GateQueues(queued=0)
+        provider = GateProvider(current=3, assigned=0, ungated=0, gated=3)
+        provider.fail_release["gated-0"] = TimeoutError("read timed out")
+        reconciler = gate_reconciler(provider, queues)
+        refill(reconciler)
+        key = ("general", "gated-0")
+        reconciler._gate_unknown_since[key] -= 59.0
+        provider.fail_release["gated-0"] = TimeoutError("read timed out again")
+        refill(reconciler)
+        # 재전송도 응답이 없었으므로 나이를 다시 잰다 - 60초가 지나도 바로 빼지 않는다.
+        self.assertLess(time.monotonic() - reconciler._gate_unknown_since[key], 5.0)
+        self.assertIn("gated-0", reconciler._gate_unknown["general"])
+
+
+class ReconcileCapacityTrimTests(unittest.TestCase):
+    """replicas > room 인 용량 교정은 축소 게이트 없이 공급 작업으로 넘긴다.
+
+    축소 게이트를 세우던 경로가 셋이었다: 시작 중 파드가 있을 때, 쿨다운 대기 중일 때,
+    그리고 목표가 room 과 같은 포화의 일반 축소.
+    """
+
+    def harness(self, provider, queues, *, starting=0, waiting=None):
+        reconciler = gate_reconciler(provider, queues)
+        reconciler._record_status = lambda *args, **kwargs: None
+        reconciler.pipeline_width = lambda compute_type, n: None
+        reconciler.cooldown_seconds = lambda compute_type: 0.0
+        reconciler._note_target = lambda *args: None
+        reconciler.create_time_seconds = lambda compute_type, quantile=0.9: 0.0
+        reconciler.work_time_seconds = lambda compute_type, quantile=0.5: 0.0
+        reconciler._sample_count = lambda compute_type, kind: 0
+        reconciler.cooldown_min_samples = 10
+        reconciler._starting_grace_seconds = lambda compute_type: 30.0
+        reconciler._cooldown_blocks_scale_down = lambda compute_type, desired, cooldown: waiting
+        reconciler._schedule_after = lambda *args, **kwargs: None
+        self.refills = []
+        self.scale_downs = []
+        reconciler.request_refill = lambda compute_type, **kwargs: self.refills.append(kwargs)
+        reconciler._scale_down = lambda compute_type, policy, base: (
+            self.scale_downs.append(base) or {"status": "scaled_down"}
+        )
+        snapshot = provider.list_buffer_snapshot
+
+        def with_starting(compute_type):
+            value = snapshot(compute_type)
+            value["schedulable_not_ready"] = starting
+            value["oldest_schedulable_not_ready_since"] = None
+            return value
+
+        provider.list_buffer_snapshot = with_starting
+        return reconciler
+
+    def test_all_three_trim_paths_go_to_refill_without_gate(self):
+        for label, kwargs in (
+            ("starting", {"starting": 2}),
+            ("cooldown", {"waiting": 5.0}),
+            ("plain", {}),
+        ):
+            with self.subTest(path=label):
+                queues = GateQueues(queued=183)
+                # assigned 30, room 10, replicas 11 (room + 1), 게이트 풀린 8 <= room.
+                provider = GateProvider(current=11, assigned=30, ungated=8, gated=3)
+                result = self.harness(provider, queues, **kwargs).reconcile_type("general")
+                self.assertEqual(result["status"], "refill_requested")
+                self.assertEqual(result["reason"], "capacity_trim")
+                self.assertEqual(self.scale_downs, [])
+                self.assertEqual(len(self.refills), 1)
+                self.assertFalse(result.get("retry"))
+
+    def test_lowered_n_still_uses_gated_scale_down(self):
+        queues = GateQueues(queued=183)
+        # 게이트 풀린 11 > room 10: N 을 낮춘 직후. 축소 게이트를 세우는 경로로 간다.
+        provider = GateProvider(current=11, assigned=30, ungated=11, gated=0)
+        result = self.harness(provider, queues).reconcile_type("general")
+        self.assertEqual(result["status"], "scaled_down")
+        self.assertEqual(len(self.scale_downs), 1)
+        self.assertEqual(self.refills, [])
+
+
 if __name__ == "__main__":
     unittest.main()
