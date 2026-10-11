@@ -6,7 +6,6 @@ namespace="${DEPLOY_NAMESPACE}"
 storage_class="${DEPLOY_STORAGE_CLASS}"
 overlay="${DEPLOY_OVERLAY}"
 stage_label="${DEPLOY_STAGE_LABEL}"
-buffer_reserve="${BUFFER_RESERVE}"
 buffer_capacity="${BUFFER_CAPACITY}"
 rendered="${WORKSPACE}/.kda-deploy-${BUILD_NUMBER}.yaml"
 kustomization="${overlay}/kustomization.yaml"
@@ -26,24 +25,18 @@ for required_command in kubectl sed grep sort diff wc tr; do
     fi
 done
 
-# Mirror the controller's own fail-closed rule (0 <= R <= N) so a bad build
-# parameter is rejected before anything is applied to the cluster.
-for policy_value in "${buffer_reserve}" "${buffer_capacity}"; do
-    case "${policy_value}" in
-        ''|*[!0-9]*)
-            echo "[PreflightFailed] buffer policy must be non-negative integers: R=${buffer_reserve} N=${buffer_capacity}"
-            exit 1
-            ;;
-    esac
-done
-if [ "${buffer_reserve}" -gt "${buffer_capacity}" ]; then
-    echo "[PreflightFailed] buffer policy must satisfy R <= N: R=${buffer_reserve} N=${buffer_capacity}"
-    exit 1
-fi
-# 이 arm 은 요청마다 파드를 만들 수도 있으므로 N=0 이면 어떤 요청도 파드를 받지
-# 못한다. 오류 없이 run 하나를 통째로 버리게 되므로 여기서 막는다(cold arm 과 같다).
+# 잘못된 빌드 파라미터는 클러스터에 아무것도 적용하기 전에 막는다. 이 arm 은 R 이
+# 없다(미리 만드는 파드가 없다).
+case "${buffer_capacity}" in
+    ''|*[!0-9]*)
+        echo "[PreflightFailed] N must be a non-negative integer: N=${buffer_capacity}"
+        exit 1
+        ;;
+esac
+# 요청마다 파드를 만들므로 N=0 이면 어떤 요청도 파드를 받지 못한다. 오류 없이 run
+# 하나를 통째로 버리게 되므로 여기서 막는다.
 if [ "${buffer_capacity}" -lt 1 ]; then
-    echo "[PreflightFailed] the direct warm buffer needs N>=1: N=${buffer_capacity}"
+    echo "[PreflightFailed] cold start needs N>=1: N=${buffer_capacity}"
     exit 1
 fi
 
@@ -144,10 +137,10 @@ test -s "${rendered}"
 grep -F "${CONTROLLER_IMAGE}" "${rendered}" >/dev/null
 grep -F "${SWLABSSH_IMAGE}" "${rendered}" >/dev/null
 
-# 이 arm 은 Deployment 가 없어 R/N 을 컨트롤러 env 로 받는다. 적용 전에 넣어 rollout 을
+# 이 arm 은 Deployment 가 없어 N 을 컨트롤러 env 로 받는다. 적용 전에 넣어 rollout 을
 # 한 번만 한다(적용 뒤 set env 로 바꾸면 두 번 돌고, 그 사이 컨트롤러는 N 없이 뜬다).
-echo "[Render] Direct warm buffer policy R=${buffer_reserve} N=${buffer_capacity}"
-sh "${WORKSPACE}/deploy/scripts/set_buffer_policy.sh" "${rendered}" "${buffer_reserve}" "${buffer_capacity}"
+echo "[Render] Cold start policy N=${buffer_capacity}"
+sh "${WORKSPACE}/deploy/scripts/set_buffer_policy.sh" "${rendered}" "${buffer_capacity}"
 
 echo '[Validate] Client render and deploy-stage coverage'
 kubectl apply --dry-run=client \
@@ -237,7 +230,7 @@ kubectl rollout status deployment/controller \
 # 것을 발견하면 0 으로 내린다. 이 계정에 지울 권한이 없어도 배포는 멈추지 않는다.
 kubectl delete deployment -l app=compute-pod -n "${namespace}" --ignore-not-found || echo '[Warning] could not delete the compute Deployment; the controller leader scales it to 0'
 
-echo '[Smoke] Wait for the direct warm buffer to report its policy'
+echo '[Smoke] Wait for cold start to report its policy with no idle pod'
 attempt=0
 until kubectl exec -n "${namespace}" deployment/controller -- \
     python -c '
@@ -245,8 +238,7 @@ import json
 import sys
 import urllib.request
 
-expected_r = int(sys.argv[1])
-expected_n = int(sys.argv[2])
+expected_n = int(sys.argv[1])
 
 with urllib.request.urlopen(
     "http://127.0.0.1:9001/api/compute/status/",
@@ -254,19 +246,21 @@ with urllib.request.urlopen(
 ) as response:
     status = json.load(response)
 
-# Deployment 가 없으므로 정책 캐시·깃발도 없다. 확인할 것은 컨트롤러가 이 arm 으로
-# 돌고 있고 받은 R/N 을 쓰고 있는가다.
+# 컨트롤러가 이 arm 으로 돌고, 받은 N 을 쓰고, R 이 없고(None), idle 파드가 없는가.
+# 다른 arm 이 남긴 idle 은 리더가 지우므로 기다리면 0 이 된다. 0 이 안 되면 미리
+# 만드는 경로가 살아 있는 것이다.
 ready = (
-    status.get("allocation_mode") == "warm_buffer_direct"
-    and status.get("R") == expected_r
+    status.get("allocation_mode") == "cold_start"
+    and status.get("R") is None
     and status.get("N") == expected_n
+    and status.get("available") == 0
 )
 sys.exit(0 if ready else 1)
-' "${buffer_reserve}" "${buffer_capacity}" >/dev/null
+' "${buffer_capacity}" >/dev/null
 do
     attempt=$((attempt + 1))
     if [ "${attempt}" -ge 40 ]; then
-        echo '[SmokeFailed] direct warm buffer policy was not active within 120 seconds'
+        echo '[SmokeFailed] cold start policy was not active with no idle pod within 120 seconds'
         kubectl exec -n "${namespace}" deployment/controller -- \
             python -c '
 import json
@@ -310,11 +304,8 @@ test "${actual_controller_image}" = "${CONTROLLER_IMAGE}"
 # 만들므로 컨트롤러 env 가 기준이다(아래 runtime_compute_image).
 test "${actual_swlabssh_image}" = "${SWLABSSH_IMAGE}"
 
-actual_buffer_reserve=$(kubectl exec -n "${namespace}" deployment/controller -- \
-    sh -c 'printf "%s" "$BUFFER_RESERVE"')
 actual_buffer_capacity=$(kubectl exec -n "${namespace}" deployment/controller -- \
     sh -c 'printf "%s" "$BUFFER_CAPACITY"')
-test "${actual_buffer_reserve}" = "${buffer_reserve}"
 test "${actual_buffer_capacity}" = "${buffer_capacity}"
 
 runtime_compute_image=$(kubectl exec -n "${namespace}" \
@@ -363,5 +354,5 @@ test "${fluent_bit_desired}" -gt 0
 test "${fluent_bit_ready}" -eq "${fluent_bit_desired}"
 
 echo "[Success] image tag=${IMAGE_TAG}"
-echo "[Success] direct warm buffer policy R=${buffer_reserve} N=${buffer_capacity}"
+echo "[Success] cold start policy N=${buffer_capacity}"
 echo "[Success] SSH endpoint=${DEPLOY_SSH_HOST}:${DEPLOY_SSH_PORT}"

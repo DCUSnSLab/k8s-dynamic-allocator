@@ -31,14 +31,9 @@ pipeline {
     // falls back to the default.
     parameters {
         string(
-            name: 'BUFFER_RESERVE',
-            defaultValue: '2',
-            description: 'R - warm Compute Pods kept immediately allocatable'
-        )
-        string(
             name: 'BUFFER_CAPACITY',
             defaultValue: '5',
-            description: 'N - upper bound on available + assigned Compute Pods'
+            description: 'N - upper bound on Compute Pods (cold start creates one per request; no R)'
         )
     }
 
@@ -86,13 +81,12 @@ pipeline {
                     env.DEPLOY_STARTED = 'false'
                     env.DEPLOY_DIAGNOSTICS_DONE = 'false'
 
-                    env.BUFFER_RESERVE = (params.BUFFER_RESERVE ?: '2').trim()
                     env.BUFFER_CAPACITY = (params.BUFFER_CAPACITY ?: '5').trim()
 
                     echo "BRANCH_NAME=${env.BRANCH_NAME}"
                     echo "IMAGE_TAG=${env.IMAGE_TAG}"
                     echo "IS_MANUAL_BUILD=${env.IS_MANUAL_BUILD}"
-                    echo "BUFFER_POLICY R=${env.BUFFER_RESERVE} N=${env.BUFFER_CAPACITY}"
+                    echo "COLD_START_POLICY N=${env.BUFFER_CAPACITY}"
 
                     if (env.IS_MANUAL_BUILD != 'true') {
                         echo 'Automatic Multibranch/SCM build detected: image build and deployment are skipped.'

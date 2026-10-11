@@ -83,9 +83,9 @@ logger = logging.getLogger(__name__)
 
 class Orchestrator:
     def __init__(self):
-        # exp-warm-buffer: Deployment 없이 컨트롤러가 버퍼 파드를 직접 만들고 지운다.
-        # 리더의 조정 스레드가 놀고 있는 파드 수를 정책 목표에 맞추고, 할당은 두
-        # 복제본이 할당 락 아래에서 한다(cold start 와 같은 방식).
+        # exp-cold-start: 요청마다 컨트롤러가 파드를 만들고 반납 때 지운다. 할당은 두
+        # 복제본이 할당 락 아래에서 한다. 리더는 다른 arm 이 남긴 idle 파드를 지우고
+        # 주기 정리를 한다(미리 만드는 파드는 없다).
         self.provider = DirectBufferProvider()
         self.queues = ComputeQueues()
         self.tickets = self.queues.tickets

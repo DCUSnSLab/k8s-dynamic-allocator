@@ -1,6 +1,6 @@
-"""버퍼 직접 관리가 새로 쓰는 큐 조회와 정책(BufferPolicy) 계산.
+"""요청 파드 경로가 쓰는 큐 조회(파드 없는 claim, 생성 예약).
 
-큐는 Redis 서버 없이 가짜 클라이언트로, 정책은 모듈만 따로 읽어 확인한다.
+Redis 서버 없이 가짜 클라이언트로 확인한다.
 """
 
 import importlib.util
@@ -10,7 +10,6 @@ import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 CONTROLLER = Path(__file__).resolve().parents[1]
@@ -26,24 +25,6 @@ _spec = importlib.util.spec_from_file_location(
 queue_module = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = queue_module
 _spec.loader.exec_module(queue_module)
-
-
-def load_policy_class():
-    config = types.ModuleType("config")
-    config.settings = SimpleNamespace(
-        BUFFER_SCALE_DOWN_COOLDOWN_SAMPLES=20,
-        BUFFER_SCALE_DOWN_COOLDOWN_MIN_SAMPLES=3,
-    )
-    spec = importlib.util.spec_from_file_location(
-        "buffer_policy_under_test", CONTROLLER / "services" / "compute" / "buffer_policy.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    with patch.dict(sys.modules, {"config": config}):
-        spec.loader.exec_module(module)
-    return module.BufferPolicy
-
-
-BufferPolicy = load_policy_class()
 
 
 class FakePipeline:
@@ -152,17 +133,6 @@ def put(queue, client, ticket_id, *, queued=False, **fields):
 
 
 class DirectQueueTests(unittest.TestCase):
-    def test_claimable_count_skips_silent_clients_and_non_queued(self):
-        queue, client = make_queue()
-        now_ms = int(time.time() * 1000)
-        silent = (queue.client_timeout_seconds + 30) * 1000
-        put(queue, client, "a", queued=True, status="queued", last_poll_ms=now_ms)
-        put(queue, client, "b", queued=True, status="queued", last_poll_ms=now_ms - silent)
-        put(queue, client, "c", queued=True, status="allocating", last_poll_ms=now_ms)
-        self.assertEqual(queue.queued_count("general"), 2)
-        self.assertEqual(queue.claimable_queued_count("general"), 1)
-        self.assertEqual(client.round_trips, 2)
-
     def test_allocating_missing_pods_reads_once_and_skips_positions(self):
         queue, client = make_queue()
         future = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
@@ -183,16 +153,17 @@ class DirectQueueTests(unittest.TestCase):
 class PendingCreateRefreshTests(unittest.TestCase):
     def test_refresh_keeps_only_reservations_that_still_exist(self):
         queue, client = make_queue()
-        key = queue._pending_create_key("general", "idle")
-        client.zsets[key] = {"warm-a": 100.0}
+        key = queue._pending_create_key("general", "request")
+        client.zsets[key] = {"pod-a": 100.0}
         with patch.object(time, "time", return_value=200.0):
-            alive = queue.refresh_pending_creates("general", ["warm-a", "warm-gone"], "idle")
-        self.assertEqual(alive, {"warm-a"})
-        self.assertEqual(client.zsets[key], {"warm-a": 200.0})  # 지워진 것을 되살리지 않는다
+            alive = queue.refresh_pending_creates("general", ["pod-a", "pod-gone"], "request")
+        self.assertEqual(alive, {"pod-a"})
+        self.assertEqual(client.zsets[key], {"pod-a": 200.0})  # 지워진 것을 되살리지 않는다
         self.assertEqual(client.round_trips, 1)
         self.assertEqual(client.transactions, [True])
 
     def test_pending_creates_returns_kind_and_drops_expired(self):
+        # 이 arm 은 request 만 올리지만, 다른 arm 이 남긴 idle 예약도 만료 전까지 센다.
         queue, client = make_queue()
         client.zsets[queue._pending_create_key("general", "idle")] = {"pod-a": 950.0, "pod-old": 100.0}
         client.zsets[queue._pending_create_key("general", "request")] = {"pod-b": 990.0}
@@ -205,74 +176,11 @@ class PendingCreateRefreshTests(unittest.TestCase):
     def test_same_score_refresh_still_counts_as_alive(self):
         """ZADD XX CH 는 점수가 같으면 0 을 돌려준다. 그것을 예약 상실로 보면 안 된다."""
         queue, client = make_queue()
-        key = queue._pending_create_key("general", "idle")
-        client.zsets[key] = {"warm-a": 300.0}
+        key = queue._pending_create_key("general", "request")
+        client.zsets[key] = {"pod-a": 300.0}
         with patch.object(time, "time", return_value=300.0):
-            alive = queue.refresh_pending_creates("general", ["warm-a"], "idle")
-        self.assertEqual(alive, {"warm-a"})
-
-
-class BufferPolicyTests(unittest.TestCase):
-    def make(self):
-        queues = SimpleNamespace(
-            churn_samples=lambda *a: (_ for _ in ()).throw(RuntimeError("no shared")),
-            record_churn_sample=lambda *a, **k: None,
-        )
-        return BufferPolicy(queues)
-
-    def test_reserve_is_the_floor_and_demand_raises_it(self):
-        self.assertEqual(BufferPolicy.desired_detail(2, 40, 10, 0), {"desired": 2, "bound_by": "reserve"})
-        self.assertEqual(BufferPolicy.desired_detail(2, 40, 10, 7), {"desired": 7, "bound_by": "demand"})
-
-    def test_room_bounds_the_target(self):
-        self.assertEqual(BufferPolicy.desired_detail(2, 40, 38, 7), {"desired": 2, "bound_by": "room"})
-        self.assertEqual(BufferPolicy.desired_detail(2, 40, 40, 7), {"desired": 0, "bound_by": "room"})
-        self.assertEqual(BufferPolicy.desired_detail(2, 40, 45, 7), {"desired": 0, "bound_by": "room"})
-
-    def test_window_holds_the_peak_for_the_cooldown(self):
-        policy = self.make()
-        with patch.object(time, "monotonic", return_value=100.0):
-            policy.note_target("general", 8, 30.0)
-        with patch.object(time, "monotonic", return_value=110.0):
-            policy.note_target("general", 2, 30.0)
-            self.assertEqual(policy.window_max("general"), 8)
-        # 창(30초)이 지나면 그 최댓값을 놓는다.
-        with patch.object(time, "monotonic", return_value=131.0):
-            policy.note_target("general", 2, 30.0)
-            self.assertEqual(policy.window_max("general"), 2)
-
-    def test_scale_down_waits_while_a_higher_target_is_in_the_window(self):
-        policy = self.make()
-        with patch.object(time, "monotonic", return_value=1000.0):
-            policy.note_target("general", 8, 30.0)
-        with patch.object(time, "monotonic", return_value=1040.0):
-            policy.note_target("general", 2, 30.0)
-            # 막 보기 시작한 것은 아니다(40초 관측). 창(30초) 안의 더 높은 목표는 없다.
-            self.assertIsNone(policy.cooldown_blocks_scale_down("general", 2, 30.0))
-        with patch.object(time, "monotonic", return_value=1045.0):
-            policy.note_target("general", 9, 30.0)
-            policy.note_target("general", 2, 30.0)
-            hold = policy.cooldown_blocks_scale_down("general", 2, 30.0)
-        self.assertIsNotNone(hold)
-        self.assertAlmostEqual(hold, 30.0, delta=0.01)
-
-    def test_fresh_observer_waits_one_window_before_scaling_down(self):
-        policy = self.make()
-        with patch.object(time, "monotonic", return_value=500.0):
-            policy.note_target("general", 2, 30.0)
-        with patch.object(time, "monotonic", return_value=510.0):
-            self.assertAlmostEqual(policy.cooldown_blocks_scale_down("general", 2, 30.0), 20.0, delta=0.01)
-
-    def test_dips_and_create_times_set_the_cooldown(self):
-        policy = self.make()
-        self.assertEqual(policy.cooldown_seconds("general"), 0.0)
-        created = datetime(2026, 10, 11, tzinfo=timezone.utc)
-        for index, seconds in enumerate((5.0, 6.0, 7.0, 20.0)):
-            policy.note_create_time("general", f"uid-{index}", created, created + timedelta(seconds=seconds))
-        # 같은 파드의 Ready 이벤트는 한 번만 센다.
-        policy.note_create_time("general", "uid-0", created, created + timedelta(seconds=99))
-        self.assertEqual(policy.create_time_seconds("general"), 20.0)
-        self.assertEqual(policy.cooldown_seconds("general"), 20.0)
+            alive = queue.refresh_pending_creates("general", ["pod-a"], "request")
+        self.assertEqual(alive, {"pod-a"})
 
 
 if __name__ == "__main__":

@@ -1,11 +1,10 @@
-"""컨트롤러가 직접 관리하는 웜 버퍼(warm_buffer_direct)의 불변식.
+"""cold start(요청마다 파드를 만든다)의 불변식.
 
 실제 클러스터 없이 가짜 클러스터·큐 위에서 확인한다.
-  - 두 복제본의 할당(drain)과 리더 조정이 동시에 돌아도 살아 있는 파드가 N 을 넘지 않는다.
-  - idle 파드 할당이 충돌하면 다음 파드로 넘어가고, 다 실패하면 티켓을 돌려놓는다.
-  - 묶는 사이 취소된 티켓 몫으로 파드를 새로 만들지 않는다.
+  - 두 복제본의 할당(drain)과 리더가 동시에 돌아도 살아 있는 파드가 N 을 넘지 않는다.
+  - 미리 만든 파드를 쓰지 않는다. 다른 arm 이 남긴 idle 은 내주지 않고 리더가 지운다.
+  - 묶는 사이 취소된 티켓 몫으로 파드를 만들지 않는다.
   - 생성 중 목록이 N 계산에 들어가고, 거절(4xx)만 목록에서 뺀다.
-  - 버퍼 목표는 동적 R 하나다: R 이 바닥이고, 몰림 뒤에는 쿨다운 창만큼 버퍼를 붙잡는다.
 """
 
 import ast
@@ -53,11 +52,8 @@ SETTINGS = SimpleNamespace(
     WAIT_QUEUE_WORKER_INTERVAL_SECONDS=1,
     WAIT_QUEUE_LOCK_RENEW_SECONDS=20,
     WARM_BUFFER_PENDING_CREATE_SECONDS=60.0,
-    # 정책(BufferPolicy)
+    # 리더
     BUFFER_RECONCILE_RESYNC_SECONDS=5,
-    BUFFER_SCALE_DOWN_COOLDOWN_SAMPLES=20,
-    BUFFER_SCALE_DOWN_COOLDOWN_MIN_SAMPLES=3,
-    # direct 조정
     WARM_BUFFER_RESYNC_SECONDS=0.2,
     COLD_START_POD_READY_TIMEOUT_SECONDS=300.0,
     COLD_START_POD_READY_POLL_SECONDS=0.01,
@@ -121,31 +117,16 @@ def load_direct_reconciler_class():
     config.settings = SETTINGS
     queue = types.ModuleType("controller.services.queue")
     queue.QueueUnavailableError = FakeQueueUnavailable
-    kubernetes = types.ModuleType("kubernetes")
-    kclient = types.ModuleType("kubernetes.client")
-    rest = types.ModuleType("kubernetes.client.rest")
-    rest.ApiException = FakeApiException
-    kubernetes.client = kclient
-    kclient.rest = rest
-    modules.update({
-        "config": config,
-        queue.__name__: queue,
-        "kubernetes": kubernetes,
-        "kubernetes.client": kclient,
-        "kubernetes.client.rest": rest,
-    })
-    loaded = {}
+    modules.update({"config": config, queue.__name__: queue})
+    name = "controller.services.compute.direct_buffer_reconciler"
     with patch.dict(sys.modules, modules):
-        for short in ("buffer_policy", "direct_buffer_reconciler"):
-            name = f"controller.services.compute.{short}"
-            spec = importlib.util.spec_from_file_location(
-                name, ROOT / "services" / "compute" / f"{short}.py"
-            )
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[name] = module
-            spec.loader.exec_module(module)
-            loaded[short] = module
-    return loaded["direct_buffer_reconciler"].DirectBufferReconciler
+        spec = importlib.util.spec_from_file_location(
+            name, ROOT / "services" / "compute" / "direct_buffer_reconciler.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return module.DirectBufferReconciler
 
 
 ComputeAllocator = load_allocator_class()
@@ -163,11 +144,9 @@ class World:
     파드가 하나 생길 때마다 살아 있는(지우는 중이 아닌) 파드 수가 N 이하인지 본다.
     """
 
-    def __init__(self, capacity: Optional[int], reserve: int, boot_seconds: float = 0.03):
+    def __init__(self, capacity: Optional[int], boot_seconds: float = 0.03):
         self.mu = threading.RLock()
-        self.template_hash = "gen-1"
         self.capacity = capacity
-        self.reserve = reserve
         self.boot_seconds = boot_seconds
         self.pods: Dict[str, Dict] = {}
         self.rv = itertools.count(1)
@@ -180,7 +159,7 @@ class World:
         self.lock_token: Optional[str] = None
         self.max_live = 0
         self.violations: List[Tuple[str, int]] = []
-        self.created = {"idle": 0, "request": 0}
+        self.created = {"request": 0}
         self.assignments: Dict[str, List[str]] = {}
 
     # 파드
@@ -190,8 +169,7 @@ class World:
             return [dict(p) for p in self.pods.values() if not p["terminating"]]
 
     def add_pod(self, name: str, status: str, annotations: Dict, *, ready: bool = False,
-                age_seconds: float = 0.0, not_ready_since: Optional[datetime] = None,
-                template_hash: Optional[str] = None) -> Dict:
+                age_seconds: float = 0.0) -> Dict:
         with self.mu:
             if name in self.pods:
                 raise FakeApiException(409, "AlreadyExists")
@@ -204,8 +182,6 @@ class World:
                 "annotations": dict(annotations),
                 "buffer_status": status,
                 "ready": ready,
-                "not_ready_since": not_ready_since,
-                "template_hash": self.template_hash if template_hash is None else template_hash,
                 "terminating": False,
             }
             self.pods[name] = pod
@@ -274,17 +250,16 @@ class World:
 
 
 class FakeProvider:
-    allocation_mode = "warm_buffer_direct"
+    allocation_mode = "cold_start"
     LABEL_COMPUTE_TYPE = "compute-type"
+    LABEL_STATUS = "compute-status"
     STATUS_IDLE = "idle"
     STATUS_ASSIGNED = "assigned"
 
     def __init__(self, world: World, create_latency: float = 0.0):
         self.world = world
         self.create_latency = create_latency
-        self.names = itertools.count(1)
         self.fail_create_with: Optional[Exception] = None
-        self.claim_conflicts = set()
         self.calls: List[Tuple] = []
 
     def snapshot(self, compute_type=None) -> Dict:
@@ -298,10 +273,7 @@ class FakeProvider:
                     "annotations": dict(p["annotations"]),
                     "buffer_status": p["buffer_status"],
                     "ready": p["ready"],
-                    "ready_at": datetime.now(timezone.utc) if p["ready"] else None,
-                    "not_ready_since": p.get("not_ready_since"),
                     "ip": "10.0.0.9" if p["ready"] else None,
-                    "template_hash": p.get("template_hash", ""),
                     "terminating": p["terminating"],
                 }
                 for p in self.world.pods.values()
@@ -319,34 +291,18 @@ class FakeProvider:
     def read_capacity(self, compute_type=None):
         return self.world.capacity
 
-    def read_reserve(self, compute_type=None):
-        return self.world.reserve
-
-    def new_idle_name(self, compute_type):
-        return f"compute-{compute_type}-warm-{next(self.names)}"
-
-    def template_hash(self, compute_type):
-        return self.world.template_hash
-
     def request_pod_name(self, ticket):
-        return f"compute-general-req-{ticket['ticket_id']}-{ticket.get('retry_count') or 0}"
+        return f"compute-general-{ticket['ticket_id']}-{ticket.get('retry_count') or 0}"
 
     def _latency(self):
         if self.create_latency:
             time.sleep(random.uniform(0, self.create_latency))
 
-    def create_idle_pod(self, compute_type, name):
-        self.calls.append(("create_idle", name))
-        if self.fail_create_with is not None:
-            raise self.fail_create_with
-        self._latency()
-        self.world.add_pod(name, "idle", {"origin": "idle"})
-        with self.world.mu:
-            self.world.created["idle"] += 1
-
     def create_pod_for_ticket(self, ticket, pod_name=None):
         name = pod_name or self.request_pod_name(ticket)
         self.calls.append(("create_request", name))
+        if self.fail_create_with is not None:
+            raise self.fail_create_with
         self._latency()
         self.world.add_pod(name, "assigned", {
             "ticket": ticket["ticket_id"], "claim": ticket.get("claim_token") or "",
@@ -354,21 +310,6 @@ class FakeProvider:
         with self.world.mu:
             self.world.created["request"] += 1
         return name
-
-    def claim_idle_pod(self, name, rv, user_pod, ticket_id, claim_token, expected_annotations=None):
-        self.calls.append(("claim_idle", name, ticket_id))
-        if name in self.claim_conflicts:
-            return False
-        with self.world.mu:
-            pod = self.world.pods.get(name)
-            if (not pod or pod["terminating"] or pod["resource_version"] != rv
-                    or pod["buffer_status"] != "idle"):
-                return False
-            pod["buffer_status"] = "assigned"
-            pod["annotations"].update({"ticket": ticket_id, "claim": claim_token})
-            self.world.bump(pod)
-            self.world.assignments.setdefault(name, []).append(ticket_id)
-            return True
 
     def delete_idle_pod(self, name, uid, rv):
         self.calls.append(("delete_idle", name))
@@ -382,7 +323,7 @@ class FakeProvider:
         self.calls.append(("release", name))
         return self.world.terminate(name)
 
-    def wait_pod_ready(self, name, keep_claim=None, must_exist=False):
+    def wait_pod_ready(self, name, keep_claim=None):
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             self.world.tick()
@@ -459,38 +400,17 @@ class FakeQueues:
                 if t["status"] == "allocating" and not (t["compute_pod"] and t["compute_pod"] in known)
             ]
 
-    def queued_count(self, compute_type):
-        with self.world.mu:
-            return sum(1 for _, tid in self.world.queue if self.world.tickets[tid]["status"] == "queued")
-
-    def claimable_queued_count(self, compute_type):
-        with self.world.mu:
-            return sum(
-                1 for _, tid in self.world.queue
-                if self.world.tickets[tid]["status"] == "queued"
-                and not self.world.tickets[tid].get("disconnected")
-            )
-
     def pending_creates(self, compute_type, max_age_seconds):
         cutoff = time.time() - max_age_seconds
         with self.world.mu:
             for name in [n for n, at in self.world.pending.items() if at < cutoff]:
                 del self.world.pending[name]
-            return {name: self.world.pending_kind.get(name, "idle") for name in self.world.pending}
+            return {name: self.world.pending_kind.get(name, "request") for name in self.world.pending}
 
     def add_pending_create(self, compute_type, name, kind):
         with self.world.mu:
             self.world.pending[name] = time.time()
             self.world.pending_kind[name] = kind
-
-    def add_pending_creates_if_locked(self, compute_type, names, lock_token, kind="idle"):
-        with self.world.mu:
-            if self.world.lock_token != lock_token:
-                return False
-            for name in names:
-                self.world.pending[name] = time.time()
-                self.world.pending_kind[name] = kind
-            return True
 
     def refresh_pending_creates(self, compute_type, names, kind):
         # 실제와 같은 계약: 남아 있는 것만 갱신하고, 남아 있던 이름을 돌려준다.
@@ -520,12 +440,6 @@ class FakeQueues:
                 ticket["claimed_by"] = worker_id
                 return dict(ticket)
             return None
-
-    def churn_samples(self, compute_type, kind):
-        raise FakeQueueUnavailable("no shared samples in tests")
-
-    def record_churn_sample(self, *args, **kwargs):
-        return None
 
 
 class FakeTickets:
@@ -569,8 +483,6 @@ class FakeTickets:
 
     def mark_allocating(self, ticket_id, compute_pod, compute_pod_ip, claimed_by=None,
                         claim_token=None, compute_ready_at=None, compute_available_at=None):
-        if self.before_record is not None:
-            self.before_record(ticket_id)
         with self.world.mu:
             ticket = self.world.tickets[ticket_id]
             if self._owns(ticket, claim_token):
@@ -603,6 +515,7 @@ class SimAllocator(ComputeAllocator):
             if owns:
                 current["status"] = "assigned"
                 current["final_pod"] = pod
+                world.assignments.setdefault(pod, []).append(ticket_id)
         if not owns:
             self.provider.release_pod(pod)
             return {"status": "queued"}
@@ -655,80 +568,85 @@ def wait_until(predicate, timeout=5.0, world: Optional[World] = None):
     return False
 
 
+def pod_event(status):
+    return SimpleNamespace(metadata=SimpleNamespace(labels={"compute-type": CT, "compute-status": status}))
+
+
 # ---------------------------------------------------------------------- 할당(drain)
 
 
 class DirectDrainTests(unittest.TestCase):
-    def test_ready_idle_pod_is_used_before_creating(self):
-        world = World(capacity=5, reserve=2)
-        world.add_pod("warm-a", "idle", {}, ready=True)
-        provider, queues, tickets, allocator, _ = make(world)
+    def test_each_ticket_gets_its_own_new_pod(self):
+        world = World(capacity=5)
+        provider, queues, tickets, allocator, reconciler = make(world)
+        world.enqueue(2)
+        with run_detached_threads_inline():
+            result = allocator.drain_wait_queue_for_type(CT, no_stale)
+        self.assertEqual(result["claimed"], 2)
+        self.assertEqual(world.created["request"], 2)
+        for ticket_id in ("t0001", "t0002"):
+            self.assertEqual(world.tickets[ticket_id]["status"], "assigned")
+        # 예약은 목록에 보일 때까지 남고, 리더가 목록에서 보면 뺀다.
+        self.assertEqual(len(world.pending), 2)
+        reconciler.reconcile_type(CT)
+        self.assertEqual(world.pending, {})
+
+    def test_listed_reservation_does_not_outlive_its_pod(self):
+        """세션이 끝나 파드가 사라진 뒤 남은 예약이 자리를 쥐지 않는다(리더가 목록에서 보고 뺐다)."""
+        world = World(capacity=1)
+        provider, queues, tickets, allocator, reconciler = make(world)
+        world.enqueue(1)
+        with run_detached_threads_inline():
+            allocator.drain_wait_queue_for_type(CT, no_stale)
+        reconciler.reconcile_type(CT)
+        pod = world.tickets["t0001"]["compute_pod"]
+        world.terminate(pod)
+        self.assertTrue(wait_until(lambda: pod not in world.pods, world=world))
         world.enqueue(1)
         with run_detached_threads_inline():
             result = allocator.drain_wait_queue_for_type(CT, no_stale)
         self.assertEqual(result["claimed"], 1)
-        self.assertEqual(world.assignments.get("warm-a"), ["t0001"])
-        self.assertEqual(world.created["request"], 0)
+
+    def test_leftover_idle_is_never_handed_out(self):
+        """다른 arm 이 남긴 Ready idle 이 있어도 새로 만든다(cold 측정이 warm hit 로 오염되지 않게)."""
+        world = World(capacity=5)
+        world.add_pod("leftover", "idle", {}, ready=True)
+        provider, queues, tickets, allocator, _ = make(world)
+        world.enqueue(1)
+        with run_detached_threads_inline():
+            allocator.drain_wait_queue_for_type(CT, no_stale)
+        self.assertNotIn("leftover", world.assignments)
+        self.assertEqual(world.pods["leftover"]["buffer_status"], "idle")
+        self.assertEqual(world.created["request"], 1)
         self.assertEqual(world.tickets["t0001"]["status"], "assigned")
 
-    def test_ready_idle_is_preferred_over_booting_idle(self):
-        world = World(capacity=5, reserve=2)
-        world.add_pod("warm-booting", "idle", {}, ready=False, age_seconds=10)
-        world.add_pod("warm-ready", "idle", {}, ready=True, age_seconds=1)
+    def test_leftover_idle_still_counts_toward_n(self):
+        world = World(capacity=2)
+        world.add_pod("leftover", "idle", {}, ready=True)
         provider, queues, tickets, allocator, _ = make(world)
-        world.enqueue(1)
+        world.enqueue(3)
         with run_detached_threads_inline():
-            allocator.drain_wait_queue_for_type(CT, no_stale)
-        self.assertEqual(world.assignments.get("warm-ready"), ["t0001"])
-        self.assertNotIn("warm-booting", world.assignments)
+            result = allocator.drain_wait_queue_for_type(CT, no_stale)
+        self.assertEqual(result["claimed"], 1)
+        self.assertEqual(world.violations, [])
 
-    def test_idle_claim_conflict_falls_through_to_next_pod(self):
-        world = World(capacity=5, reserve=2)
-        world.add_pod("warm-a", "idle", {}, ready=True, age_seconds=2)
-        world.add_pod("warm-b", "idle", {}, ready=True, age_seconds=1)
-        provider, queues, tickets, allocator, _ = make(world)
-        provider.claim_conflicts.add("warm-a")
-        world.enqueue(1)
-        with run_detached_threads_inline():
-            allocator.drain_wait_queue_for_type(CT, no_stale)
-        self.assertEqual(world.assignments.get("warm-b"), ["t0001"])
-        self.assertEqual(world.created["request"], 0)
-
-    def test_all_idle_lost_and_no_room_requeues_ticket(self):
-        world = World(capacity=2, reserve=2)
-        world.add_pod("warm-a", "idle", {}, ready=True)
+    def test_full_capacity_leaves_tickets_queued_in_order(self):
+        world = World(capacity=1)
         world.add_pod("busy", "assigned", {}, ready=True)
         provider, queues, tickets, allocator, _ = make(world)
-        provider.claim_conflicts.add("warm-a")
         world.enqueue(2)
         with run_detached_threads_inline():
             result = allocator.drain_wait_queue_for_type(CT, no_stale)
         self.assertEqual(result["claimed"], 0)
-        self.assertEqual(tickets.requeued, ["t0001"])
-        self.assertEqual(world.tickets["t0001"]["status"], "queued")
-        self.assertEqual(world.tickets["t0001"]["retry_count"], 0)
-        # 맨 앞으로 돌아간다.
-        self.assertEqual(world.queue[0][1], "t0001")
-        self.assertEqual(world.created["request"], 0)
-
-    def test_ticket_cancelled_while_binding_idle_creates_nothing(self):
-        world = World(capacity=5, reserve=2)
-        world.add_pod("warm-a", "idle", {}, ready=True)
-        provider, queues, tickets, allocator, _ = make(world)
-        tickets.before_record = world.cancel
-        world.enqueue(1)
-        with run_detached_threads_inline():
-            allocator.drain_wait_queue_for_type(CT, no_stale)
-        self.assertEqual(world.tickets["t0001"]["status"], "cancelled")
-        self.assertEqual(world.created["request"], 0)
-        self.assertTrue(world.pods["warm-a"]["terminating"])
+        self.assertEqual(result.get("capacity_blocked"), "capacity")
+        self.assertEqual([tid for _, tid in world.queue], ["t0001", "t0002"])
 
     def test_capacity_counts_pending_creates_and_missing_claims(self):
-        world = World(capacity=4, reserve=0)
+        world = World(capacity=4)
         world.add_pod("busy", "assigned", {}, ready=True)
         provider, queues, tickets, allocator, _ = make(world)
-        # 생성 중인 idle 하나 + 파드가 아직 안 보이는 claim 하나.
-        queues.add_pending_create(CT, "warm-pending", "idle")
+        # 생성 중인 요청 파드 하나 + 파드가 아직 안 보이는 claim 하나.
+        queues.add_pending_create(CT, "pod-pending", "request")
         world.enqueue(1)
         with world.mu:
             world.tickets["t0001"].update(status="allocating", claim_token="c")
@@ -736,24 +654,24 @@ class DirectDrainTests(unittest.TestCase):
         world.enqueue(5)
         with run_detached_threads_inline():
             result = allocator.drain_wait_queue_for_type(CT, no_stale)
-        # 4 - 1(busy) - 1(생성 중 idle) - 1(파드 없는 claim) = 1
+        # 4 - 1(busy) - 1(생성 중) - 1(파드 없는 claim) = 1
         self.assertEqual(result["claimed"], 1)
         self.assertEqual(world.created["request"], 1)
 
     def test_listed_pending_name_is_not_counted_twice(self):
-        world = World(capacity=3, reserve=0)
+        world = World(capacity=3)
         provider, queues, tickets, allocator, _ = make(world)
         # 생성 중 목록에 남아 있지만 이미 목록에 보이는(지우는 중) 파드.
-        world.add_pod("warm-gone", "idle", {}, ready=True)
-        queues.add_pending_create(CT, "warm-gone", "idle")
-        world.terminate("warm-gone")
+        world.add_pod("pod-gone", "assigned", {}, ready=True)
+        queues.add_pending_create(CT, "pod-gone", "request")
+        world.terminate("pod-gone")
         world.enqueue(5)
         with run_detached_threads_inline():
             result = allocator.drain_wait_queue_for_type(CT, no_stale)
         self.assertEqual(result["claimed"], 3)
 
     def test_cancel_before_reservation_check_creates_nothing(self):
-        world = World(capacity=5, reserve=0)
+        world = World(capacity=5)
         provider, queues, tickets, allocator, _ = make(world)
         world.enqueue(1)
         original_add = queues.add_pending_create
@@ -775,7 +693,7 @@ class DirectDrainTests(unittest.TestCase):
 
     def test_cancel_after_reservation_keeps_the_slot(self):
         """확인 뒤 취소된 claim 의 파드는 그래도 만들어진다 - 그 자리는 생성 중 목록이 쥔다."""
-        world = World(capacity=2, reserve=0)
+        world = World(capacity=2)
         provider, queues, tickets, allocator, _ = make(world)
         world.enqueue(1)
         original_create = provider.create_pod_for_ticket
@@ -797,32 +715,24 @@ class DirectDrainTests(unittest.TestCase):
         self.assertEqual(seen["result"]["claimed"], 1)
         self.assertEqual(world.violations, [])
 
-    def test_ready_idle_is_committed_without_rereading_the_pod(self):
-        world = World(capacity=5, reserve=2)
-        world.add_pod("warm-a", "idle", {}, ready=True)
-        provider, queues, tickets, allocator, _ = make(world)
-        provider.wait_pod_ready = None  # 불리면 TypeError 로 실패한다
-        world.enqueue(1)
-        with run_detached_threads_inline():
-            allocator.drain_wait_queue_for_type(CT, no_stale)
-        self.assertEqual(world.tickets["t0001"]["status"], "assigned")
-        self.assertEqual(world.tickets["t0001"]["compute_pod_ip"], "10.0.0.9")
-
-    def test_broken_idle_is_not_handed_out(self):
-        """Ready 였다가 NotReady 가 된 idle(에이전트가 죽음)은 내주지 않고 새로 만든다."""
-        world = World(capacity=5, reserve=2)
-        world.add_pod("warm-broken", "idle", {}, ready=False,
-                      not_ready_since=datetime.now(timezone.utc) - timedelta(seconds=5))
-        provider, queues, tickets, allocator, _ = make(world)
-        world.enqueue(1)
-        with run_detached_threads_inline():
-            allocator.drain_wait_queue_for_type(CT, no_stale)
-        self.assertNotIn("warm-broken", world.assignments)
-        self.assertEqual(world.created["request"], 1)
+    def test_rejected_create_returns_the_slot_but_unanswered_keeps_it(self):
+        for error, kept in ((FakeApiException(422, "Invalid"), 0),
+                            (FakeApiException(504, "Timeout"), 1),
+                            (TimeoutError("read timed out"), 1)):
+            world = World(capacity=5)
+            provider, queues, tickets, allocator, _ = make(world)
+            provider.fail_create_with = error
+            world.enqueue(1)
+            with run_detached_threads_inline():
+                allocator.drain_wait_queue_for_type(CT, no_stale)
+            # 응답 없는 생성은 서버에 반영됐을 수 있어 상한까지 자리를 쥔다.
+            self.assertEqual(len(world.pending), kept, repr(error))
+            self.assertEqual(world.tickets["t0001"]["status"], "queued")
+            self.assertEqual(world.tickets["t0001"]["retry_count"], 1)
 
     def test_mount_failure_after_assignment_keeps_the_pod(self):
         """할당이 확정된 뒤의 예외(문맥 기록 실패 등)로 쓰는 중인 파드를 지우지 않는다."""
-        world = World(capacity=5, reserve=0)
+        world = World(capacity=5)
         provider, queues, tickets, allocator, _ = make(world)
 
         class Exploding(SimAllocator):
@@ -840,39 +750,39 @@ class DirectDrainTests(unittest.TestCase):
         self.assertFalse(world.pods[pod]["terminating"])
 
     def test_error_mid_batch_still_starts_earlier_claims(self):
-        world = World(capacity=5, reserve=2)
-        world.add_pod("warm-a", "idle", {}, ready=True, age_seconds=2)
-        world.add_pod("warm-b", "idle", {}, ready=True, age_seconds=1)
+        world = World(capacity=5)
         provider, queues, tickets, allocator, _ = make(world)
-        original_claim = provider.claim_idle_pod
+        original_add = queues.add_pending_create
+        calls = {"n": 0}
 
-        def second_times_out(name, *args, **kwargs):
-            if name == "warm-b":
-                raise TimeoutError("patch timed out")
-            return original_claim(name, *args, **kwargs)
+        def second_fails(compute_type, name, kind):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise FakeQueueUnavailable("redis timeout")
+            return original_add(compute_type, name, kind)
 
-        provider.claim_idle_pod = second_times_out
+        queues.add_pending_create = second_fails
         world.enqueue(3)
         with run_detached_threads_inline():
             result = allocator.drain_wait_queue_for_type(CT, no_stale)
         self.assertEqual(world.tickets["t0001"]["status"], "assigned")
         self.assertEqual(world.tickets["t0002"]["status"], "queued")
+        self.assertEqual(world.tickets["t0002"]["retry_count"], 0)
         self.assertEqual(len(result["errors"]), 1)
 
     def test_missing_capacity_creates_nothing(self):
-        world = World(capacity=None, reserve=2)
+        world = World(capacity=None)
         provider, queues, tickets, allocator, reconciler = make(world)
         world.enqueue(2)
         with run_detached_threads_inline():
             result = allocator.drain_wait_queue_for_type(CT, no_stale)
         self.assertEqual(result["claimed"], 0)
-        with world.mu:
-            world.queue.clear()
         reconciler.reconcile_type(CT)
-        self.assertEqual(world.created, {"idle": 0, "request": 0})
+        self.assertEqual(world.created, {"request": 0})
+        self.assertEqual(world.pods, {})
 
     def test_unknown_capacity_claims_nothing(self):
-        world = World(capacity=5, reserve=0)
+        world = World(capacity=5)
         provider, queues, tickets, allocator, _ = make(world)
         world.enqueue(3)
 
@@ -887,11 +797,11 @@ class DirectDrainTests(unittest.TestCase):
         self.assertEqual(sum(1 for t in world.tickets.values() if t["status"] == "queued"), 3)
 
     def test_provision_failure_requeues_and_releases(self):
-        world = World(capacity=5, reserve=0)
+        world = World(capacity=5)
         provider, queues, tickets, allocator, _ = make(world)
         world.enqueue(1)
 
-        def dies(name, keep_claim=None, must_exist=False):
+        def dies(name, keep_claim=None):
             raise RuntimeError("pod failed")
 
         provider.wait_pod_ready = dies
@@ -902,185 +812,150 @@ class DirectDrainTests(unittest.TestCase):
         self.assertEqual(ticket["retry_count"], 1)
         self.assertTrue(all(p["terminating"] for p in world.pods.values()))
 
+    def test_request_pod_with_lost_reservation_but_fresh_claim_is_created(self):
+        world = World(capacity=5)
+        provider, queues, tickets, allocator, _ = make(world)
+        world.enqueue(1)
+        original_refresh = queues.refresh_pending_creates
 
-# ---------------------------------------------------------------------- 리더 조정
+        def reservation_pruned(compute_type, names, kind):
+            with world.mu:
+                for name in names:
+                    world.pending.pop(name, None)
+            return original_refresh(compute_type, names, kind)
+
+        queues.refresh_pending_creates = reservation_pruned
+        with run_detached_threads_inline():
+            allocator.drain_wait_queue_for_type(CT, no_stale)
+        self.assertEqual(world.created["request"], 1)
+        self.assertEqual(world.tickets["t0001"]["status"], "assigned")
+
+    def test_request_pod_with_lost_reservation_and_stale_claim_is_requeued(self):
+        world = World(capacity=5)
+        provider, queues, tickets, allocator, _ = make(world)
+        world.enqueue(1)
+        original_refresh = queues.refresh_pending_creates
+
+        def reservation_and_claim_expired(compute_type, names, kind):
+            with world.mu:
+                for name in names:
+                    world.pending.pop(name, None)
+                world.tickets["t0001"]["stale"] = True
+            return original_refresh(compute_type, names, kind)
+
+        queues.refresh_pending_creates = reservation_and_claim_expired
+        with run_detached_threads_inline():
+            allocator.drain_wait_queue_for_type(CT, no_stale)
+        self.assertEqual(world.created["request"], 0)
+        self.assertEqual(world.tickets["t0001"]["status"], "queued")
+        self.assertEqual(world.tickets["t0001"]["retry_count"], 0)
+
+
+# ---------------------------------------------------------------------- 리더
 
 
 class DirectReconcilerTests(unittest.TestCase):
-    def test_creates_reserve_when_idle(self):
-        world = World(capacity=10, reserve=2)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        outcome = reconciler.reconcile_type(CT)
-        self.assertEqual(outcome["record"]["target"], 2)
-        self.assertEqual(world.created["idle"], 2)
-        # 만든 이름은 목록에 보이기 전까지 생성 중 목록에 있다.
-        self.assertEqual(len(world.pending), 2)
-        reconciler.reconcile_type(CT)
-        self.assertEqual(world.created["idle"], 2)
-        self.assertEqual(world.pending, {})
-
-    def test_r_zero_creates_nothing(self):
-        world = World(capacity=10, reserve=0)
+    def test_never_creates_pods(self):
+        world = World(capacity=10)
         provider, queues, tickets, allocator, reconciler = make(world)
         for _ in range(3):
             reconciler.reconcile_type(CT)
-        self.assertEqual(world.created["idle"], 0)
-
-    def test_target_is_bounded_by_room(self):
-        world = World(capacity=5, reserve=2)
-        for i in range(4):
-            world.add_pod(f"busy-{i}", "assigned", {}, ready=True)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        outcome = reconciler.reconcile_type(CT)
-        self.assertEqual(outcome["record"]["target"], 1)
-        self.assertEqual(outcome["record"]["bound_by"], "room")
-        self.assertEqual(world.created["idle"], 1)
-
-    def test_does_not_prebuild_while_tickets_are_queued(self):
-        world = World(capacity=10, reserve=2)
-        provider, queues, tickets, allocator, reconciler = make(world)
         world.enqueue(3)
         reconciler.reconcile_type(CT)
-        self.assertEqual(world.created["idle"], 0)
-
-    def test_burst_is_held_as_buffer_after_it_is_served(self):
-        """몰린 요청이 자기 파드를 띄우는 동안은 그 파드가 버퍼다(Deployment 버퍼와 같다).
-
-        받아 간 뒤에는 쿨다운 창이 목표를 붙잡아 그만큼 idle 을 채운다.
-        """
-        world = World(capacity=10, reserve=2)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        reconciler.policy.cooldown_seconds = lambda compute_type: 30.0
-        ids = world.enqueue(5)
-        with world.mu:
-            world.queue.clear()
-            for index, ticket_id in enumerate(ids):
-                world.tickets[ticket_id].update(status="allocating", claim_token="c")
-        # 셋은 파드가 부팅 중, 둘은 아직 파드가 안 보인다.
-        for ticket_id in ids[:3]:
-            world.add_pod(f"req-{ticket_id}", "assigned", {}, ready=False)
-            world.tickets[ticket_id]["compute_pod"] = f"req-{ticket_id}"
-        outcome = reconciler.reconcile_type(CT)
-        self.assertEqual(outcome["record"]["in_flight"], 5)
-        self.assertEqual(outcome["record"]["desired"], 5)
-        self.assertEqual(world.created["idle"], 0)
-
-        # 다섯 다 Ready 파드를 받아 갔다.
-        with world.mu:
-            for ticket_id in ids[3:]:
-                world.add_pod(f"req-{ticket_id}", "assigned", {}, ready=True)
-            for ticket_id in ids:
-                world.pods[f"req-{ticket_id}"]["ready"] = True
-                world.tickets[ticket_id].update(status="assigned", compute_pod=f"req-{ticket_id}")
-        outcome = reconciler.reconcile_type(CT)
-        self.assertEqual(outcome["record"]["desired"], 2)
-        self.assertEqual(outcome["record"]["target"], 5)
-        self.assertEqual(world.created["idle"], 5)
-
-    def test_rejected_create_is_forgotten_but_unanswered_is_kept(self):
-        world = World(capacity=10, reserve=1)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        provider.fail_create_with = FakeApiException(422, "Invalid")
-        reconciler.reconcile_type(CT)
+        self.assertEqual(world.pods, {})
         self.assertEqual(world.pending, {})
+        self.assertEqual([c for c in provider.calls if c[0] != "delete_idle"], [])
 
-        world2 = World(capacity=10, reserve=1)
-        provider2, queues2, tickets2, allocator2, reconciler2 = make(world2)
-        provider2.fail_create_with = FakeApiException(504, "Timeout")
-        reconciler2.reconcile_type(CT)
-        self.assertEqual(len(world2.pending), 1)
-        # 응답 없는 생성은 서버에 반영됐을 수 있어 자리를 계속 쥔다 - 다시 만들지 않는다.
-        provider2.fail_create_with = None
-        reconciler2.reconcile_type(CT)
-        self.assertEqual(world2.created["idle"], 0)
-
-        provider3_error = TimeoutError("read timed out")
-        world3 = World(capacity=10, reserve=1)
-        provider3, _, _, _, reconciler3 = make(world3)
-        provider3.fail_create_with = provider3_error
-        reconciler3.reconcile_type(CT)
-        self.assertEqual(len(world3.pending), 1)
-
-    def test_scale_down_deletes_booting_then_newest(self):
-        world = World(capacity=10, reserve=1)
-        world.add_pod("old-ready", "idle", {}, ready=True, age_seconds=30)
-        world.add_pod("new-ready", "idle", {}, ready=True, age_seconds=5)
-        world.add_pod("booting", "idle", {}, ready=False, age_seconds=1)
+    def test_leftover_idle_is_deleted_and_assigned_is_left_alone(self):
+        world = World(capacity=10)
+        world.add_pod("idle-ready", "idle", {}, ready=True)
+        world.add_pod("idle-booting", "idle", {}, ready=False)
+        world.add_pod("in-use", "assigned", {}, ready=True)
         provider, queues, tickets, allocator, reconciler = make(world)
-        reconciler.reconcile_type(CT)
-        self.assertTrue(world.pods["booting"]["terminating"])
-        self.assertTrue(world.pods["new-ready"]["terminating"])
-        self.assertFalse(world.pods["old-ready"]["terminating"])
+        outcome = reconciler.reconcile_type(CT)
+        self.assertEqual(outcome["record"]["idle"], 2)
+        self.assertEqual(outcome["record"]["deleted"], 2)
+        self.assertTrue(world.pods["idle-ready"]["terminating"])
+        self.assertTrue(world.pods["idle-booting"]["terminating"])
+        self.assertFalse(world.pods["in-use"]["terminating"])
 
-    def test_delete_precondition_spares_pod_assigned_in_between(self):
-        world = World(capacity=10, reserve=0)
-        world.add_pod("warm-a", "idle", {}, ready=True)
+    def test_delete_precondition_spares_pod_changed_in_between(self):
+        world = World(capacity=10)
+        world.add_pod("idle-a", "idle", {}, ready=True)
         provider, queues, tickets, allocator, reconciler = make(world)
         original_delete = provider.delete_idle_pod
 
-        def assign_first(name, uid, rv):
-            # 락을 놓은 뒤 삭제 호출 전에 다른 복제본이 이 파드를 가져갔다.
-            self.assertTrue(provider.claim_idle_pod(name, world.pods[name]["resource_version"],
-                                                    "user", "t-x", "c"))
+        def changed_first(name, uid, rv):
+            # 목록을 읽은 뒤 삭제 호출 전에 다른 쪽이 이 파드를 바꿨다.
+            with world.mu:
+                world.pods[name]["buffer_status"] = "assigned"
+                world.bump(world.pods[name])
             return original_delete(name, uid, rv)
 
-        provider.delete_idle_pod = assign_first
+        provider.delete_idle_pod = changed_first
         reconciler.reconcile_type(CT)
-        self.assertFalse(world.pods["warm-a"]["terminating"])
-        self.assertEqual(world.pods["warm-a"]["buffer_status"], "assigned")
+        self.assertFalse(world.pods["idle-a"]["terminating"])
 
-    def test_stuck_idle_is_deleted_after_ready_timeout(self):
-        world = World(capacity=10, reserve=1)
-        world.add_pod("stuck", "idle", {}, ready=False,
-                      age_seconds=SETTINGS.COLD_START_POD_READY_TIMEOUT_SECONDS + 1)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        reconciler.reconcile_type(CT)
-        self.assertTrue(world.pods["stuck"]["terminating"])
-
-    def test_nothing_to_do_only_when_saturated_and_recent(self):
-        world = World(capacity=10, reserve=2)
+    def test_nothing_to_do_until_idle_remains_or_resync(self):
+        world = World(capacity=10)
         provider, queues, tickets, allocator, reconciler = make(world)
         self.assertFalse(reconciler._nothing_to_do(CT))  # 직전 기록 없음
-        world.enqueue(1)
-        reconciler.reconcile_type(CT)  # 대기 중이라 만들지 않는다 → idle 0
-        self.assertTrue(reconciler._nothing_to_do(CT))
-        with world.mu:
-            world.queue.clear()
-            world.tickets["t0001"]["status"] = "cancelled"
-        # 거름망은 Redis 를 보지 않고 직전 기록만 본다. 큐가 비어도 기록이 resync 주기
-        # 안이면 건너뛰고, 주기가 지나면 다시 계산한다(보충 지연은 그 주기까지).
+        reconciler.reconcile_type(CT)  # idle 없음
         self.assertTrue(reconciler._nothing_to_do(CT))
         with reconciler._status_lock:
             reconciler._status[CT]["updated_at"] -= reconciler.resync_seconds
         self.assertFalse(reconciler._nothing_to_do(CT))
-        reconciler.reconcile_type(CT)
-        self.assertEqual(world.created["idle"], 2)
 
-    def test_disconnected_ticket_does_not_stop_the_buffer(self):
-        """폴링을 멈춘 클라이언트의 티켓은 claim 이 건너뛴다. 그것 때문에 미리 만들기를 멈추지 않는다."""
-        world = World(capacity=10, reserve=2)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        ids = world.enqueue(1)
-        world.tickets[ids[0]]["disconnected"] = True
+        # 지우지 못한 idle 이 남았으면 거르지 않는다.
+        world.add_pod("idle-a", "idle", {}, ready=True)
+        provider.delete_idle_pod = lambda name, uid, rv: False
         reconciler.reconcile_type(CT)
-        self.assertEqual(world.created["idle"], 2)
+        self.assertFalse(reconciler._nothing_to_do(CT))
 
-    def test_lock_missed_asks_for_retry(self):
-        world = World(capacity=10, reserve=2)
+    def test_only_idle_pod_events_wake_the_leader(self):
+        world = World(capacity=10)
         provider, queues, tickets, allocator, reconciler = make(world)
-        world.lock_token = "someone-else"
-        outcome = reconciler.reconcile_type(CT)
-        self.assertTrue(outcome["retry"])
-        self.assertEqual(world.created["idle"], 0)
+        reconciler.on_buffer_event("MODIFIED", pod_event("assigned"))
+        self.assertFalse(reconciler._wake)
+        reconciler.on_buffer_event("ADDED", pod_event("idle"))
+        self.assertTrue(reconciler._wake)
+
+    def test_deletion_stops_when_leadership_is_lost(self):
+        world = World(capacity=10)
+        for index in range(3):
+            world.add_pod(f"idle-{index}", "idle", {}, ready=True)
+        provider, queues, tickets, allocator, reconciler = make(world)
+        leader = {"ok": True}
+        reconciler.set_leadership_validator(lambda: leader["ok"])
+        original_delete = provider.delete_idle_pod
+
+        def delete_then_lose(name, uid, rv):
+            leader["ok"] = False
+            return original_delete(name, uid, rv)
+
+        provider.delete_idle_pod = delete_then_lose
+        reconciler.reconcile_type(CT)
+        self.assertEqual(sum(1 for p in world.pods.values() if p["terminating"]), 1)
+
+    def test_stale_generation_does_not_delete(self):
+        world = World(capacity=10)
+        for index in range(3):
+            world.add_pod(f"idle-{index}", "idle", {}, ready=True)
+        provider, queues, tickets, allocator, reconciler = make(world)
+        reconciler._generation = 5
+        reconciler.reconcile_type(CT, generation=4)  # 이전 세대의 바퀴
+        self.assertFalse(any(p["terminating"] for p in world.pods.values()))
 
 
 # ---------------------------------------------------------------------- 동시 실행
 
 
 class DirectConcurrencyTests(unittest.TestCase):
-    def _simulate(self, capacity, reserve, tickets_total=60, seed=7):
+    def _simulate(self, capacity, tickets_total=60, seed=7, leftover_idle=0):
         random.seed(seed)
-        world = World(capacity=capacity, reserve=reserve, boot_seconds=0.03)
+        world = World(capacity=capacity, boot_seconds=0.03)
+        for index in range(leftover_idle):
+            world.add_pod(f"leftover-{index}", "idle", {}, ready=True)
         provider, queues, tickets, allocator, reconciler = make(world, create_latency=0.01)
         # 두 번째 복제본: 같은 Redis·apiserver 를 보는 다른 프로세스.
         allocator2 = SimAllocator(provider, queues, tickets)
@@ -1107,30 +982,14 @@ class DirectConcurrencyTests(unittest.TestCase):
             loop(lambda: reconciler.reconcile_type(CT), 0.004),
         ]
         ids: List[str] = []
-        cancelled = set()
         try:
-            # 실험처럼 R 개가 Ready 로 준비된 상태에서 시작한다. 요청을 바로 몰아넣으면
-            # 첫 바퀴보다 대기가 먼저 생기고, 이 부하(N 을 내내 넘는 몰림)에서는 대기가
-            # 끝까지 비지 않아 설계대로 미리 만들기가 한 번도 일어나지 않는다. 그러면
-            # "미리 만든 파드를 썼나" 가 시작 타이밍에 따라 갈렸다(스레드 전환을 잦게 하면
-            # 40회 중 26회 실패로 재현).
-            initial = min(reserve, capacity or 0)
-            self.assertTrue(
-                wait_until(
-                    lambda: sum(1 for p in world.live() if p["buffer_status"] == "idle" and p["ready"]) >= initial,
-                    timeout=5.0,
-                ),
-                "시작 전 idle 이 Ready 로 준비되지 않았다",
-            )
             remaining = tickets_total
             while remaining > 0:
                 burst = min(remaining, random.choice([1, 1, 2, 5, 8]))
                 ids += world.enqueue(burst)
                 remaining -= burst
                 if random.random() < 0.3:
-                    victim = random.choice(ids)
-                    world.cancel(victim)
-                    cancelled.add(victim)
+                    world.cancel(random.choice(ids))
                 time.sleep(random.uniform(0.0, 0.05))
 
             def settled():
@@ -1138,39 +997,34 @@ class DirectConcurrencyTests(unittest.TestCase):
                     return all(world.tickets[t]["status"] in ("done", "cancelled") for t in ids)
 
             self.assertTrue(wait_until(settled, timeout=20.0), "티켓이 끝나지 않았다")
-            # 수요가 끝난 뒤 버퍼가 R 로 돌아온다(쿨다운 창이 지나면).
-            converged = wait_until(
-                lambda: len([p for p in world.live() if p["buffer_status"] == "idle"]) == min(reserve, capacity)
-                and not any(p["buffer_status"] == "assigned" for p in world.live()),
-                timeout=10.0,
-            )
+            emptied = wait_until(lambda: not world.live(), timeout=10.0)
         finally:
             stop.set()
             for thread in threads:
                 thread.join(timeout=2)
         self.assertEqual(errors, [])
         self.assertEqual(world.violations, [], f"N={capacity} 을 넘었다: {world.violations[:5]}")
-        self.assertTrue(converged, "버퍼가 R 로 돌아오지 않았다")
-        # 파드 하나는 요청 하나에만 쓴다.
+        self.assertTrue(emptied, "수요가 끝났는데 파드가 남았다")
+        # 파드 하나는 요청 하나에만 쓰고, 남은 idle 은 아무 요청도 받지 않았다.
         for pod, owners in world.assignments.items():
             self.assertEqual(len(owners), 1, pod)
+            self.assertFalse(pod.startswith("leftover-"), pod)
         done = [t for t in ids if world.tickets[t]["status"] == "done"]
         self.assertGreater(len(done), 0)
-        return world, done
+        # 만든 파드는 할당됐거나, 만든 뒤 취소된 티켓 몫으로 버려졌다.
+        cancelled = sum(1 for t in ids if world.tickets[t]["status"] == "cancelled")
+        self.assertLessEqual(world.created["request"] - len(world.assignments), cancelled)
+        return world
 
-    def test_capacity_holds_with_reserve(self):
-        world, done = self._simulate(capacity=6, reserve=2)
-        self.assertGreater(world.created["idle"], 0)
-        self.assertTrue(world.assignments, "미리 만든 파드를 한 번도 쓰지 않았다")
+    def test_capacity_holds(self):
+        world = self._simulate(capacity=6)
         self.assertLessEqual(world.max_live, 6)
 
-    def test_reserve_zero_holds_capacity_and_returns_to_zero(self):
-        """R=0 이어도 동적 R 은 몰림 뒤 버퍼를 둔다. 수요가 끝나면 0 으로 돌아온다."""
-        self._simulate(capacity=6, reserve=0, seed=3)
-
     def test_tight_capacity(self):
-        self._simulate(capacity=2, reserve=2, tickets_total=40, seed=11)
+        self._simulate(capacity=2, tickets_total=40, seed=11)
 
+    def test_leftover_idle_is_cleared_and_never_used(self):
+        self._simulate(capacity=6, seed=3, leftover_idle=3)
 
 
 # ---------------------------------------------------------------------- 배포 계약
@@ -1193,10 +1047,9 @@ class DirectDeployContractTests(unittest.TestCase):
         labels = pod["metadata"]["labels"]
         self.assertEqual(labels["app"], "compute-pod")
         self.assertIn("assigned-user", labels)
-        # 남아 있는 develop Deployment 의 ReplicaSet 이 입양하지 못하게 available 을 쓰지 않는다.
         self.assertNotEqual(labels["compute-status"], "available")
-        # 다른 arm(develop, cold)의 compute 파드와 같은 사양이어야 버퍼 관리 방식만 다른
-        # 비교가 된다(10/11 develop compute-general.yaml 의 파드 사양과 대조해 맞춘 값).
+        # 다른 arm(warm buffer, reuse)의 compute 파드와 같은 사양이어야 할당 방식만 다른
+        # 비교가 된다.
         agent = pod["spec"]["containers"][0]
         self.assertEqual(agent["resources"]["requests"], {"cpu": "1", "memory": "2Gi"})
         self.assertEqual(agent["resources"]["limits"], {"cpu": "1", "memory": "2Gi"})
@@ -1204,19 +1057,34 @@ class DirectDeployContractTests(unittest.TestCase):
         self.assertEqual(agent["readinessProbe"]["periodSeconds"], 2)
         self.assertNotIn("schedulingGates", pod["spec"])
 
-    def test_deploy_passes_policy_through_controller_env_with_one_rollout(self):
+    def test_no_precreation_path_in_the_controller(self):
+        """미리 만드는 경로는 끄는 것이 아니라 없다(정적 R=0 이나 토글로 cold 를 흉내 내지 않는다)."""
+        compute = ROOT / "services" / "compute"
+        provider = (compute / "direct_buffer_provider.py").read_text(encoding="utf-8")
+        allocator = (compute / "allocator.py").read_text(encoding="utf-8")
+        reconciler = (compute / "direct_buffer_reconciler.py").read_text(encoding="utf-8")
+        for name in ("def create_idle_pod", "def claim_idle_pod", "def new_idle_name", "def read_reserve"):
+            self.assertNotIn(name, provider)
+        self.assertNotIn("claim_idle", allocator)
+        self.assertNotIn("create_pod", reconciler)
+        self.assertNotIn("BufferPolicy", reconciler)
+        self.assertFalse((compute / "buffer_policy.py").exists())
+        self.assertIn('allocation_mode = "cold_start"', provider)
+
+    def test_deploy_passes_n_through_controller_env_with_one_rollout(self):
         script = (self.REPO / "deploy/scripts/deploy.sh").read_text(encoding="utf-8")
-        inject = script.index('set_buffer_policy.sh" "${rendered}" "${buffer_reserve}" "${buffer_capacity}"')
+        inject = script.index('set_buffer_policy.sh" "${rendered}" "${buffer_capacity}"')
         # 적용보다 먼저 넣는다. 적용 뒤 set env 로 바꾸면 rollout 이 두 번 돈다.
         self.assertLess(inject, script.index("apply_stage bootstrap"))
         self.assertNotIn("kubectl set env deployment/controller", script)
-        self.assertIn('status.get("allocation_mode") == "warm_buffer_direct"', script)
-        # Deployment 버퍼를 되살리거나 정책을 거기에 싣지 않는다.
-        self.assertNotIn("kubectl annotate deployment/compute-general", script)
-        self.assertNotIn("kubectl patch deployment/compute-general", script)
+        self.assertNotIn("BUFFER_RESERVE", script)
+        # smoke: 이 arm 으로 돌고, R 이 없고, idle 파드가 0 이다.
+        self.assertIn('status.get("allocation_mode") == "cold_start"', script)
+        self.assertIn('status.get("R") is None', script)
+        self.assertIn('status.get("available") == 0', script)
         self.assertIn("kubectl delete deployment -l app=compute-pod", script)
 
-    def test_policy_injection_sets_both_env_values_exactly_once(self):
+    def test_n_injection_sets_the_env_value_exactly_once(self):
         import shutil
         import subprocess
         import tempfile
@@ -1227,8 +1095,6 @@ class DirectDeployContractTests(unittest.TestCase):
         script = str(self.REPO / "deploy/scripts/set_buffer_policy.sh")
         rendered = "\n".join([
             "        env:",
-            "        - name: BUFFER_RESERVE",
-            '          value: ""',
             "        - name: BUFFER_CAPACITY",
             '          value: ""',
             "",
@@ -1236,254 +1102,32 @@ class DirectDeployContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rendered.yaml"
             path.write_text(rendered, encoding="utf-8")
-            subprocess.run([shell, script, str(path), "2", "40"], check=True)
-            text = path.read_text(encoding="utf-8")
-            self.assertIn('value: "2"', text)
-            self.assertIn('value: "40"', text)
-            # 하나라도 없으면 실패해서 배포를 멈춘다.
-            path.write_text(rendered.split("        - name: BUFFER_CAPACITY")[0], encoding="utf-8")
-            failed = subprocess.run([shell, script, str(path), "2", "40"], capture_output=True)
+            subprocess.run([shell, script, str(path), "40"], check=True)
+            self.assertIn('value: "40"', path.read_text(encoding="utf-8"))
+            # 없으면 실패해서 배포를 멈춘다.
+            path.write_text("        env:\n", encoding="utf-8")
+            failed = subprocess.run([shell, script, str(path), "40"], capture_output=True)
             self.assertNotEqual(failed.returncode, 0)
 
-    def test_controller_manifest_names_the_arm_and_has_no_policy_switch(self):
+    def test_controller_manifest_names_the_arm_and_has_no_r(self):
         documents = self._load_yaml("deploy/base/controller.yaml")
         controller = next(d for d in documents if d and d.get("kind") == "Deployment")
         env = {
             item["name"]: item.get("value")
             for item in controller["spec"]["template"]["spec"]["containers"][0]["env"]
         }
-        self.assertEqual(env["COMPUTE_ALLOCATION_MODE"], "warm_buffer_direct")
-        # 동적 R 하나만 있다. 끄고 켜는 스위치를 다시 들이지 않는다.
+        self.assertEqual(env["COMPUTE_ALLOCATION_MODE"], "cold_start")
+        self.assertNotIn("BUFFER_RESERVE", env)
         self.assertNotIn("BUFFER_DYNAMIC_RESERVE_ENABLED", env)
-        self.assertIn("BUFFER_RESERVE", env)
         self.assertIn("BUFFER_CAPACITY", env)
 
-
-
-# ---------------------------------------------------------------- 장애 조건
-
-
-class HoldAllocator(SimAllocator):
-    """세션이 끝나지 않는 할당(자리를 계속 쥔다)."""
-
-    def _execute_allocated_ticket(self, ticket):
-        with self.provider.world.mu:
-            self.provider.world.tickets[ticket["ticket_id"]]["status"] = "assigned"
-        return {"status": "assigned"}
-
-
-class DirectFaultTests(unittest.TestCase):
-    def test_slow_creates_cannot_exceed_n_after_reservations_expire(self):
-        """리뷰 재현: 호출당 4.9초로 순차 생성하면 뒤쪽 예약이 60초를 넘겨 만료된다.
-
-        그 자리를 다른 복제본이 빈자리로 세어 요청 파드를 만든다. 고치기 전에는 리더가
-        남은 이름을 마저 만들어 N=16 에 19 개가 됐다.
-        """
-        clock = {"now": 1_000_000.0}
-        world = World(capacity=16, reserve=16)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        reconciler.policy.cooldown_seconds = lambda compute_type: 0.0
-        original_create = provider.create_idle_pod
-        state = {"stolen": False}
-
-        def slow_create(compute_type, name):
-            clock["now"] += 4.9
-            if clock["now"] - 1_000_000.0 > 60 and not state["stolen"]:
-                state["stolen"] = True
-                world.tick()
-                time.sleep(0.05)
-                world.tick()
-                world.enqueue(16)
-                for _ in range(2):
-                    with run_detached_threads_inline():
-                        HoldAllocator(provider, queues, tickets).drain_wait_queue_for_type(CT, no_stale)
-            return original_create(compute_type, name)
-
-        provider.create_idle_pod = slow_create
-        with patch("time.time", lambda: clock["now"]):
-            reconciler.reconcile_type(CT)
-        self.assertTrue(state["stolen"])
-        self.assertEqual(world.violations, [])
-        self.assertLessEqual(len(world.live()), 16)
-
-    def test_reservations_stay_alive_while_creates_are_slow(self):
-        """다른 쪽이 끼어들지 않으면 느린 생성도 끝까지 다 만든다(꼬리 예약이 만료되지 않는다)."""
-        clock = {"now": 2_000_000.0}
-        world = World(capacity=16, reserve=16)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        reconciler.policy.cooldown_seconds = lambda compute_type: 0.0
-        original_create = provider.create_idle_pod
-
-        def slow_create(compute_type, name):
-            clock["now"] += 4.9
-            # 다른 복제본이 예약을 세면서 만료된 것을 지운다.
-            queues.pending_creates(CT, 60.0)
-            return original_create(compute_type, name)
-
-        provider.create_idle_pod = slow_create
-        with patch("time.time", lambda: clock["now"]):
-            reconciler.reconcile_type(CT)
-        self.assertEqual(world.created["idle"], 16)
-
-    def test_plan_is_not_registered_after_the_lock_is_lost(self):
-        world = World(capacity=10, reserve=3)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        original_plan = reconciler._plan
-
-        def plan_then_lose_lock(ct):
-            plan = original_plan(ct)
-            world.lock_token = "someone-else"  # 계획 중에 락이 만료돼 남이 잡았다
-            return plan
-
-        reconciler._plan = plan_then_lose_lock
-        outcome = reconciler.reconcile_type(CT)
-        self.assertEqual(outcome["record"].get("create_aborted"), "lock_lost")
-        self.assertEqual(world.created["idle"], 0)
-        self.assertEqual(world.pending, {})
-
-    def test_request_pod_with_lost_reservation_but_fresh_claim_is_created(self):
-        world = World(capacity=5, reserve=0)
-        provider, queues, tickets, allocator, _ = make(world)
-        world.enqueue(1)
-        original_refresh = queues.refresh_pending_creates
-
-        def reservation_pruned(compute_type, names, kind):
-            with world.mu:
-                for name in names:
-                    world.pending.pop(name, None)
-            return original_refresh(compute_type, names, kind)
-
-        queues.refresh_pending_creates = reservation_pruned
-        with run_detached_threads_inline():
-            allocator.drain_wait_queue_for_type(CT, no_stale)
-        self.assertEqual(world.created["request"], 1)
-        self.assertEqual(world.tickets["t0001"]["status"], "assigned")
-
-    def test_request_pod_with_lost_reservation_and_stale_claim_is_requeued(self):
-        world = World(capacity=5, reserve=0)
-        provider, queues, tickets, allocator, _ = make(world)
-        world.enqueue(1)
-        original_refresh = queues.refresh_pending_creates
-
-        def reservation_and_claim_expired(compute_type, names, kind):
-            with world.mu:
-                for name in names:
-                    world.pending.pop(name, None)
-                world.tickets["t0001"]["stale"] = True
-            return original_refresh(compute_type, names, kind)
-
-        queues.refresh_pending_creates = reservation_and_claim_expired
-        with run_detached_threads_inline():
-            allocator.drain_wait_queue_for_type(CT, no_stale)
-        self.assertEqual(world.created["request"], 0)
-        self.assertEqual(world.tickets["t0001"]["status"], "queued")
-        self.assertEqual(world.tickets["t0001"]["retry_count"], 0)
-
-
-
-class DirectLeadershipTests(unittest.TestCase):
-    def test_creation_stops_when_leadership_is_lost_mid_batch(self):
-        world = World(capacity=10, reserve=5)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        leader = {"ok": True}
-        reconciler.set_leadership_validator(lambda: leader["ok"])
-        original_create = provider.create_idle_pod
-        calls = {"n": 0}
-
-        def create_then_lose(compute_type, name):
-            calls["n"] += 1
-            if calls["n"] == 2:
-                leader["ok"] = False  # 두 번째 생성 도중 리더를 잃었다
-            return original_create(compute_type, name)
-
-        provider.create_idle_pod = create_then_lose
-        reconciler.reconcile_type(CT)
-        self.assertEqual(world.created["idle"], 2)
-        # 만들지 않은 세 이름의 예약은 남기지 않는다.
-        with world.mu:
-            unlisted = [name for name in world.pending if name not in world.pods]
-        self.assertEqual(unlisted, [])
-
-    def test_creation_stops_on_stop_signal(self):
-        world = World(capacity=10, reserve=4)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        original_create = provider.create_idle_pod
-
-        def create_then_stop(compute_type, name):
-            reconciler._stop_event.set()
-            return original_create(compute_type, name)
-
-        provider.create_idle_pod = create_then_stop
-        reconciler.reconcile_type(CT)
-        self.assertEqual(world.created["idle"], 1)
-
-    def test_stale_generation_does_not_delete(self):
-        world = World(capacity=10, reserve=0)
-        for index in range(3):
-            world.add_pod(f"warm-{index}", "idle", {}, ready=True)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        reconciler._generation = 5
-        reconciler.reconcile_type(CT, generation=4)  # 이전 세대의 바퀴
-        self.assertFalse(any(p["terminating"] for p in world.pods.values()))
-
-
-
-class DirectTemplateGenerationTests(unittest.TestCase):
-    def _live(self, world):
-        return sorted((p["name"], p["template_hash"]) for p in world.live())
-
-    def test_outdated_idle_is_not_handed_out(self):
-        world = World(capacity=5, reserve=1)
-        world.add_pod("warm-old", "idle", {}, ready=True, template_hash="gen-0")
-        provider, queues, tickets, allocator, _ = make(world)
-        world.enqueue(1)
-        with run_detached_threads_inline():
-            allocator.drain_wait_queue_for_type(CT, no_stale)
-        self.assertNotIn("warm-old", world.assignments)
-        self.assertEqual(world.created["request"], 1)
-
-    def test_replacements_are_ready_before_outdated_idle_is_deleted(self):
-        world = World(capacity=10, reserve=2)
-        world.add_pod("warm-old-a", "idle", {}, ready=True, template_hash="gen-0")
-        world.add_pod("warm-old-b", "idle", {}, ready=True, template_hash="gen-0")
-        provider, queues, tickets, allocator, reconciler = make(world)
-        reconciler.reconcile_type(CT)
-        self.assertEqual(world.created["idle"], 2)
-        self.assertFalse(world.pods["warm-old-a"]["terminating"])  # 교체본이 아직 부팅 중
-        self.assertTrue(wait_until(lambda: all(p["ready"] for p in world.live()), world=world))
-        reconciler.reconcile_type(CT)
-        self.assertTrue(world.pods["warm-old-a"]["terminating"])
-        self.assertTrue(world.pods["warm-old-b"]["terminating"])
-        self.assertEqual(world.violations, [])
-
-    def test_full_capacity_replaces_one_at_a_time_without_exceeding_n(self):
-        world = World(capacity=2, reserve=2)
-        world.add_pod("warm-old-a", "idle", {}, ready=True, template_hash="gen-0", age_seconds=2)
-        world.add_pod("warm-old-b", "idle", {}, ready=True, template_hash="gen-0", age_seconds=1)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        for _ in range(12):
-            reconciler.reconcile_type(CT)
-            wait_until(lambda: False, timeout=0.05, world=world)
-            self.assertLessEqual(len(world.live()), 2)
-        self.assertEqual([h for _, h in self._live(world)], ["gen-1", "gen-1"])
-        self.assertEqual(world.violations, [])
-
-    def test_outdated_idle_is_dropped_while_requests_wait(self):
-        world = World(capacity=10, reserve=2)
-        world.add_pod("warm-old", "idle", {}, ready=True, template_hash="gen-0")
-        provider, queues, tickets, allocator, reconciler = make(world)
-        world.enqueue(1)
-        reconciler.reconcile_type(CT)
-        self.assertTrue(world.pods["warm-old"]["terminating"])
-
-    def test_current_generation_buffer_is_left_alone(self):
-        world = World(capacity=10, reserve=2)
-        world.add_pod("warm-a", "idle", {}, ready=True)
-        world.add_pod("warm-b", "idle", {}, ready=True)
-        provider, queues, tickets, allocator, reconciler = make(world)
-        reconciler.reconcile_type(CT)
-        self.assertEqual(world.created["idle"], 0)
-        self.assertFalse(any(p["terminating"] for p in world.pods.values()))
+    def test_jenkins_takes_only_n(self):
+        jenkinsfile = self.REPO / "Jenkinsfile"
+        if not jenkinsfile.exists():
+            self.skipTest("테스트 이미지에는 Jenkinsfile 이 없다")
+        text = jenkinsfile.read_text(encoding="utf-8")
+        self.assertIn("name: 'BUFFER_CAPACITY'", text)
+        self.assertNotIn("BUFFER_RESERVE", text)
 
 
 if __name__ == "__main__":

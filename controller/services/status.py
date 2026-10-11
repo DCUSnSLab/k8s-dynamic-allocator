@@ -18,7 +18,8 @@ class ControllerStatus:
         capacity = self.provider.read_capacity()
         response = {
             "allocation_mode": self.provider.allocation_mode,
-            "R": self.provider.read_reserve(),
+            # 미리 만드는 파드가 없는 arm 이다. R 은 0 이 아니라 없는 값이다.
+            "R": None,
             "N": capacity,
             "capacity": capacity,
             "total": len(snapshot["active_names"]),

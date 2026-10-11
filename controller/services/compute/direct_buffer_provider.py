@@ -1,15 +1,8 @@
-"""Deployment 없이 컨트롤러가 직접 관리하는 웜 버퍼의 파드 공급자.
+"""cold start 의 파드 공급자. 요청마다 파드를 만들고 반납 때 지운다.
 
-cold start 공급자(요청마다 파드를 만들고 반납 때 지운다)에 "미리 만들어 둔 파드"
-하나를 더한 것이다. 파드는 두 상태다.
-
-  idle      미리 만든 파드. 부팅 중이거나 Ready 로 대기한다. 아직 요청이 없다.
-  assigned  요청에 묶인 파드. 미리 만든 파드를 할당했거나 요청 때 새로 만들었다.
-
-ReplicaSet 이 없으므로 replicas·게이트·축소 게이트가 없고, 어떤 파드를 지울지는
-항상 컨트롤러가 고른다. idle 라벨 값은 일부러 "available" 이 아니다 - 같은
-네임스페이스에 남아 있는 compute-general Deployment(셀렉터 compute-status=available)의
-ReplicaSet 이 주인 없는 파드로 보고 입양해 지우지 못하게 하기 위해서다.
+제안(warm buffer)의 공급자에서 "미리 만들어 둔 파드" 를 뺀 것이다. 이 arm 이 만드는
+파드는 모두 assigned(요청에 묶인 파드)다. idle 은 다른 arm 이 남긴 파드를 알아보고
+지우기 위해서만 읽는다. Deployment 는 쓰지 않는다.
 """
 
 import copy
@@ -20,7 +13,6 @@ import logging
 import os
 import re
 import time
-import uuid
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
@@ -59,8 +51,8 @@ MANIFESTS_DIR = os.path.join(
 
 
 class DirectBufferProvider(KubernetesClient):
-    allocation_mode = "warm_buffer_direct"
-    # 리더의 버퍼 조정이 파드 이벤트로 깨어나고, 생성 시간 표본도 이벤트에서 얻는다.
+    allocation_mode = "cold_start"
+    # 리더의 남은 idle 정리가 파드 이벤트로 깨어난다.
     uses_availability_watch = True
 
     LABEL_APP = "app"
@@ -70,20 +62,19 @@ class DirectBufferProvider(KubernetesClient):
 
     APP_COMPUTE_POD = "compute-pod"
 
+    # 다른 arm(warm buffer)이 미리 만든 파드. 이 arm 은 만들지도 내주지도 않고 지운다.
     STATUS_IDLE = "idle"
     STATUS_ASSIGNED = "assigned"
-    # compute watcher 와 상태 보고가 쓰는 이름. 이 arm 에서 "할당 가능" 은 idle 이다.
+    # compute watcher 와 상태 보고가 쓰는 이름. 이 arm 에는 할당 가능한 파드가 없다.
     STATUS_AVAILABLE = STATUS_IDLE
 
     ANNOTATION_ALLOCATION_TICKET = "k8s-dynamic-allocator/allocation-ticket-id"
     ANNOTATION_ALLOCATION_CLAIM = "k8s-dynamic-allocator/allocation-claim-token"
-    # idle 로 만든 파드인지 요청 때 만든 파드인지. 분석에서 "미리 만든 파드를 썼나" 를
-    # 가른다. 할당해도 바뀌지 않는다.
+    # 파드를 만든 경로. 이 arm 은 늘 request 다. 분석 도구가 arm 과 상관없이 같은
+    # 어노테이션으로 "미리 만든 파드를 썼나" 를 가르므로 남긴다.
     ANNOTATION_ORIGIN = "k8s-dynamic-allocator/origin"
-    # 파드를 만든 템플릿(이미지 포함)의 세대. 배포로 템플릿이 바뀌면 옛 세대 idle 은
-    # 할당하지 않고 교체한다. 요청에 묶인 파드는 건드리지 않는다.
+    # 파드를 만든 템플릿(이미지 포함)의 세대. 기록용이다(arm 과 상관없이 같은 형식).
     ANNOTATION_TEMPLATE_HASH = "k8s-dynamic-allocator/template-hash"
-    ORIGIN_IDLE = "idle"
     ORIGIN_REQUEST = "request"
 
     def __init__(self):
@@ -95,20 +86,19 @@ class DirectBufferProvider(KubernetesClient):
     # ------------------------------------------------------------------ 설정
 
     def initialize_buffer(self, *, log_existing: bool = True) -> Dict:
-        """파드 템플릿을 읽고 검증한다. 파드는 만들지 않는다(리더의 조정이 만든다)."""
+        """파드 템플릿을 읽고 검증한다. 파드는 만들지 않는다(요청이 올 때 할당이 만든다)."""
         results = {"created": [], "existing": [], "failed": [], "templates": []}
         self._templates_by_type = {}
         self._template_hash_by_type = {}
 
         if log_existing:
             capacity = self.read_capacity()
-            reserve = self.read_reserve()
             if capacity is None:
                 logger.error(
                     "[Failed] operation=direct_buffer_capacity reason=%r",
                     "no capacity (BUFFER_CAPACITY) configured; no compute pod will be created",
                 )
-            logger.info("Direct warm buffer policy: R=%s N=%s", reserve, capacity)
+            logger.info("Cold start policy: N=%s", capacity)
 
         yaml_files = glob.glob(os.path.join(MANIFESTS_DIR, "*.yaml"))
         if not yaml_files:
@@ -139,7 +129,7 @@ class DirectBufferProvider(KubernetesClient):
                 results["failed"].append({"file": os.path.basename(yaml_file), "error": str(exc)})
 
         if results["templates"] and log_existing:
-            logger.info("Direct warm buffer pod templates loaded: %s", results["templates"])
+            logger.info("Cold start pod templates loaded: %s", results["templates"])
         return results
 
     @staticmethod
@@ -157,15 +147,10 @@ class DirectBufferProvider(KubernetesClient):
             return None
 
     def read_capacity(self, compute_type: Optional[str] = None) -> Optional[int]:
-        """N. None 이면 설정이 없는 것이고, 할당과 버퍼 조정은 파드를 하나도 만들지 않는다
+        """N. None 이면 설정이 없는 것이고, 할당은 파드를 하나도 만들지 않는다
         (상한 없는 run 이 조용히 생기지 않게. 시작 로그에 오류가 남는다)."""
         del compute_type
         return self._parse_count(settings.WARM_BUFFER_CAPACITY, "N")
-
-    def read_reserve(self, compute_type: Optional[str] = None) -> int:
-        """R(버퍼의 바닥). 비었거나 잘못되면 0. 동적 R 이라 0 이어도 몰림 뒤에는 버퍼를 둔다."""
-        del compute_type
-        return self._parse_count(settings.WARM_BUFFER_RESERVE, "R") or 0
 
     # ------------------------------------------------------------------ 목록
 
@@ -248,22 +233,13 @@ class DirectBufferProvider(KubernetesClient):
 
     # ------------------------------------------------------------------ 생성
 
-    # 파드 이름은 미리 만든 것과 요청 때 만든 것이 같은 규칙이다: compute-<타입>-<hex 10>.
-    # 어느 경로로 만들었는지는 어노테이션 origin 이 기록한다(분석용). 이름으로 구분하지
-    # 않는다 - 측정과 운영이 같은 코드를 쓴다.
+    # 파드 이름은 arm 과 상관없이 같은 규칙이다: compute-<타입>-<hex 10>. 어느 경로로
+    # 만들었는지는 어노테이션 origin 이 기록한다(분석용). 이름으로 구분하지 않는다.
 
     @staticmethod
     def _pod_name(compute_type: str, suffix: str) -> str:
         type_value = re.sub(r"[^a-z0-9-]", "-", compute_type.lower()).strip("-") or "general"
         return f"compute-{type_value}-{suffix}"
-
-    def new_idle_name(self, compute_type: str) -> str:
-        """미리 만들 파드의 이름. 요청 전에 정해 N 계산의 "생성 중" 목록에 먼저 올린다.
-
-        무작위 꼬리를 쓴다. 순번은 초기화 때 Redis 와 함께 지워져, 앞 run 의 지워지는
-        중인 파드와 이름이 겹칠 수 있다.
-        """
-        return self._pod_name(compute_type, uuid.uuid4().hex[:10])
 
     def request_pod_name(self, ticket: Dict) -> str:
         """요청 하나에 묶어 만들 파드의 이름. 만들기 전에 티켓과 생성 중 목록에 올린다.
@@ -278,22 +254,6 @@ class DirectBufferProvider(KubernetesClient):
             retry_count = 0
         digest = hashlib.sha256(f"{ticket.get('ticket_id') or ''}:{retry_count}".encode("utf-8")).hexdigest()
         return self._pod_name(compute_type, digest[:10])
-
-    @timing.timed("k8s.create_pod")
-    def create_idle_pod(self, compute_type: str, pod_name: str) -> None:
-        """요청 없이 파드를 하나 만든다. 409(같은 이름 존재)는 예외로 올린다."""
-        body = self._pod_body(
-            compute_type,
-            pod_name,
-            status=self.STATUS_IDLE,
-            user="",
-            annotations={self.ANNOTATION_ORIGIN: self.ORIGIN_IDLE},
-        )
-        self.v1.create_namespaced_pod(
-            namespace=self.namespace,
-            body=body,
-            _request_timeout=self.api_request_timeout,
-        )
 
     @timing.timed("k8s.create_pod")
     def create_pod_for_ticket(self, ticket: Dict, pod_name: Optional[str] = None) -> str:
@@ -343,60 +303,13 @@ class DirectBufferProvider(KubernetesClient):
         metadata["annotations"] = merged
         return body
 
-    # ------------------------------------------------------------------ 할당·삭제
-
-    @timing.timed("k8s.patch_assign")
-    def claim_idle_pod(
-        self,
-        pod_name: str,
-        expected_resource_version: str,
-        user_pod: str,
-        ticket_id: str,
-        claim_token: str,
-        expected_annotations: Optional[Dict] = None,
-    ) -> bool:
-        """idle 파드를 요청에 묶는다. 읽은 뒤 바뀌었으면(삭제 시작 포함) 아무것도 안 하고 False.
-
-        resourceVersion 을 test 하므로, 그사이 다른 복제본이 할당했거나 리더가 지우기
-        시작했으면(deletionTimestamp 가 붙으면 버전이 바뀐다) 실패한다.
-        """
-        if not pod_name or not expected_resource_version:
-            return False
-        annotations = dict(expected_annotations or {})
-        annotations[self.ANNOTATION_ALLOCATION_TICKET] = ticket_id or ""
-        annotations[self.ANNOTATION_ALLOCATION_CLAIM] = claim_token or ""
-        patch = [
-            {"op": "test", "path": "/metadata/resourceVersion", "value": expected_resource_version},
-            {"op": "test", "path": "/metadata/labels/app", "value": self.APP_COMPUTE_POD},
-            {"op": "test", "path": "/metadata/labels/compute-status", "value": self.STATUS_IDLE},
-            {"op": "add", "path": "/metadata/annotations", "value": annotations},
-            {"op": "replace", "path": "/metadata/labels/compute-status", "value": self.STATUS_ASSIGNED},
-            {"op": "replace", "path": "/metadata/labels/assigned-user", "value": user_pod or "unknown"},
-        ]
-        try:
-            self.v1.api_client.call_api(
-                "/api/v1/namespaces/{namespace}/pods/{name}",
-                "PATCH",
-                path_params={"namespace": self.namespace, "name": pod_name},
-                body=patch,
-                header_params={"Content-Type": "application/json-patch+json"},
-                auth_settings=["BearerToken"],
-                _return_http_data_only=True,
-                _preload_content=True,
-                _request_timeout=self.api_request_timeout,
-            )
-        except ApiException as exc:
-            if exc.status in (404, 409, 422):
-                return False
-            raise
-        return True
+    # ------------------------------------------------------------------ 삭제
 
     @timing.timed("k8s.delete_pod")
     def delete_idle_pod(self, pod_name: str, uid: str, expected_resource_version: str) -> bool:
-        """idle 파드를 지운다. 읽은 뒤 바뀌었으면(그사이 할당됐으면) 지우지 않고 False.
+        """남은 idle 파드를 지운다. 읽은 뒤 바뀌었으면 지우지 않고 False.
 
-        삭제 전제 조건(uid + resourceVersion)이라 할당과 같은 파드를 두고 겹쳐도
-        할당된 파드를 지우는 일이 없다.
+        삭제 전제 조건(uid + resourceVersion)이라 그사이 다른 쪽이 바꾼 파드는 지우지 않는다.
         """
         try:
             self.v1.delete_namespaced_pod(
@@ -444,15 +357,14 @@ class DirectBufferProvider(KubernetesClient):
         self,
         pod_name: str,
         keep_claim: Optional[Callable[[], bool]] = None,
-        must_exist: bool = False,
     ):
         """파드가 Ready 가 될 때까지 기다린다.
 
         이미지가 느리면 티켓의 allocating TTL 보다 오래 걸릴 수 있다. keep_claim 이
         기다리는 동안 claim 을 연장하고, 티켓이 소유권을 잃으면 멈춘다.
 
-        404 는 생성 직후 한때만 "아직 안 보임" 으로 본다. 한 번 본 파드(또는 이미 있던
-        idle, must_exist)가 404 면 지워진 것이다 - 우리 삭제는 grace 0 이라 Terminating
+        404 는 생성 직후 한때만 "아직 안 보임" 으로 본다. 한 번 본 파드가 404 면 지워진
+        것이다 - 우리 삭제는 grace 0 이라 Terminating
         단계 없이 바로 사라지므로, 그때 기다리면 Ready 대기 상한(300초)을 통째로 쓴다.
         읽기 실패(timeout, 5xx, 429)는 상한 안에서 다시 읽는다. 혼잡한 apiserver 에서
         한 번의 실패로 할당 시도를 버리면 재시도 예산이 줄고 파드를 새로 만든다.
@@ -463,7 +375,7 @@ class DirectBufferProvider(KubernetesClient):
         deadline = time.monotonic() + timeout
         next_renew = time.monotonic() + renew_interval
         last_phase = ""
-        seen = bool(must_exist)
+        seen = False
 
         while time.monotonic() < deadline:
             if keep_claim is not None and time.monotonic() >= next_renew:

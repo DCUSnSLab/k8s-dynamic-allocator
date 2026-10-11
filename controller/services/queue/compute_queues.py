@@ -271,49 +271,6 @@ class ComputeQueues:
     def _lock_key(self, compute_type: str) -> str:
         return f"{self.prefix}:lock:{compute_type}"
 
-    def _churn_samples_key(self, compute_type: str, kind: str) -> str:
-        return f"{self.prefix}:churn:{kind}:{compute_type}"
-
-    def record_churn_sample(
-        self,
-        compute_type: str,
-        kind: str,
-        value: float,
-        cap: int,
-    ) -> None:
-        """쿨다운 길이를 정하는 관측 표본 하나를 남긴다.
-
-        리컨실러는 이 표본들의 p90 으로 축소 쿨다운을 정한다. 프로세스 메모리에만
-        두면 컨트롤러가 재시작되거나 리더가 바뀔 때 표본이 사라지고, 다시 쌓일 때까지
-        쿨다운이 0 이 되어 축소가 무조건 통과한다. 실험은 매번 컨트롤러를 재시작하므로
-        그 구간이 항상 생긴다.
-
-        표본은 컨트롤러 사이에 공유해도 되는 값이다 - 이 클러스터에서 파드를 세우는 데
-        걸리는 시간과 수요가 가라앉아 있는 시간이라, 누가 관측했는지는 상관이 없다.
-        리더가 아닌 쪽도 파드 이벤트를 보기 때문에 공유하면 표본이 더 빨리 모인다.
-
-        값이 밀리면 오래된 것부터 버린다. TTL 은 두지 않는다 - 부하가 없는 밤에
-        표본이 만료되면 아침 첫 축소가 쿨다운 없이 지나간다.
-        """
-        client = self._redis_client()
-        key = self._churn_samples_key(compute_type, kind)
-        with client.pipeline(transaction=False) as pipe:
-            pipe.rpush(key, repr(float(value)))
-            pipe.ltrim(key, -int(max(1, cap)), -1)
-            pipe.execute()
-
-    def churn_samples(self, compute_type: str, kind: str) -> List[float]:
-        """record_churn_sample 로 쌓인 표본. 읽을 수 없으면 빈 목록."""
-        client = self._redis_client()
-        raw = client.lrange(self._churn_samples_key(compute_type, kind), 0, -1) or []
-        values = []
-        for item in raw:
-            try:
-                values.append(float(item))
-            except (TypeError, ValueError):
-                continue
-        return values
-
     def _assigned_request_key(self, compute_pod: str) -> str:
         return f"{self.prefix}:assigned-request:{compute_pod}"
 
@@ -708,40 +665,9 @@ class ComputeQueues:
             missing.append(compute_pod)
         return missing
 
-    def claimable_queued_count(self, compute_type: str) -> int:
-        """지금 claim 할 수 있는 대기 티켓 수.
-
-        queued_count 와 달리 claim 이 건너뛰는 티켓(클라이언트가 폴링을 멈춤)을 빼고
-        센다. 그런 티켓은 큐에 자리를 지킨 채 대기 제한(기본 30분)까지 남을 수 있어,
-        버퍼 조정이 그것을 "대기 수요" 로 보면 그동안 미리 만들기를 멈춘다.
-        """
-        compute_type_value = self.normalize_compute_type(compute_type)
-        ticket_ids = self._queue_ids(compute_type_value)
-        if not ticket_ids:
-            return 0
-        client = self._redis_client()
-        try:
-            with client.pipeline(transaction=False) as pipe:
-                for ticket_id in ticket_ids:
-                    pipe.hmget(self._ticket_key(ticket_id), "status", "last_poll_ms", "created_at")
-                rows = pipe.execute()
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to read queued tickets for {compute_type_value}: {exc}"
-            ) from exc
-        count = 0
-        for status, last_poll_ms, created_at in rows:
-            if str(status or "").lower() != "queued":
-                continue
-            fields = {"last_poll_ms": last_poll_ms, "created_at": parse_datetime(created_at)}
-            if self.is_client_disconnected(fields):
-                continue
-            count += 1
-        return count
-
-    # 생성 중 예약은 종류별로 따로 둔다. 파드가 아직 없어 어노테이션으로 구분할 수 없고,
-    # 이름도 두 종류가 같은 규칙이다. N 계산은 둘을 합쳐 세고, 리더는 미리 만드는 쪽만
-    # 버퍼로 센다.
+    # 생성 중 예약은 종류별로 따로 둔다(arm 사이에 같은 키 형식). 이 arm 은 request 만
+    # 올린다. N 계산은 두 종류를 합쳐 센다 - 다른 arm 이 남긴 idle 예약도 만료 전까지는
+    # 자리를 쥔 것으로 본다.
     PENDING_KINDS = ("idle", "request")
 
     def _pending_create_key(self, compute_type: str, kind: str) -> str:
@@ -759,50 +685,6 @@ class ComputeQueues:
             )
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to record pending create {pod_name}: {exc}") from exc
-
-    def add_pending_creates_if_locked(
-        self,
-        compute_type: str,
-        pod_names: Iterable[str],
-        lock_token: Optional[str],
-        kind: str = "idle",
-    ) -> bool:
-        """할당 락을 아직 쥐고 있을 때만 생성 예약을 한 번에 올린다. 못 올렸으면 False.
-
-        리더의 계획은 락 아래에서 자리를 셌다. 락이 그사이 만료돼 다른 쪽이 같은 자리를
-        셌다면 그 계획으로 예약하면 안 된다. 락 확인과 등록을 한 스크립트로 묶어 그 사이에
-        끼어들 틈을 없앤다(만료된 키는 GET 이 nil 이다).
-        """
-        names = [name for name in pod_names if name]
-        if not names:
-            return True
-        if not lock_token:
-            return False
-        compute_type_value = self.normalize_compute_type(compute_type)
-        script = """
-        if redis.call("get", KEYS[1]) ~= ARGV[1] then
-            return 0
-        end
-        for i = 3, #ARGV do
-            redis.call("zadd", KEYS[2], ARGV[2], ARGV[i])
-        end
-        return 1
-        """
-        client = self._redis_client()
-        try:
-            return bool(
-                client.eval(
-                    script,
-                    2,
-                    self._lock_key(compute_type_value),
-                    self._pending_create_key(compute_type_value, kind),
-                    lock_token,
-                    repr(time.time()),
-                    *names,
-                )
-            )
-        except RedisError as exc:
-            raise QueueUnavailableError(f"Failed to record pending creates: {exc}") from exc
 
     def refresh_pending_creates(self, compute_type: str, pod_names: Iterable[str], kind: str) -> set:
         """아직 남아 있는 생성 예약만 시각을 갱신하고, 남아 있던 이름을 돌려준다.

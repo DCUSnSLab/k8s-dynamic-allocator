@@ -139,11 +139,10 @@ CACHES = {
 REDIS_URL = _env_first(('REDIS_URL',), 'redis://localhost:6379/0')
 WAIT_QUEUE_PREFIX = _env_first(('WAIT_QUEUE_PREFIX',), 'kda:waitq')
 DEFAULT_COMPUTE_TYPE = _env_first(('DEFAULT_COMPUTE_TYPE',), 'general')
-# 이 브랜치(exp-warm-buffer)는 Deployment 없이 컨트롤러가 버퍼 파드를 직접 만들고
-# 지우는 비교군이다. 브랜치가 곧 arm 이므로 모드는 상수다 - 환경변수로 읽으면
-# 오타 하나로 다른 arm 이 조용히 배포된다. 상태 API 와 평가 도구가 이 이름으로
-# arm 을 기록한다.
-COMPUTE_ALLOCATION_MODE = 'warm_buffer_direct'
+# 이 브랜치(exp-cold-start)는 요청마다 파드를 만들고 반납 때 지우는 비교군이다.
+# 브랜치가 곧 arm 이므로 모드는 상수다 - 환경변수로 읽으면 오타 하나로 다른 arm 이
+# 조용히 배포된다. 상태 API 와 평가 도구가 이 이름으로 arm 을 기록한다.
+COMPUTE_ALLOCATION_MODE = 'cold_start'
 COMPUTE_POD_IMAGE = _env_first(
     ('COMPUTE_POD_IMAGE',),
     'harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:latest',
@@ -218,32 +217,15 @@ BUFFER_RECONCILE_RESYNC_SECONDS = _env_int_any(
     60,
 )
 
-# The cooldown itself is not configured - it is the larger of two observed
-# quantities, the time a Pod takes to become Ready and how long the target stays
-# down before recovering. These two only size the estimator's window: how many
-# recent observations to keep, and the fewest that make a p90 worth trusting.
-# Below the minimum that input is ignored; with neither there is no cooldown,
-# which is only the case at startup while the buffer is still filling.
-BUFFER_SCALE_DOWN_COOLDOWN_SAMPLES = _env_int_any(
-    ('BUFFER_SCALE_DOWN_COOLDOWN_SAMPLES',),
-    50,
-)
-BUFFER_SCALE_DOWN_COOLDOWN_MIN_SAMPLES = _env_int_any(
-    ('BUFFER_SCALE_DOWN_COOLDOWN_MIN_SAMPLES',),
-    10,
-)
-
-# ---- warm_buffer_direct (Deployment 없이 컨트롤러가 직접 관리하는 버퍼)
+# ---- cold_start (요청마다 파드를 만든다)
 #
-# R(미리 띄워 둘 최소 개수)과 N(노드 위 compute 파드 상한). Deployment 가 없으므로
-# 어노테이션 대신 컨트롤러 환경변수로 받는다. deploy.sh 가 빌드 파라미터를 넣는다.
-# 실험 중 바꿀 일이 없어 시작 시 한 번 읽는다(값은 status API 와 로그에 남는다).
+# N(노드 위 compute 파드 상한). 컨트롤러 환경변수로 받고 deploy.sh 가 빌드 파라미터를
+# 넣는다. 실험 중 바꿀 일이 없어 시작 시 한 번 읽는다(값은 status API 와 로그에 남는다).
 # N 이 비면 파드를 하나도 만들지 않는다(시작 로그에 오류가 남는다). 설정 누락으로
 # 상한 없는 run 이 조용히 생기지 않게 한다.
-WARM_BUFFER_RESERVE = _env_first(('BUFFER_RESERVE', 'WARM_BUFFER_RESERVE'), '0').strip()
 WARM_BUFFER_CAPACITY = _env_first(('BUFFER_CAPACITY', 'WARM_BUFFER_CAPACITY'), '').strip()
-# 리더가 버퍼를 맞추는 주기의 상한. 파드 이벤트·반납·요청 도착으로 바로 깨어나므로
-# 이 값은 놓친 이벤트를 메우는 바닥일 뿐이다.
+# 리더가 남은 idle 파드(다른 arm 의 것)를 확인하는 주기의 상한. idle 파드 이벤트로
+# 바로 깨어나므로 이 값은 놓친 이벤트를 메우는 바닥일 뿐이다.
 WARM_BUFFER_RESYNC_SECONDS = _env_float_any(('WARM_BUFFER_RESYNC_SECONDS',), 2.0)
 # 생성 요청을 보냈지만 목록에 아직 안 보이는 파드를 N 에 세는 시간의 상한. 응답을 못
 # 받은 생성 요청이 서버에 남아 있을 수 있는 시간은 apiserver 요청 timeout(기본

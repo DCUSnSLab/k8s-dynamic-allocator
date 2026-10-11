@@ -128,13 +128,12 @@ class ComputeAllocator:
                 )
 
     # ------------------------------------------------------------------
-    # 할당. 버퍼 파드는 Deployment 없이 컨트롤러가 직접 만들고 지운다.
+    # 할당(cold start). 요청마다 파드를 만든다. 미리 만든 파드는 없다.
     #
-    # cold start 의 할당 경로에 "놀고 있는(idle) 파드를 먼저 쓴다" 만 더했다.
-    #   - 할당 락 아래에서: 목록 1회, N 여유 계산, 티켓 claim, idle 파드 할당(조건부 PATCH)
-    #   - 락 밖에서(티켓마다 스레드): idle 이 없던 티켓은 파드를 만들고, Ready 를 기다려
-    #     마운트한다. cold start 와 같은 함수 순서다.
-    # 포화에서는 idle 이 없으므로 cold start 와 같은 경로가 된다.
+    #   - 할당 락 아래에서: 목록 1회, N 여유 계산, 티켓 claim, 생성 예약
+    #   - 락 밖에서(티켓마다 스레드): 파드를 만들고, Ready 를 기다려 마운트한다.
+    # 제안(warm buffer)의 할당 경로에서 "idle 파드를 먼저 쓴다" 만 뺀 것이다. 남은 idle
+    # (다른 arm 이 남긴 것)은 내주지 않는다 - 리더가 지운다.
 
     def _drain_wait_queue_for_type_impl(
         self,
@@ -151,8 +150,8 @@ class ComputeAllocator:
             "failed": 0,
             "errors": [],
         }
-        # (티켓, idle 파드 이름 또는 None=새로 만듦, 마운트만 남은 확정 티켓 또는 None)
-        work: List[Tuple[Dict, Optional[str], Optional[Dict]]] = []
+        # claim 하고 생성 자리를 예약한 티켓
+        work: List[Dict] = []
         effective_batch, _mount_concurrency = self._compute_wait_queue_batch_plan()
         lock_token = None
         lock_renewed_at = 0.0
@@ -212,33 +211,16 @@ class ComputeAllocator:
                 result["capacity_blocked"] = "capacity_unknown"
                 return result
 
-            # Ready 인 idle 먼저, 그다음 오래된(먼저 부팅을 시작한) 것부터. Ready 였다가
-            # NotReady 가 된 파드(에이전트가 죽음)는 내주지 않는다 - 정리가 곧 지운다.
-            # 옛 템플릿 세대(배포 전 이미지)도 내주지 않는다 - 리더가 교체한다.
-            current_hash = self._current_template_hash(compute_type_value)
-            idle = sorted(
-                (
-                    pod for pod in snapshot["idle"]
-                    if (pod["ready"] or pod.get("not_ready_since") is None)
-                    and (not current_hash or pod.get("template_hash") == current_hash)
-                ),
-                key=lambda pod: (
-                    not pod["ready"],
-                    pod["created"].timestamp() if pod.get("created") else float("inf"),
-                ),
-            )
             # N 이 없으면 하나도 만들지 않는다(설정 누락으로 상한 없는 run 이 되지 않게).
-            new_slots = max(
-                0,
-                int(capacity or 0) - len(active) - pending_tickets - len(pending_names),
+            limit = min(
+                effective_batch,
+                max(0, int(capacity or 0) - len(active) - pending_tickets - len(pending_names)),
             )
-            limit = min(effective_batch, len(idle) + new_slots)
             if limit <= 0:
                 result["queued"] += 1
                 result["capacity_blocked"] = "capacity"
                 return result
 
-            idle_iter = iter(idle)
             renew_interval = max(
                 1.0, float(getattr(settings, "WAIT_QUEUE_LOCK_RENEW_SECONDS", 20))
             )
@@ -257,41 +239,17 @@ class ComputeAllocator:
                     )
                     if not ticket:
                         break
-
-                    claimed_pod, committed, ticket_alive = self._claim_idle_for_ticket(
-                        ticket, idle_iter
+                    # 자리를 락 안에서 생성 중 목록으로 옮겨 둔다. 스레드가 늦게 떠서
+                    # 그사이 claim 이 만료돼도(만료된 claim 은 세지 않는다) 자리가
+                    # 비지 않는다. 스레드가 소유를 확인하지 못하면 이 이름을 지운다.
+                    self.queues.add_pending_create(
+                        compute_type_value, self.provider.request_pod_name(ticket), "request"
                     )
-                    if not ticket_alive:
-                        # 묶는 사이 취소됐다. 이 티켓 몫으로 새 파드를 만들지 않는다.
-                        ticket = None
-                        continue
-                    if claimed_pod:
-                        work.append((ticket, claimed_pod, committed))
-                    elif new_slots > 0:
-                        # 자리를 락 안에서 생성 중 목록으로 옮겨 둔다. 스레드가 늦게 떠서
-                        # 그사이 claim 이 만료돼도(만료된 claim 은 세지 않는다) 자리가
-                        # 비지 않는다. 스레드가 소유를 확인하지 못하면 이 이름을 지운다.
-                        self.queues.add_pending_create(
-                            compute_type_value, self.provider.request_pod_name(ticket), "request"
-                        )
-                        new_slots -= 1
-                        work.append((ticket, None, None))
-                    else:
-                        # idle 이 다 남의 것이 됐고 새로 만들 자리도 없다. 순서를 지킨 채
-                        # 돌려놓는다.
-                        self.tickets.requeue_ticket(
-                            ticket["ticket_id"],
-                            reason="No idle compute pod and no capacity",
-                            increment_retry=False,
-                            claim_token=ticket.get("claim_token"),
-                        )
-                        result["queued"] += 1
-                        break
+                    work.append(ticket)
                     result["claimed"] += 1
                 except Exception as exc:
                     # 이미 claim 한 앞의 일감은 아래에서 그대로 시작한다. 이 티켓만
-                    # 돌려놓는다(idle PATCH 결과를 모르는 경우 그 파드는 claim 토큰이
-                    # 어긋나 정리가 회수한다).
+                    # 돌려놓는다.
                     logger.warning(
                         "[Warning] operation=direct_claim compute_type=%s ticket_id=%s reason=%r",
                         compute_type_value,
@@ -325,10 +283,10 @@ class ComputeAllocator:
                         str(exc),
                     )
 
-        for ticket, idle_pod, committed in work:
+        for ticket in work:
             threading.Thread(
                 target=self._safe_execute_direct_ticket,
-                args=(ticket, compute_type_value, idle_pod, committed),
+                args=(ticket, compute_type_value),
                 name=f"direct-{str(ticket.get('ticket_short') or ticket.get('ticket_id') or '')[:10]}",
                 daemon=True,
             ).start()
@@ -336,90 +294,19 @@ class ComputeAllocator:
             result["queued"] += 1
         return result
 
-    def _current_template_hash(self, compute_type_value: str) -> str:
-        reader = getattr(self.provider, "template_hash", None)
-        if reader is None:
-            return ""
+    def _safe_execute_direct_ticket(self, ticket: Dict, compute_type_value: str) -> Dict:
         try:
-            return reader(compute_type_value) or ""
-        except Exception:
-            # 세대를 모르면 거르지 않는다(템플릿을 못 읽으면 어차피 새로 만들 수도 없다).
-            return ""
-
-    def _claim_idle_for_ticket(
-        self, ticket: Dict, idle_iter
-    ) -> Tuple[Optional[str], Optional[Dict], bool]:
-        """남은 idle 파드를 차례로 이 티켓에 묶어 본다.
-
-        (묶은 파드 이름 또는 None, 마운트만 남은 확정 티켓 또는 None, 티켓이 살아 있나).
-        PATCH 가 resourceVersion 을 test 하므로, 그사이 다른 쪽이 가져갔거나 리더가
-        지우기 시작한 파드는 실패하고 다음 것으로 넘어간다.
-
-        Ready 인 파드는 방금 읽은 목록에 IP 와 Ready 시각이 있으므로 여기서 바로 할당을
-        확정한다(Deployment 버퍼와 같다). 락 밖에서 파드를 다시 읽는 왕복이 없다.
-        """
-        ticket_id = ticket["ticket_id"]
-        claim_token = ticket.get("claim_token") or ""
-        user_pod = ticket.get("user_pod") or "unknown"
-        for pod in idle_iter:
-            if not self.provider.claim_idle_pod(
-                pod["name"],
-                pod.get("resource_version") or "",
-                user_pod,
-                ticket_id,
-                claim_token,
-                expected_annotations=pod.get("annotations"),
-            ):
-                continue
-            if pod["ready"] and pod.get("ip"):
-                ready_at = pod.get("ready_at")
-                recorded = self.tickets.mark_allocating(
-                    ticket_id,
-                    compute_pod=pod["name"],
-                    compute_pod_ip=pod["ip"],
-                    claimed_by=ticket.get("claimed_by"),
-                    claim_token=claim_token,
-                    compute_ready_at=ready_at,
-                    compute_available_at=ready_at,
-                )
-                committed = recorded
-            else:
-                recorded = self.tickets.record_allocating_pod(
-                    ticket_id,
-                    compute_pod=pod["name"],
-                    claim_token=claim_token,
-                )
-                committed = None
-            if not self._owns_claim(recorded, claim_token):
-                # 티켓이 그사이 취소됐다. 묶은 파드는 버린다(요청 하나에 하나만 쓴다).
-                try:
-                    self.provider.release_pod(pod["name"])
-                except Exception:
-                    pass
-                return None, None, False
-            return pod["name"], committed, True
-        return None, None, True
-
-    def _safe_execute_direct_ticket(
-        self,
-        ticket: Dict,
-        compute_type_value: str,
-        idle_pod: Optional[str],
-        committed: Optional[Dict] = None,
-    ) -> Dict:
+            committed, response = self._provision_direct_ticket(ticket)
+        except Exception as exc:
+            logger.exception(
+                "[Failed] operation=provision_direct_ticket ticket_id=%s compute_type=%s reason=%r",
+                ticket.get("ticket_id"),
+                compute_type_value,
+                str(exc),
+            )
+            return self._handle_provision_failure(ticket=ticket, compute_pod="", exc=exc)
         if committed is None:
-            try:
-                committed, response = self._provision_direct_ticket(ticket, idle_pod)
-            except Exception as exc:
-                logger.exception(
-                    "[Failed] operation=provision_direct_ticket ticket_id=%s compute_type=%s reason=%r",
-                    ticket.get("ticket_id"),
-                    compute_type_value,
-                    str(exc),
-                )
-                return self._handle_provision_failure(ticket=ticket, compute_pod=idle_pod or "", exc=exc)
-            if committed is None:
-                return response  # 이미 정리를 마친 응답(소유를 잃음, 재시도 등)
+            return response  # 이미 정리를 마친 응답(소유를 잃음, 재시도 등)
         # 마운트 단계. 여기서 난 예외로 파드를 지우지 않는다 - 할당이 확정된 뒤일 수 있다
         # (mark_assigned 뒤 문맥 기록 실패 등). 남은 정리는 stale 회수와 고아 정리가 한다.
         try:
@@ -438,41 +325,36 @@ class ComputeAllocator:
                 "message": str(exc),
             }
 
-    def _provision_direct_ticket(
-        self, ticket: Dict, idle_pod: Optional[str]
-    ) -> Tuple[Optional[Dict], Optional[Dict]]:
-        """파드를 마련해(새로 만들거나 부팅 중인 idle 을 기다려) 할당을 확정한다.
+    def _provision_direct_ticket(self, ticket: Dict) -> Tuple[Optional[Dict], Optional[Dict]]:
+        """파드를 만들고 Ready 를 기다려 할당을 확정한다.
 
         (확정된 티켓, None) 이면 호출자가 마운트한다. (None, 응답) 이면 이미 정리를
         마쳤다(소유를 잃음, 재시도로 돌려보냄 등).
         """
         ticket_id = ticket.get("ticket_id", "")
         claim_token = ticket.get("claim_token") or ""
-        compute_pod = idle_pod or ""
+        compute_pod = ""
 
         try:
-            if not compute_pod:
-                compute_pod = self._reserve_request_pod(ticket)
-                try:
-                    self.provider.create_pod_for_ticket(ticket, compute_pod)
-                except Exception as exc:
-                    status = getattr(exc, "status", None)
-                    if isinstance(status, int) and 400 <= status < 500:
-                        # 확정된 거절이라 만들어지지 않았다. 생성 중 목록의 자리를 돌려준다.
-                        # 응답 없음·5xx 는 서버에 반영됐을 수 있어 그대로 둔다(상한이 지나면
-                        # 빠진다). 409(이미 있음)는 공급자가 상태 없는 오류로 바꿔 올린다.
-                        try:
-                            self.queues.remove_pending_creates(
-                                ticket.get("compute_type"), [compute_pod]
-                            )
-                        except Exception:
-                            pass
-                    raise
+            compute_pod = self._reserve_request_pod(ticket)
+            try:
+                self.provider.create_pod_for_ticket(ticket, compute_pod)
+            except Exception as exc:
+                status = getattr(exc, "status", None)
+                if isinstance(status, int) and 400 <= status < 500:
+                    # 확정된 거절이라 만들어지지 않았다. 생성 중 목록의 자리를 돌려준다.
+                    # 응답 없음·5xx 는 서버에 반영됐을 수 있어 그대로 둔다(상한이 지나면
+                    # 빠진다). 409(이미 있음)는 공급자가 상태 없는 오류로 바꿔 올린다.
+                    try:
+                        self.queues.remove_pending_creates(
+                            ticket.get("compute_type"), [compute_pod]
+                        )
+                    except Exception:
+                        pass
+                raise
             ready_pod = self.provider.wait_pod_ready(
                 compute_pod,
                 keep_claim=lambda: self.tickets.extend_allocation_deadline(ticket_id, claim_token),
-                # 미리 만든 파드는 이미 있다. 사라졌으면 기다리지 않는다.
-                must_exist=bool(idle_pod),
             )
             compute_pod_ip = getattr(ready_pod.status, "pod_ip", "") or self.provider.get_pod_ip(compute_pod) or ""
             if not compute_pod_ip:
@@ -486,7 +368,7 @@ class ComputeAllocator:
                 claimed_by=ticket.get("claimed_by"),
                 claim_token=claim_token,
                 compute_ready_at=compute_ready_at,
-                compute_available_at=compute_ready_at if idle_pod else None,
+                compute_available_at=None,
             )
             if not self._owns_claim(committed, claim_token):
                 try:
@@ -575,8 +457,7 @@ class ComputeAllocator:
     ) -> Dict:
         """파드를 만들거나 Ready 를 기다리다 실패했다(cold start 와 같다).
 
-        파드는 지우고 티켓은 재시도 예산 안에서 큐로 돌려보낸다. 미리 만든(idle) 파드가
-        부팅 중에 죽은 경우도 여기로 온다 - 요청은 실패시키지 않고 다시 줄 세운다.
+        파드는 지우고 티켓은 재시도 예산 안에서 큐로 돌려보낸다.
         """
         ticket_id = ticket.get("ticket_id", "")
         claim_token = ticket.get("claim_token") or ""
