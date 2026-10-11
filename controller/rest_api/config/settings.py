@@ -238,8 +238,8 @@ BUFFER_SCALE_DOWN_COOLDOWN_MIN_SAMPLES = _env_int_any(
 # R(미리 띄워 둘 최소 개수)과 N(노드 위 compute 파드 상한). Deployment 가 없으므로
 # 어노테이션 대신 컨트롤러 환경변수로 받는다. deploy.sh 가 빌드 파라미터를 넣는다.
 # 실험 중 바꿀 일이 없어 시작 시 한 번 읽는다(값은 status API 와 로그에 남는다).
-# N 이 비면 상한이 없다는 뜻이고 시작 로그에 경고가 남는다 - 상한 없는 run 은
-# 다른 arm 과 같은 제약 아래가 아니다.
+# N 이 비면 파드를 하나도 만들지 않는다(시작 로그에 오류가 남는다). 설정 누락으로
+# 상한 없는 run 이 조용히 생기지 않게 한다.
 WARM_BUFFER_RESERVE = _env_first(('BUFFER_RESERVE', 'WARM_BUFFER_RESERVE'), '0').strip()
 WARM_BUFFER_CAPACITY = _env_first(('BUFFER_CAPACITY', 'WARM_BUFFER_CAPACITY'), '').strip()
 # 리더가 버퍼를 맞추는 주기의 상한. 파드 이벤트·반납·요청 도착으로 바로 깨어나므로

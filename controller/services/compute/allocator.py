@@ -88,9 +88,7 @@ class ComputeAllocator:
     ) -> Dict:
         """계측 포장. KDA_TIMING_LOG 가 꺼져 있으면 원래 경로를 그대로 탄다.
 
-        Ready 후 할당 대기가 1.0 -> 2.8초로 늘었는데, 그것이 락을 놓쳐서인지
-        축소 게이트에 막혀서인지 후보가 없어서인지 지금 로그로는 나눌 수 없다.
-        capacity_blocked / lock_missed 는 결과 dict 에만 담겨 아무도 읽지 않는다.
+        drain 한 번의 결과(claim, 자리 없음, 락 놓침 등)와 소요를 한 줄로 남긴다.
         """
         if not timing.ENABLED:
             return self._drain_wait_queue_for_type_impl(

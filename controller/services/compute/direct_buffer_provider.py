@@ -163,7 +163,7 @@ class DirectBufferProvider(KubernetesClient):
         return self._parse_count(settings.WARM_BUFFER_CAPACITY, "N")
 
     def read_reserve(self, compute_type: Optional[str] = None) -> int:
-        """R. 비었거나 잘못되면 0 - 미리 만들지 않는 cold start 와 같아진다."""
+        """R(버퍼의 바닥). 비었거나 잘못되면 0. 동적 R 이라 0 이어도 몰림 뒤에는 버퍼를 둔다."""
         del compute_type
         return self._parse_count(settings.WARM_BUFFER_RESERVE, "R") or 0
 
@@ -173,8 +173,8 @@ class DirectBufferProvider(KubernetesClient):
     def snapshot(self, compute_type: Optional[str] = None) -> Dict:
         """한 번의 LIST 로 버퍼 상태를 만든다.
 
-        LIST 는 apiserver 의 watch 캐시가 최신 상태로 응답한다(일관 읽기, 10/11 실측:
-        캐시 응답 = 전체, etcd 로 빠짐 0). 그래서 매 패스 읽어도 etcd 부담이 작다.
+        LIST 는 apiserver 의 watch 캐시가 일관 읽기로 응답한다. 그래서 매 패스 읽어도
+        etcd 부담이 작다.
         """
         pods = self.v1.list_namespaced_pod(
             namespace=self.namespace,
@@ -199,6 +199,7 @@ class DirectBufferProvider(KubernetesClient):
         labels = metadata.labels or {}
         annotations = metadata.annotations or {}
         status = pod.status
+        ready = self._pod_is_ready(pod)
         return {
             "name": metadata.name,
             "uid": metadata.uid,
@@ -214,8 +215,8 @@ class DirectBufferProvider(KubernetesClient):
             "allocation_ticket_id": annotations.get(self.ANNOTATION_ALLOCATION_TICKET, ""),
             "allocation_claim_token": annotations.get(self.ANNOTATION_ALLOCATION_CLAIM, ""),
             "phase": getattr(status, "phase", None),
-            "ready": self._pod_is_ready(pod),
-            "ready_at": self._pod_ready_at(pod) if self._pod_is_ready(pod) else None,
+            "ready": ready,
+            "ready_at": self._pod_ready_at(pod) if ready else None,
             "not_ready_since": self._pod_not_ready_since(pod),
             "terminating": getattr(metadata, "deletion_timestamp", None) is not None,
             "ip": getattr(status, "pod_ip", None),
@@ -224,12 +225,6 @@ class DirectBufferProvider(KubernetesClient):
 
     def list_buffer_status(self, compute_type: Optional[str] = None) -> List[Dict]:
         return self.snapshot(compute_type=compute_type)["pods"]
-
-    def active_pod_names(self, compute_type: Optional[str] = None) -> set:
-        return self.snapshot(compute_type=compute_type)["active_names"]
-
-    def count_active_pods(self, compute_type: Optional[str] = None) -> int:
-        return len(self.active_pod_names(compute_type=compute_type))
 
     def find_reserved_pod(
         self,
@@ -499,19 +494,6 @@ class DirectBufferProvider(KubernetesClient):
             time.sleep(poll)
 
         raise TimeoutError(f"Timed out waiting for compute pod Ready: {pod_name} phase={last_phase}")
-
-    def get_pod_ready_at(self, pod_name: str):
-        try:
-            pod = self.v1.read_namespaced_pod(
-                name=pod_name,
-                namespace=self.namespace,
-                _request_timeout=self.api_request_timeout,
-            )
-        except ApiException as exc:
-            if exc.status == 404:
-                return None
-            raise
-        return self._pod_ready_at(pod)
 
     # ------------------------------------------------------------------ 기타
 

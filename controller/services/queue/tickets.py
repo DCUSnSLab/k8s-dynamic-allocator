@@ -490,11 +490,11 @@ class Tickets:
         compute_pod: str,
         claim_token: Optional[str] = None,
     ) -> Optional[Dict[str, object]]:
-        """할당 중인 티켓에 파드 이름만 적는다(cold start 와 같다).
+        """할당 중인 티켓에 파드 이름만 적는다(IP 는 Ready 뒤에 mark_allocating 이 적는다).
 
-        mark_allocating 과 따로 둔다. 이름은 파드 오브젝트가 생기는 순간 적어야 N 계산이
-        그 claim 을 "생성 중" 으로 세지 않게 되고, IP 는 Ready 뒤에야 생긴다. 상태·claim
-        토큰·마감은 건드리지 않으므로 곧 정리될 claim 을 연장하지 않는다.
+        요청 파드는 만들기 전에 이름을 적는다. 그래야 N 계산이 이 claim 과 생성 중 예약을
+        같은 파드로 알아보고 한 번만 센다. 상태·claim 토큰·마감은 건드리지 않으므로 곧
+        정리될 claim 을 연장하지 않는다.
         """
         ticket = self.get_ticket(ticket_id)
         if not ticket:

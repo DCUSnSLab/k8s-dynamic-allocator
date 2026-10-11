@@ -34,12 +34,10 @@ class DirectBufferReconciler:
         self,
         provider,
         queues,
-        on_capacity_available: Optional[Callable[[Optional[str]], None]] = None,
         on_periodic_cleanup: Optional[Callable[[], Dict]] = None,
     ):
         self.provider = provider
         self.queues = queues
-        self.on_capacity_available = on_capacity_available
         self.on_periodic_cleanup = on_periodic_cleanup
         self.policy = BufferPolicy(queues)
 
@@ -221,8 +219,7 @@ class DirectBufferReconciler:
         없었다면 지울 것도 없다. 이때 이벤트로 깨어난 바퀴는 목록·락·Redis 없이
         건너뛴다(직전 바퀴의 기록만 본다). 직전 바퀴가 resync 주기보다 오래됐으면 거르지
         않는다 - 그사이 큐가 비었을 수 있고, 그래서 보충이 늦어지는 것은 그 주기까지다.
-        Deployment 버퍼에서 공급 패스가 포화에 초당 1.3번 락을 0.66초씩 쥐어 락 점유가
-        94% 였던 일(10/11)을 되풀이하지 않으려는 것이다.
+        포화에서 바퀴마다 락을 쥐면 그만큼 할당이 밀린다.
         """
         ct = self.queues.normalize_compute_type(compute_type)
         with self._status_lock:

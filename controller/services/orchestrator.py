@@ -94,7 +94,6 @@ class Orchestrator:
         self.capacity_reconciler = DirectBufferReconciler(
             self.provider,
             self.queues,
-            on_capacity_available=self.compute_manager.kick_wait_queue_worker,
             # Full sweep; it calls recover_journaled_orphans itself.
             on_periodic_cleanup=self.cleanup.check_stale_allocations,
         )

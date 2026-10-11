@@ -271,12 +271,3 @@ class BufferPolicy:
                 del state["creates"][: len(state["creates"]) - self.cooldown_samples]
         self._share_sample(compute_type, "create", seconds)
 
-    def status(self, compute_type: str) -> Dict:
-        with self._churn_lock:
-            state = self._churn_state(compute_type)
-            return {
-                "cooldown_s": state["cooldown"],
-                "held_back": state["held_back"],
-                "dip_samples": len(state["dips"]),
-                "create_samples": len(state["creates"]),
-            }
