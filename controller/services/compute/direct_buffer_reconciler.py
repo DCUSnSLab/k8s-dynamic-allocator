@@ -69,6 +69,18 @@ class DirectBufferReconciler:
         self._leadership_validator = validator
         self.policy.set_leadership_validator(validator)
 
+    def _still_in_charge(self, generation: Optional[int]) -> bool:
+        """이 바퀴의 결정을 계속 집행해도 되나. 메모리 안의 값만 본다(원격 조회 없음).
+
+        리더를 잃었거나 멈추라는 신호가 왔거나 다른 세대가 시작됐으면, 이전 목표를 계속
+        집행하지 않는다. 이미 보낸 요청의 결과는 그대로 둔다(예약이 자리를 쥐고 있다).
+        """
+        if self._stop_event.is_set():
+            return False
+        if generation is not None and generation != self._generation:
+            return False
+        return self._is_leader()
+
     def _is_leader(self) -> bool:
         try:
             return bool(self._leadership_validator())
@@ -160,7 +172,7 @@ class DirectBufferReconciler:
                 if self._nothing_to_do(compute_type):
                     continue
                 try:
-                    outcome = self.reconcile_type(compute_type)
+                    outcome = self.reconcile_type(compute_type, generation)
                     retry_soon = retry_soon or outcome.get("retry", False)
                 except Exception as exc:
                     retry_soon = True
@@ -175,7 +187,7 @@ class DirectBufferReconciler:
     def _maintenance_loop(self, generation: int) -> None:
         # 리더가 되자마자 한 번(남은 Deployment 버퍼를 먼저 내린다), 그다음 주기마다.
         while not self._stop_event.is_set() and self._generation == generation:
-            if self._is_leader():
+            if self._still_in_charge(generation):
                 self._periodic_maintenance()
             if self._stop_event.wait(self.cleanup_seconds):
                 return
@@ -235,7 +247,7 @@ class DirectBufferReconciler:
 
     # ------------------------------------------------------------------ 한 바퀴
 
-    def reconcile_type(self, compute_type: str) -> Dict:
+    def reconcile_type(self, compute_type: str, generation: Optional[int] = None) -> Dict:
         ct = self.queues.normalize_compute_type(compute_type)
         lock_token = self.queues.acquire_allocator_lock(ct)
         if not lock_token:
@@ -268,8 +280,8 @@ class DirectBufferReconciler:
                     str(exc),
                 )
 
-        created = self._create_idle(ct, to_create)
-        deleted = self._delete_idle(to_delete)
+        created = self._create_idle(ct, to_create, generation)
+        deleted = self._delete_idle(to_delete, generation)
         record.update({"created": created, "deleted": deleted})
         self._record_status(ct, record)
         if created or deleted or record.get("queued"):
@@ -417,7 +429,7 @@ class DirectBufferReconciler:
         }
         return {"create": create, "delete": delete, "record": record}
 
-    def _create_idle(self, ct: str, names: List[str]) -> int:
+    def _create_idle(self, ct: str, names: List[str], generation: Optional[int] = None) -> int:
         """예약한 이름을 차례로 만든다. 예약이 남아 있는 이름만 만든다.
 
         호출마다 남은 예약 전부의 시각을 갱신해, 생성이 느려도 뒤쪽 예약이 차례를 기다리는
@@ -428,6 +440,16 @@ class DirectBufferReconciler:
         created = 0
         remaining = list(names)
         while remaining:
+            if not self._still_in_charge(generation):
+                # 만들지 않을 이름의 자리는 바로 돌려준다(상한까지 쥐고 있지 않게).
+                self._forget_pending(ct, *remaining)
+                logger.info(
+                    "[DirectBufferCreateStopped] compute_type=%s remaining=%s reason=%r",
+                    ct,
+                    len(remaining),
+                    "no longer the leader or stopping",
+                )
+                break
             try:
                 alive = self.queues.refresh_pending_creates(ct, remaining)
             except Exception as exc:
@@ -473,15 +495,17 @@ class DirectBufferReconciler:
                 )
         return created
 
-    def _forget_pending(self, ct: str, name: str) -> None:
+    def _forget_pending(self, ct: str, *names: str) -> None:
         try:
-            self.queues.remove_pending_creates(ct, [name])
+            self.queues.remove_pending_creates(ct, list(names))
         except QueueUnavailableError:
             pass
 
-    def _delete_idle(self, pods: List[Dict]) -> int:
+    def _delete_idle(self, pods: List[Dict], generation: Optional[int] = None) -> int:
         deleted = 0
         for pod in pods:
+            if not self._still_in_charge(generation):
+                break
             try:
                 if self.provider.delete_idle_pod(pod["name"], pod.get("uid") or "", pod.get("resource_version") or ""):
                     deleted += 1

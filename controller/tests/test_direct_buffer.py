@@ -1337,5 +1337,52 @@ class DirectFaultTests(unittest.TestCase):
         self.assertEqual(world.tickets["t0001"]["retry_count"], 0)
 
 
+
+class DirectLeadershipTests(unittest.TestCase):
+    def test_creation_stops_when_leadership_is_lost_mid_batch(self):
+        world = World(capacity=10, reserve=5)
+        provider, queues, tickets, allocator, reconciler = make(world)
+        leader = {"ok": True}
+        reconciler.set_leadership_validator(lambda: leader["ok"])
+        original_create = provider.create_idle_pod
+        calls = {"n": 0}
+
+        def create_then_lose(compute_type, name):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                leader["ok"] = False  # 두 번째 생성 도중 리더를 잃었다
+            return original_create(compute_type, name)
+
+        provider.create_idle_pod = create_then_lose
+        reconciler.reconcile_type(CT)
+        self.assertEqual(world.created["idle"], 2)
+        # 만들지 않은 세 이름의 예약은 남기지 않는다.
+        with world.mu:
+            unlisted = [name for name in world.pending if name not in world.pods]
+        self.assertEqual(unlisted, [])
+
+    def test_creation_stops_on_stop_signal(self):
+        world = World(capacity=10, reserve=4)
+        provider, queues, tickets, allocator, reconciler = make(world)
+        original_create = provider.create_idle_pod
+
+        def create_then_stop(compute_type, name):
+            reconciler._stop_event.set()
+            return original_create(compute_type, name)
+
+        provider.create_idle_pod = create_then_stop
+        reconciler.reconcile_type(CT)
+        self.assertEqual(world.created["idle"], 1)
+
+    def test_stale_generation_does_not_delete(self):
+        world = World(capacity=10, reserve=0)
+        for index in range(3):
+            world.add_pod(f"warm-{index}", "idle", {}, ready=True)
+        provider, queues, tickets, allocator, reconciler = make(world)
+        reconciler._generation = 5
+        reconciler.reconcile_type(CT, generation=4)  # 이전 세대의 바퀴
+        self.assertFalse(any(p["terminating"] for p in world.pods.values()))
+
+
 if __name__ == "__main__":
     unittest.main()
