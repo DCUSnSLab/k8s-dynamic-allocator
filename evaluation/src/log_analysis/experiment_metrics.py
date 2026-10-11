@@ -465,6 +465,10 @@ def build_pod_lives(records: Iterable[dict[str, Any]], run_end: datetime) -> lis
             life.ready_at = at
         if life.deleting_at is None:
             status = pod.get("compute_status")
+            # 직접 관리 arm 은 할당 가능한 파드를 idle 이라 부른다(Deployment arm 의 available 과
+            # 같은 상태). 같게 세지 않으면 idle 구간과 재사용(assigned -> idle -> assigned)이 빠진다.
+            if status == "idle":
+                status = "available"
             current = life.spans[-1][0] if life.spans and life.spans[-1][2] is None else None
             if status in ("available", "assigned") and status != current:
                 close_span(life, at)
