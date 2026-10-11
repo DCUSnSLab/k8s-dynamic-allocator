@@ -24,6 +24,10 @@ BUFFER_SETTLE_POLL_SECONDS = 2.0
 # controller follows. The reuse arm hands pods back to that same Deployment
 # instead of deleting them, so it takes R/N exactly as the proposal does.
 DEPLOYMENT_BUFFER_MODES = {"warm_buffer", "warm_buffer_reuse"}
+# Deployment 없이 컨트롤러가 버퍼 파드를 직접 만들고 지우는 arm(exp-warm-buffer).
+# R/N 은 컨트롤러 env 에 있고, 미리 만든 파드는 compute-status=idle 이다. 버퍼 목표는
+# 동적 R 하나뿐이다(끄는 스위치가 없다).
+DIRECT_BUFFER_MODES = {"warm_buffer_direct"}
 
 
 class ServerSettingsError(RuntimeError):
@@ -48,7 +52,20 @@ def prepare_server(
         print(f"Server settings not recorded: {exc}")
         return {"error": str(exc)}
 
-    if apply_policy:
+    if apply_policy and settings["allocation_mode"] in DIRECT_BUFFER_MODES:
+        # 이 arm 의 R/N 은 컨트롤러 env 라 바꾸려면 컨트롤러를 다시 띄워야 한다. 여기서
+        # 몰래 바꾸지 않는다 - arm 은 run 스크립트가 맞춘다. 다르면 잘못된 R/N 을 잰
+        # run 이 남지 않도록 멈춘다.
+        r, n = wanted
+        for buffer in settings["buffers"]:
+            if (buffer["R"], buffer["N"]) != (r, n):
+                raise ServerSettingsError(
+                    f"direct buffer runs R={buffer['R']} N={buffer['N']} but the config asks "
+                    f"R={r} N={n}; set BUFFER_RESERVE/BUFFER_CAPACITY on the controller first"
+                )
+        wait_for_buffers(r, n)
+        settings = read_server_settings()
+    elif apply_policy:
         if settings["allocation_mode"] not in DEPLOYMENT_BUFFER_MODES:
             print(f"R/N not applied: allocation mode is {settings['allocation_mode']}")
         else:
@@ -150,6 +167,30 @@ def read_server_settings() -> dict[str, Any]:
             }
         ]
 
+    if allocation_mode in DIRECT_BUFFER_MODES:
+        # cold start 와 같은 이유로 남아 있는 compute Deployment 의 어노테이션은 이 arm 의
+        # 정책이 아니다. 정책은 컨트롤러 env 에서, 버퍼는 idle 파드에서 읽는다.
+        live = [
+            pod for pod in pods
+            if not pod["metadata"].get("deletionTimestamp")
+        ]
+        idle = [pod for pod in live if _labels(pod).get("compute-status") == "idle"]
+        reserve = _int_or_none(_env(controller, "BUFFER_RESERVE"))
+        buffers = [
+            {
+                "deployment": None,
+                "direct": True,
+                "compute_type": "general",
+                # 비었으면 컨트롤러는 0 으로 읽는다(미리 만들지 않는다).
+                "R": 0 if reserve is None else reserve,
+                "N": _int_or_none(_env(controller, "BUFFER_CAPACITY")),
+                "available": len(idle),
+                "available_ready": sum(1 for pod in idle if _is_ready(pod)),
+                "assigned": sum(1 for pod in live if _labels(pod).get("compute-status") == "assigned"),
+                "image": _cold_start_compute_image(),
+            }
+        ]
+
     return {
         "namespace": KUBERNETES_NAMESPACE,
         "allocation_mode": allocation_mode,
@@ -188,6 +229,10 @@ def _desired(buffer: dict[str, Any], r: int, n: int) -> int:
 
 def _settled(buffer: dict[str, Any], r: int, n: int) -> bool:
     desired = _desired(buffer, r, n)
+    if buffer.get("direct"):
+        # 동적 R 의 쿨다운이 직전 수요만큼 idle 을 더 붙잡고 있을 수 있다. 줄어들기를
+        # 기다리지 않는다 - 시작 조건은 "R 만큼 Ready 로 준비됐다" 이다.
+        return buffer["available_ready"] >= desired
     return buffer["available"] == desired and buffer["available_ready"] == desired
 
 
@@ -205,6 +250,11 @@ def describe_settings(settings: dict[str, Any]) -> str:
     if settings["allocation_mode"] == "cold_start":
         buffer_text = ", ".join(
             f"N={buffer['N']}" for buffer in settings["buffers"]
+        )
+    elif settings["allocation_mode"] in DIRECT_BUFFER_MODES:
+        buffer_text = ", ".join(
+            f"direct R={buffer['R']} N={buffer['N']} idle_ready={buffer['available_ready']}"
+            for buffer in settings["buffers"]
         )
     else:
         buffer_text = ", ".join(
@@ -393,32 +443,94 @@ def _pod_request(pod: dict[str, Any]) -> tuple[int, int]:
     return max(cpu, init_cpu), max(memory, init_memory)
 
 
+# 컨트롤러 이미지에 구워진 compute 파드 템플릿을 읽는다. Deployment 없이 파드를 직접
+# 만드는 arm(cold start, warm_buffer_direct)에는 읽을 Deployment 가 없다.
+_CONTROLLER_COMPUTE_TEMPLATES = r"""
+import glob, json, yaml
+found = []
+for path in sorted(glob.glob("/app/manifests/**/*.yaml", recursive=True)):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            doc = yaml.safe_load(handle)
+    except Exception:
+        continue
+    if not isinstance(doc, dict):
+        continue
+    labels = (doc.get("metadata") or {}).get("labels") or {}
+    if doc.get("kind") == "Deployment":
+        spec = ((doc.get("spec") or {}).get("template") or {}).get("spec") or {}
+    elif doc.get("kind") == "Pod":
+        spec = doc.get("spec") or {}
+    else:
+        continue
+    if labels.get("app") == "compute-pod":
+        found.append({"path": path, "spec": spec})
+print(json.dumps(found))
+"""
+
+
+def _shape_from_pod_spec(spec: dict[str, Any], source: str) -> dict[str, Any]:
+    shape: dict[str, Any] = {
+        "node_selector": spec.get("nodeSelector") or {},
+        "cpu_m": None,
+        "memory_bytes": None,
+        "source": source,
+    }
+    for container in spec.get("containers") or []:
+        requests = (container.get("resources") or {}).get("requests") or {}
+        shape["cpu_m"] = _cpu_millis(requests.get("cpu"))
+        shape["memory_bytes"] = _memory_bytes(requests.get("memory"))
+        break
+    return shape
+
+
 def _compute_pod_shape() -> dict[str, Any]:
     """What one compute pod asks for, and where it is allowed to run.
 
-    Taken from the compute Deployment's pod template rather than a constant in
-    here. The template survives cold start scaling the Deployment to zero, so it
-    is readable before a run has created anything, and it cannot drift away from
-    the server the way a copy in the simulator would.
+    Read from the server rather than a constant in here, so it cannot drift away
+    from what the arm actually creates. Two sources, in order:
+
+      1. The compute Deployment's pod template, for the arms that keep one
+         (develop, reuse). It survives scaling to zero, so it is readable before
+         a run has created anything.
+      2. The compute pod template baked into the running controller image, for
+         the arms that create pods directly (cold start, warm_buffer_direct).
+         They have no Deployment - and since 10/11 the Deployment is deleted
+         for them - so the template the controller creates pods from is the
+         only source that is both authoritative and readable before the run.
     """
-    shape: dict[str, Any] = {"node_selector": {}, "cpu_m": None, "memory_bytes": None}
+    shape: dict[str, Any] = {"node_selector": {}, "cpu_m": None, "memory_bytes": None, "source": None}
     try:
         deployments = _kubectl_json("get", "deployments")["items"]
     except ServerSettingsError:
-        return shape
+        deployments = []
     for deployment in deployments:
         labels = deployment["metadata"].get("labels") or {}
         if labels.get("app") != "compute-pod":
             continue
-        spec = deployment["spec"]["template"]["spec"]
-        shape["node_selector"] = spec.get("nodeSelector") or {}
-        for container in spec.get("containers") or []:
-            requests = (container.get("resources") or {}).get("requests") or {}
-            shape["cpu_m"] = _cpu_millis(requests.get("cpu"))
-            shape["memory_bytes"] = _memory_bytes(requests.get("memory"))
-            break
-        break
-    return shape
+        name = deployment["metadata"]["name"]
+        return _shape_from_pod_spec(deployment["spec"]["template"]["spec"], f"deployment/{name}")
+
+    try:
+        text = run_kubectl("exec", "deployment/controller", "--", "python", "-c", _CONTROLLER_COMPUTE_TEMPLATES)
+        templates = json.loads(text.strip() or "[]")
+    except (ServerSettingsError, ValueError) as exc:
+        print(f"Compute pod template not readable from the controller: {exc}")
+        return shape
+    if not templates:
+        return shape
+    chosen = _shape_from_pod_spec(templates[0]["spec"], f"controller:{templates[0]['path']}")
+    # 템플릿이 여럿이면 크기와 자리가 같아야 한다. 다르면 어느 것이 쓰이는지 여기서는
+    # 모르므로 기록에 남긴다.
+    others = [_shape_from_pod_spec(item["spec"], item["path"]) for item in templates[1:]]
+    if any(
+        (o["cpu_m"], o["memory_bytes"], o["node_selector"])
+        != (chosen["cpu_m"], chosen["memory_bytes"], chosen["node_selector"])
+        for o in others
+    ):
+        chosen["template_conflict"] = [item["path"] for item in templates]
+        print(f"Compute pod templates disagree: {chosen['template_conflict']}")
+    return chosen
 
 
 def _node_usage() -> dict[str, dict[str, int | None]]:

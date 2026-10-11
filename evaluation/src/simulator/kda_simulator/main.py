@@ -303,6 +303,9 @@ async def run_simulation(
     summary = SummaryCollector()
     sessions = SSHSessionPool(config)
     tasks: list[asyncio.Task[None]] = []
+    task_request_ids: dict[asyncio.Task[None], str] = {}
+    drain_timed_out = False
+    unfinished_request_ids: list[str] = []
     stopped_by_interrupt = False
     background_attempted = False
     output_dir: Path | None = None
@@ -402,8 +405,10 @@ async def run_simulation(
         # 포화 지속시간 으로 쌓이고 그만큼 동시 요청이 늘어난다. 실측에서 동시
         # 300 은 안정적이었고 587 에서 swlabssh 가 전부 OOM 으로 죽었다.
         global_sem = _Unlimited()
+        last_offset = 0.0
 
         for plan in request_plans:
+            last_offset = max(last_offset, float(plan["planned_offset_seconds"]))
             target_mono = started_mono + float(plan["planned_offset_seconds"])
             sleep_for = target_mono - time.monotonic()
             if sleep_for > 0:
@@ -424,9 +429,20 @@ async def run_simulation(
                     )
                 )
             )
+            task_request_ids[tasks[-1]] = plan["request_id"]
 
         if tasks:
-            await asyncio.gather(*tasks)
+            drain = config.workload.drain_minutes
+            deadline = None if drain is None else started_mono + last_offset + drain * 60.0
+            unfinished = await wait_until_drain_deadline(tasks, deadline)
+            if unfinished:
+                # 남은 요청은 finally 에서 취소되고, 세션을 닫으면 서버 쪽 세션도 끝난다.
+                drain_timed_out = True
+                unfinished_request_ids = sorted(task_request_ids[task] for task in unfinished)
+                print(
+                    f"Drain deadline ({drain} min after the last planned request) reached: "
+                    f"{len(unfinished)} requests still unfinished - cancelling them"
+                )
     except asyncio.CancelledError:
         stopped_by_interrupt = True
     finally:
@@ -499,6 +515,12 @@ async def run_simulation(
         },
         "summary": summary.to_dict(),
         "stopped_by_interrupt": stopped_by_interrupt,
+        # 정리 마감에 걸려 끊은 요청. requests.jsonl 에는 기록이 없다.
+        "drain": {
+            "minutes": config.workload.drain_minutes,
+            "timed_out": drain_timed_out,
+            "unfinished_request_ids": unfinished_request_ids,
+        },
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -506,6 +528,27 @@ async def run_simulation(
     )
     print(f"Completed {summary.total} requests")
     print(f"Summary: {output_dir / 'summary.json'}")
+
+
+async def wait_until_drain_deadline(
+    tasks: list[asyncio.Task[Any]], deadline_mono: float | None
+) -> list[asyncio.Task[Any]]:
+    """요청 태스크를 마감(monotonic)까지 기다리고, 그때까지 안 끝난 태스크를 돌려준다.
+
+    마감이 없으면 전부 기다린다. 예전 gather 처럼 예외가 난 태스크가 있으면 바로
+    그 예외를 올린다. 안 끝난 태스크는 취소하지 않는다 - 부르는 쪽의 정리 경로가 취소한다.
+    """
+    if deadline_mono is None:
+        await asyncio.gather(*tasks)
+        return []
+    remaining = max(0.0, deadline_mono - time.monotonic())
+    done, pending = await asyncio.wait(
+        tasks, timeout=remaining, return_when=asyncio.FIRST_EXCEPTION
+    )
+    for task in tasks:
+        if task in done and not task.cancelled() and task.exception() is not None:
+            raise task.exception()
+    return [task for task in tasks if task in pending]
 
 
 async def warmup_users(config: SimulatorConfig, sessions: Any, stage: str = "Warm-up") -> None:

@@ -128,6 +128,11 @@ class WorkloadConfig:
     segments: list[Any] = field(default_factory=list)
     # segments 를 펼친 계획. [{start_min, end_min, rho, lambda_per_minute}, ...]
     piecewise_plan: list[dict[str, float]] = field(default_factory=list)
+    # 마지막 요청을 계획한 시각 뒤로 남은 요청을 기다리는 최대 시간(분). 넘기면 남은
+    # 요청을 끊고 정상 정리(세션 닫기, 기록·summary 쓰기)로 끝낸다. 밖에서 프로세스를
+    # 죽이면 정리가 하나도 안 돌기 때문이다(10/11 DEV_MOUNTAIN). 비우면 실행 길이와 같다:
+    # 실행 길이만큼 기다려도 안 끝나는 적체는 서버가 멈춘 것으로 본다.
+    drain_minutes: float | None = None
 
 
 @dataclass
@@ -310,6 +315,7 @@ def _load_workload(data: dict[str, Any]) -> WorkloadConfig:
             "capacity_slots",
             "slot_seconds",
             "segments",
+            "drain_minutes",
         },
     )
     profile = _required_value(data, "profile", "workload")
@@ -344,6 +350,11 @@ def _load_workload(data: dict[str, Any]) -> WorkloadConfig:
                 f"workload.duration_minutes ({duration_minutes}) must equal the "
                 f"segments total ({total}) or be null"
             )
+    drain_minutes = _optional_float(data.get("drain_minutes"), "workload.drain_minutes")
+    if drain_minutes is None:
+        drain_minutes = duration_minutes
+    elif drain_minutes <= 0:
+        raise ValueError("workload.drain_minutes must be positive")
     return WorkloadConfig(
         profile=profile,
         lambda_scope=str(data.get("lambda_scope") or "system"),
@@ -362,6 +373,7 @@ def _load_workload(data: dict[str, Any]) -> WorkloadConfig:
         slot_seconds=slot_seconds,
         segments=list(segments),
         piecewise_plan=plan,
+        drain_minutes=drain_minutes,
     )
 
 

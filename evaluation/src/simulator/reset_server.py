@@ -13,7 +13,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             f"Reset the {KUBERNETES_NAMESPACE} test server before an experiment: stop controllers, "
-            "delete kda:* Redis keys and leftover compute pods, restart controller/swlabssh/compute-general."
+            "delete kda:* Redis keys and leftover compute pods, restart controller/swlabssh (and the compute Deployment when the arm has one)."
         )
     )
     parser.add_argument("--clear-logs", action="store_true", help="Also delete collected JSONL logs on logs-pvc.")
@@ -21,7 +21,7 @@ def main() -> None:
         "--recreate-user-pods",
         action="store_true",
         help=(
-            "Also delete user pods and their PVCs so the next run builds them again. "
+            "Also delete user pods (PVCs are kept) so the next run builds them again. "
             "Needed when switching to an arm whose user pod shape differs, such as "
             "between baseline and the others."
         ),
@@ -31,7 +31,7 @@ def main() -> None:
 
     if not args.yes:
         extra = " and all collected logs" if args.clear_logs else ""
-        pods = ", user pods and their PVCs" if args.recreate_user_pods else ""
+        pods = ", user pods (PVCs kept)" if args.recreate_user_pods else ""
         answer = input(
             f"Reset namespace {KUBERNETES_NAMESPACE}: Redis kda:* keys, compute pods{pods}{extra}. Type 'yes': "
         )
