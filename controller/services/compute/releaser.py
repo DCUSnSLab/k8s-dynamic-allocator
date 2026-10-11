@@ -66,11 +66,15 @@ class ComputeReleaser:
         request_context: Optional[Dict[str, object]] = None,
         expected_status: Optional[str] = None,
         expected_ticket_id: str = "",
+        min_not_ready_seconds: Optional[float] = None,
     ) -> Dict:
         """Release a Compute Pod whose agent is already known to be silent.
 
         Skips the unmount call, which would wait out its full timeout before
         failing anyway. Everything else matches an ordinary release.
+
+        min_not_ready_seconds 는 호출자(정리)가 "NotReady 가 오래됐다" 고 본 기준이다. 방금
+        읽은 파드가 그새 Ready 로 돌아왔거나 그 기준을 채우지 못하면 손대지 않는다.
         """
         return self._release(
             compute_pod,
@@ -78,6 +82,7 @@ class ComputeReleaser:
             unmount=False,
             expected_status=expected_status,
             expected_ticket_id=expected_ticket_id,
+            min_not_ready_seconds=min_not_ready_seconds,
         )
 
     def release_stale_locked_compute_pod(
@@ -128,6 +133,7 @@ class ComputeReleaser:
         expected_status: Optional[str] = None,
         expected_ticket_id: str = "",
         stale_lock_token: str = "",
+        min_not_ready_seconds: Optional[float] = None,
     ) -> Dict:
         # Tags this thread with the ticket's label so its own log lines attribute
         # correctly; the caller's label comes back once the release is done.
@@ -139,6 +145,7 @@ class ComputeReleaser:
                 expected_status,
                 (expected_ticket_id or "").strip(),
                 stale_lock_token or "",
+                min_not_ready_seconds,
             )
 
     def _release_with_retries(
@@ -149,6 +156,7 @@ class ComputeReleaser:
         expected_status: Optional[str],
         expected_ticket: str,
         stale_lock_token: str,
+        min_not_ready_seconds: Optional[float] = None,
     ) -> Dict:
         release_started_ms = int(time.time() * 1000)
         request_context_value = dict(request_context or {})
@@ -195,6 +203,10 @@ class ComputeReleaser:
                 # The caller decided on an older view of the Pod, which with
                 # reuse may since have been returned and handed to someone else.
                 return self._ignore_release(compute_pod, expected_ticket, pod_ticket, "stale_snapshot")
+            # 라벨·티켓은 그대로인 채 Ready 만 돌아왔을 수 있다. 정리 사유(NotReady 가
+            # 오래됐다)가 지금도 맞는지 정리와 같은 기준으로 다시 본다.
+            if min_not_ready_seconds is not None and not self._still_not_ready(pod, min_not_ready_seconds):
+                return self._ignore_release(compute_pod, expected_ticket, pod_ticket, "recovered")
 
             ticket_id = pod_ticket if pod_status == self.provider.STATUS_ASSIGNED else ""
             if ticket_id != lock_ticket:
@@ -273,11 +285,12 @@ class ComputeReleaser:
             # 처음 읽은 뒤(그사이 unmount 를 기다렸다) 파드가 바뀌었을 수 있다. 늦게 반영된
             # 되돌리기로 idle 이 되어 다음 요청에 할당됐다면 그 파드는 이 반납의 것이 아니다.
             # 다시 읽어 상태·티켓이 그대로일 때만, 그 버전을 전제로 지운다.
-            delete_state = self._delete_if_unchanged(compute_pod, pod_status, pod_ticket)
-            if delete_state == "changed":
+            delete_state = self._delete_if_unchanged(compute_pod, pod_status, pod_ticket, min_not_ready_seconds)
+            if delete_state in ("changed", "recovered"):
                 self._drop_release_lock_best_effort(lock_ticket, lock_token)
                 lock_ticket, lock_token = "", None
-                return self._ignore_release(compute_pod, ticket_id, pod_ticket, "changed_before_delete")
+                reason = "recovered" if delete_state == "recovered" else "changed_before_delete"
+                return self._ignore_release(compute_pod, ticket_id, pod_ticket, reason)
             pod_settled = True
             cleanup_context = True
             context_owner = ticket_id
@@ -662,8 +675,17 @@ class ComputeReleaser:
             "message": f"Release ignored ({reason}): {compute_pod}",
         }
 
-    def _delete_if_unchanged(self, compute_pod: str, status: Optional[str], ticket_id: str) -> str:
-        """다시 읽은 상태·티켓이 같을 때만 지운다. "deleted", "gone", "changed" 중 하나.
+    def _delete_if_unchanged(
+        self,
+        compute_pod: str,
+        status: Optional[str],
+        ticket_id: str,
+        min_not_ready_seconds: Optional[float] = None,
+    ) -> str:
+        """다시 읽은 상태·티켓이 같을 때만 지운다. "deleted", "gone", "changed", "recovered" 중 하나.
+
+        min_not_ready_seconds 가 있으면(정리의 NotReady 사유) 다시 읽은 파드가 지금도 그 기준을
+        채울 때만 지운다("recovered" 면 Ready 로 돌아왔거나 기준을 못 채운다).
 
         삭제는 uid + resourceVersion 전제 조건이라, 읽은 뒤 바뀌면 지우지 않고 다시 읽는다
         (kubelet 의 상태 갱신으로도 버전이 바뀐다).
@@ -689,6 +711,8 @@ class ComputeReleaser:
                 or (annotations.get(self.provider.ANNOTATION_ALLOCATION_TICKET) or "").strip() != ticket_id
             ):
                 return "changed"
+            if min_not_ready_seconds is not None and not self._still_not_ready(pod, min_not_ready_seconds):
+                return "recovered"
             if self.provider.delete_pod_if_unchanged(
                 compute_pod,
                 getattr(metadata, "uid", "") or "",
@@ -696,6 +720,13 @@ class ComputeReleaser:
             ):
                 return "deleted"
         return "changed"
+
+    def _still_not_ready(self, pod, min_not_ready_seconds: float) -> bool:
+        """정리의 기준(cleanup._not_ready_seconds)과 같다: Ready 였다가 떨어진 뒤 그만큼 지났나."""
+        not_ready_since = self.provider._pod_not_ready_since(pod)
+        if not isinstance(not_ready_since, datetime):
+            return False
+        return (datetime.now(timezone.utc) - not_ready_since).total_seconds() >= min_not_ready_seconds
 
     def _delete_pod(self, compute_pod: str) -> bool:
         """Delete with one retry; False when the Pod was already gone or terminating."""

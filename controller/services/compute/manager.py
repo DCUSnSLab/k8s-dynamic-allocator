@@ -219,12 +219,14 @@ class ComputeManager:
         request_context: Optional[Dict[str, object]] = None,
         expected_status: Optional[str] = None,
         expected_ticket_id: str = "",
+        min_not_ready_seconds: Optional[float] = None,
     ) -> Dict:
         return self.releaser.release_unreachable_compute_pod(
             compute_pod=compute_pod,
             request_context=request_context,
             expected_status=expected_status,
             expected_ticket_id=expected_ticket_id,
+            min_not_ready_seconds=min_not_ready_seconds,
         )
 
     def release_stale_locked_compute_pod(
