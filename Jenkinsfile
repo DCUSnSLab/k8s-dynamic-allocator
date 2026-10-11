@@ -26,21 +26,7 @@ pipeline {
         skipDefaultCheckout(true)
     }
 
-    // Multibranch note: these appear in the UI only from the second build of a
-    // branch. The first indexing build sees params as null, so every read below
-    // falls back to the default.
-    parameters {
-        string(
-            name: 'BUFFER_RESERVE',
-            defaultValue: '2',
-            description: 'R - warm Compute Pods kept immediately allocatable'
-        )
-        string(
-            name: 'BUFFER_CAPACITY',
-            defaultValue: '5',
-            description: 'N - upper bound on available + assigned Compute Pods'
-        )
-    }
+    // 이 arm(baseline)은 compute 파드를 쓰지 않으므로 R/N 빌드 파라미터가 없다.
 
     environment {
         HARBOR_REGISTRY = 'harbor.cu.ac.kr'
@@ -86,13 +72,11 @@ pipeline {
                     env.DEPLOY_STARTED = 'false'
                     env.DEPLOY_DIAGNOSTICS_DONE = 'false'
 
-                    env.BUFFER_RESERVE = (params.BUFFER_RESERVE ?: '2').trim()
-                    env.BUFFER_CAPACITY = (params.BUFFER_CAPACITY ?: '5').trim()
 
                     echo "BRANCH_NAME=${env.BRANCH_NAME}"
                     echo "IMAGE_TAG=${env.IMAGE_TAG}"
                     echo "IS_MANUAL_BUILD=${env.IS_MANUAL_BUILD}"
-                    echo "BUFFER_POLICY R=${env.BUFFER_RESERVE} N=${env.BUFFER_CAPACITY}"
+                    echo "ARM=baseline (no compute pods, no R/N)"
 
                     if (env.IS_MANUAL_BUILD != 'true') {
                         echo 'Automatic Multibranch/SCM build detected: image build and deployment are skipped.'

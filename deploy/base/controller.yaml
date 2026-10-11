@@ -58,13 +58,8 @@ spec:
         # 고정돼 있다). 평가 도구가 이 Deployment 에서 읽어 run 이 어느 arm 을
         # 쟀는지 적으므로, 실제로 도는 것을 말해야 한다.
         - name: COMPUTE_ALLOCATION_MODE
-          value: warm_buffer_direct
-        # R/N. Deployment 가 없으므로 컨트롤러 env 로 받는다. deploy.sh 가 빌드
-        # 파라미터로 덮어쓴다. N 이 비어 있으면 컨트롤러는 파드를 하나도 만들지 않는다.
-        - name: BUFFER_RESERVE
-          value: ""
-        - name: BUFFER_CAPACITY
-          value: ""
+          value: baseline
+        # 이 arm 에는 R/N 이 없다(compute 파드를 쓰지 않는다). 0 을 넣지 않는다.
         # DEBUG 가 켜져 있으면 Django 가 SQL 과 요청 정보를 프로세스 안에 모아 두고
         # 예외마다 트레이스백 페이지를 만든다. 측정하는 쪽에서는 메모리와 응답 시간에
         # 잡음만 더하는 것이라 끈다. 기본값이 true 이므로 명시해야 한다.

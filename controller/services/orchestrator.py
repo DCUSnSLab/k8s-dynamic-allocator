@@ -1,210 +1,58 @@
 import logging
-import threading
 from typing import Dict, Optional
 
 from config import settings
-from config.settings import set_request_label
 
-from .compute import (
-    ComputeCleanup,
-    ComputeManager,
-    DirectBufferProvider,
-    DirectBufferReconciler,
-)
-from .infra import (
-    ComputeAvailabilityWatcher,
-    LeaseLeaderElector,
-)
+from .compute import DirectBufferProvider
 from .queue import ComputeQueues
 from .status import ControllerStatus
 
-try:
-    from . import timing
-except ImportError:  # 단위 테스트는 이 파일 하나만 따로 읽어 패키지가 없다
-    from contextlib import nullcontext as _timing_nullcontext
-
-    class timing:  # noqa: N801 - 모듈 대역. 계측이 꺼진 것과 같게 동작한다.
-        ENABLED = False
-
-        @staticmethod
-        def timed(kind):
-            return lambda fn: fn
-
-        @staticmethod
-        def emit(*args, **kwargs):
-            pass
-
-        @staticmethod
-        def phase(*args, **kwargs):
-            pass
-
-        @staticmethod
-        def note(*args, **kwargs):
-            pass
-
-        @staticmethod
-        def current_purpose():
-            return "other"
-
-        @staticmethod
-        def current_trigger():
-            return "direct"
-
-        @staticmethod
-        def lock_acquired(*args, **kwargs):
-            pass
-
-        @staticmethod
-        def lock_missed(*args, **kwargs):
-            pass
-
-        @staticmethod
-        def lock_released(*args, **kwargs):
-            pass
-
-        @staticmethod
-        def set_leader_probe(*args, **kwargs):
-            pass
-
-        @staticmethod
-        def start(*args, **kwargs):
-            pass
-
-        @staticmethod
-        def scope(*args, **kwargs):
-            return _timing_nullcontext()
-
-        @staticmethod
-        def phase_timer():
-            return _timing_nullcontext()
-
-
 logger = logging.getLogger(__name__)
 
+# 할당을 요청받으면 돌려주는 사유. 이 arm 에서 요청이 오면 실험 구성이 잘못된 것이다.
+BASELINE_REFUSAL = "baseline arm: commands run on the user pod; compute pods are not allocated"
+
+
 class Orchestrator:
+    """exp-baseline: 작업은 고사양 user pod 에서 직접 돈다. compute 파드를 쓰지 않는다.
+
+    compute 공급(리더 조정)·할당(큐 작업자)·파드 이벤트 감시·리더 선출을 만들지도
+    시작하지도 않는다. R=N=0 을 넣어 같은 루프를 빈 채로 돌리는 것이 아니라 루프 자체가
+    없다. 그래서 할당 요청은 큐에 넣지 않고 바로 거절한다.
+
+    남는 일은 상태 보고 하나다. 배포 smoke 와 run 기록이 "compute 파드 0" 을 확인한다
+    (다른 arm 이 남긴 compute 파드는 배포가 지운다).
+    """
+
     def __init__(self):
-        # exp-warm-buffer: Deployment 없이 컨트롤러가 버퍼 파드를 직접 만들고 지운다.
-        # 리더의 조정 스레드가 놀고 있는 파드 수를 정책 목표에 맞추고, 할당은 두
-        # 복제본이 할당 락 아래에서 한다(cold start 와 같은 방식).
+        # compute 파드를 만들지 않는다. 남아 있는 것을 세는 목록 조회에만 쓴다.
         self.provider = DirectBufferProvider()
         self.queues = ComputeQueues()
         self.tickets = self.queues.tickets
-        self.compute_manager = ComputeManager(self.provider, self.queues, self.tickets)
-        self.cleanup = ComputeCleanup(self.provider, self.queues, self.compute_manager)
-        self.capacity_reconciler = DirectBufferReconciler(
-            self.provider,
-            self.queues,
-            # Full sweep; it calls recover_journaled_orphans itself.
-            on_periodic_cleanup=self.cleanup.check_stale_allocations,
-        )
-        self.status = ControllerStatus(
-            self.provider,
-            self.queues,
-            self.tickets,
-            capacity_reconciler=self.capacity_reconciler,
-        )
-        provider_uses_watch = getattr(self.provider, "uses_availability_watch", True)
-        watch_enabled = provider_uses_watch and (
-            settings.COMPUTE_AVAILABILITY_WATCH_ENABLED
-            or self.capacity_reconciler is not None
-        )
-        self.compute_watcher = ComputeAvailabilityWatcher(
-            v1=self.provider.v1,
-            namespace=self.provider.namespace,
-            label_selector=f"{self.provider.LABEL_APP}={self.provider.APP_COMPUTE_POD}",
-            on_compute_available=self.compute_manager.notify_compute_available,
-            on_buffer_event=self.capacity_reconciler.on_buffer_event,
-            enabled=watch_enabled,
-            availability_notifications_enabled=(
-                settings.COMPUTE_AVAILABILITY_WATCH_ENABLED
-            ),
-            timeout_seconds=settings.COMPUTE_AVAILABILITY_WATCH_TIMEOUT_SECONDS,
-            retry_seconds=settings.COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS,
-            app_label=self.provider.LABEL_APP,
-            app_value=self.provider.APP_COMPUTE_POD,
-            status_label=self.provider.LABEL_STATUS,
-            available_status=self.provider.STATUS_AVAILABLE,
-            compute_type_label=self.provider.LABEL_COMPUTE_TYPE,
-        )
-        self.leader_elector = None
-        self.queue_worker_thread: Optional[threading.Thread] = None
-        self.queue_worker_stop_event = threading.Event()
-        # Cold start has no capacity reconciler to carry the periodic sweep, so
-        # the leader runs it on a thread of its own.
+        self.status = ControllerStatus(self.provider, self.queues, self.tickets)
         self.startup_completed = False
-        self._initial_buffer_result: Optional[Dict] = None
 
     def health_check(self) -> str:
         return "Orchestrator healthy"
 
     def initialize_buffer(self) -> Dict:
-        result = self.provider.initialize_buffer()
-        self.compute_manager.refresh_compute_types(force=True)
-        return result
+        return {"created": [], "existing": [], "failed": [], "templates": []}
 
     def start(self) -> Dict:
-        if self.startup_completed:
-            return self._initial_buffer_result or {"status": "success", "created": 0, "existing": 0}
-
-        result = self.initialize_buffer()
-        self._initial_buffer_result = result
-        self._start_queue_worker()
-
-        self.leader_elector = LeaseLeaderElector(
-            on_started_leading=self._start_leader_services,
-            on_stopped_leading=self._stop_leader_services,
-        )
-        self.capacity_reconciler.set_leadership_validator(
-            self.leader_elector.has_valid_leadership
-        )
-        self.leader_elector.start()
-        # 계측에만 쓴다. 로그 줄마다 리더 여부를 붙여 리더/비리더 비용을 나눈다.
-        timing.set_leader_probe(self.leader_elector.has_valid_leadership)
-        timing.start()
-        logger.info("Leader election initialized")
-
-        self.startup_completed = True
-        return result
+        if not self.startup_completed:
+            logger.info(
+                "Baseline arm (mode=%s): compute supply, allocation and leader election are not started",
+                settings.COMPUTE_ALLOCATION_MODE,
+            )
+            self.startup_completed = True
+        return self.initialize_buffer()
 
     def stop(self) -> None:
-        if self.leader_elector:
-            self.leader_elector.stop()
-        self._stop_leader_services()
-        self.queue_worker_stop_event.set()
-        if self.queue_worker_thread and self.queue_worker_thread.is_alive():
-            self.queue_worker_thread.join(timeout=5)
+        return None
 
-    def _queue_worker_loop(self) -> None:
-        while not self.queue_worker_stop_event.wait(settings.WAIT_QUEUE_WORKER_INTERVAL_SECONDS):
-            set_request_label("-")
-            try:
-                with timing.scope(trigger="periodic"):
-                    self.process_wait_queues()
-            except Exception as exc:
-                logger.exception("[Failed] operation=queue_worker_iteration reason=%r", str(exc))
-            finally:
-                set_request_label("-")
-        logger.info("Queue worker stopped")
-
-    def _start_queue_worker(self) -> None:
-        if self.queue_worker_thread and self.queue_worker_thread.is_alive():
-            return
-        self.queue_worker_stop_event.clear()
-        self.queue_worker_thread = threading.Thread(
-            target=self._queue_worker_loop,
-            name="queue-worker",
-            daemon=True,
-        )
-        self.queue_worker_thread.start()
-        logger.info("Queue worker started")
-
-    def _start_leader_services(self) -> None:
-        self.capacity_reconciler.start()
-        self.compute_watcher.start()
-
-    def _stop_leader_services(self) -> None:
-        self.compute_watcher.stop()
-        self.capacity_reconciler.stop()
+    def _refuse(self, **fields) -> Dict:
+        logger.warning("[Refused] operation=compute_allocation reason=%r %s", BASELINE_REFUSAL, fields)
+        return {"status": "failed", "message": BASELINE_REFUSAL}
 
     def execute_command(
         self,
@@ -216,37 +64,40 @@ class Orchestrator:
         request_at_ms: Optional[int] = None,
         ticket_id: Optional[str] = None,
     ) -> Dict:
-        return self.compute_manager.execute_command(
-            username=username,
-            command=command,
-            user_pod_ip=user_pod_ip,
-            user_pod=user_pod,
-            compute_type=compute_type,
-            request_at_ms=request_at_ms,
-            ticket_id=ticket_id,
-        )
+        del command, user_pod_ip, compute_type, request_at_ms
+        return self._refuse(user_pod=user_pod or username, ticket_id=ticket_id)
 
     def cancel_ticket(self, ticket_id: str, reason: str = "") -> Dict:
-        return self.compute_manager.cancel_ticket(ticket_id, reason=reason)
+        del reason
+        return self._refuse(ticket_id=ticket_id)
 
     def release_compute_pod(
         self,
         compute_pod: str,
         request_context: Optional[Dict[str, object]] = None,
     ) -> Dict:
-        return self.compute_manager.release_compute_pod(
-            compute_pod=compute_pod,
-            request_context=request_context,
-        )
+        del request_context
+        return self._refuse(compute_pod=compute_pod)
 
     def process_wait_queues(self) -> Dict:
-        return self.compute_manager.process_wait_queues()
+        return {"status": "skipped", "message": BASELINE_REFUSAL}
 
     def get_assigned_request_context(self, compute_pod: str) -> Optional[Dict[str, object]]:
-        return self.compute_manager.get_assigned_request_context(compute_pod)
+        del compute_pod
+        return None
 
     def get_buffer_status(self) -> Dict:
-        return self.status.get_buffer_status()
+        response = self.status.get_buffer_status()
+        # 이 arm 에는 R 도 N 도 없다(0 이 아니라 없는 값이다).
+        response.update(
+            {
+                "allocation_mode": settings.COMPUTE_ALLOCATION_MODE,
+                "R": None,
+                "N": None,
+                "capacity": None,
+            }
+        )
+        return response
 
     def get_queue_status(self, compute_type: Optional[str] = None) -> Dict:
         return self.status.get_queue_status(compute_type=compute_type)
@@ -255,4 +106,4 @@ class Orchestrator:
         return self.status.get_ticket(ticket_id)
 
     def touch_ticket_poll(self, ticket_id: str) -> None:
-        self.tickets.touch_poll(ticket_id)
+        del ticket_id

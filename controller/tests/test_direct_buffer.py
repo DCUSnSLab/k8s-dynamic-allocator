@@ -1176,7 +1176,13 @@ class DirectConcurrencyTests(unittest.TestCase):
 # ---------------------------------------------------------------------- 배포 계약
 
 
-class DirectDeployContractTests(unittest.TestCase):
+class BaselineDeployContractTests(unittest.TestCase):
+    """exp-baseline 의 배포 계약: compute 파드를 쓰지 않고, R/N 이 없다.
+
+    위의 직접 관리 테스트는 이 브랜치에도 남아 있는 공용 compute 모듈을 확인한다. 이
+    arm 의 오케스트레이터는 그 모듈로 공급·할당 루프를 만들지 않는다(아래에서 확인).
+    """
+
     REPO = ROOT.parent
 
     def _load_yaml(self, path):
@@ -1184,80 +1190,51 @@ class DirectDeployContractTests(unittest.TestCase):
 
         return list(yaml.safe_load_all((self.REPO / path).read_text(encoding="utf-8")))
 
-    def test_pod_template_keeps_production_selector(self):
-        pod = self._load_yaml("controller/manifests/direct_buffer/compute-general-pod.yaml")[0]
-        self.assertEqual(pod["kind"], "Pod")
-        # 운영 노드셀렉터는 그대로 두고 우리 라벨만 더한다.
-        self.assertEqual(pod["spec"]["nodeSelector"]["kubessh"], "general_node")
-        self.assertEqual(pod["spec"]["nodeSelector"]["k8s-dynamic-allocator/compute"], "true")
-        labels = pod["metadata"]["labels"]
-        self.assertEqual(labels["app"], "compute-pod")
-        self.assertIn("assigned-user", labels)
-        # 남아 있는 develop Deployment 의 ReplicaSet 이 입양하지 못하게 available 을 쓰지 않는다.
-        self.assertNotEqual(labels["compute-status"], "available")
-        # 다른 arm(develop, cold)의 compute 파드와 같은 사양이어야 버퍼 관리 방식만 다른
-        # 비교가 된다(10/11 develop compute-general.yaml 의 파드 사양과 대조해 맞춘 값).
-        agent = pod["spec"]["containers"][0]
-        self.assertEqual(agent["resources"]["requests"], {"cpu": "1", "memory": "2Gi"})
-        self.assertEqual(agent["resources"]["limits"], {"cpu": "1", "memory": "2Gi"})
-        self.assertEqual(agent["imagePullPolicy"], "Always")
-        self.assertEqual(agent["readinessProbe"]["periodSeconds"], 2)
-        self.assertNotIn("schedulingGates", pod["spec"])
+    def test_orchestrator_starts_no_compute_supply_or_allocation(self):
+        source = (ROOT / "services" / "orchestrator.py").read_text(encoding="utf-8")
+        for started in (
+            "DirectBufferReconciler",
+            "ComputeManager",
+            "ComputeAvailabilityWatcher",
+            "LeaseLeaderElector",
+            "queue_worker",
+            "threading.Thread",
+        ):
+            self.assertNotIn(started, source)
 
-    def test_deploy_passes_policy_through_controller_env_with_one_rollout(self):
-        script = (self.REPO / "deploy/scripts/deploy.sh").read_text(encoding="utf-8")
-        inject = script.index('set_buffer_policy.sh" "${rendered}" "${buffer_reserve}" "${buffer_capacity}"')
-        # 적용보다 먼저 넣는다. 적용 뒤 set env 로 바꾸면 rollout 이 두 번 돈다.
-        self.assertLess(inject, script.index("apply_stage bootstrap"))
-        self.assertNotIn("kubectl set env deployment/controller", script)
-        self.assertIn('status.get("allocation_mode") == "warm_buffer_direct"', script)
-        # Deployment 버퍼를 되살리거나 정책을 거기에 싣지 않는다.
-        self.assertNotIn("kubectl annotate deployment/compute-general", script)
-        self.assertNotIn("kubectl patch deployment/compute-general", script)
-        self.assertIn("kubectl delete deployment -l app=compute-pod", script)
-
-    def test_policy_injection_sets_both_env_values_exactly_once(self):
-        import shutil
-        import subprocess
-        import tempfile
-
-        shell = shutil.which("sh")
-        if not shell or not shutil.which("awk"):
-            self.skipTest("sh/awk 가 없는 환경")
-        script = str(self.REPO / "deploy/scripts/set_buffer_policy.sh")
-        rendered = "\n".join([
-            "        env:",
-            "        - name: BUFFER_RESERVE",
-            '          value: ""',
-            "        - name: BUFFER_CAPACITY",
-            '          value: ""',
-            "",
-        ])
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "rendered.yaml"
-            path.write_text(rendered, encoding="utf-8")
-            subprocess.run([shell, script, str(path), "2", "40"], check=True)
-            text = path.read_text(encoding="utf-8")
-            self.assertIn('value: "2"', text)
-            self.assertIn('value: "40"', text)
-            # 하나라도 없으면 실패해서 배포를 멈춘다.
-            path.write_text(rendered.split("        - name: BUFFER_CAPACITY")[0], encoding="utf-8")
-            failed = subprocess.run([shell, script, str(path), "2", "40"], capture_output=True)
-            self.assertNotEqual(failed.returncode, 0)
-
-    def test_controller_manifest_names_the_arm_and_has_no_policy_switch(self):
+    def test_controller_manifest_names_the_arm_and_has_no_r_or_n(self):
         documents = self._load_yaml("deploy/base/controller.yaml")
         controller = next(d for d in documents if d and d.get("kind") == "Deployment")
         env = {
             item["name"]: item.get("value")
             for item in controller["spec"]["template"]["spec"]["containers"][0]["env"]
         }
-        self.assertEqual(env["COMPUTE_ALLOCATION_MODE"], "warm_buffer_direct")
-        # 동적 R 하나만 있다. 끄고 켜는 스위치를 다시 들이지 않는다.
-        self.assertNotIn("BUFFER_DYNAMIC_RESERVE_ENABLED", env)
-        self.assertIn("BUFFER_RESERVE", env)
-        self.assertIn("BUFFER_CAPACITY", env)
+        self.assertEqual(env["COMPUTE_ALLOCATION_MODE"], "baseline")
+        for name in ("BUFFER_RESERVE", "BUFFER_CAPACITY", "BUFFER_DYNAMIC_RESERVE_ENABLED"):
+            self.assertNotIn(name, env)
 
+    def test_deploy_takes_no_policy_and_checks_zero_compute_pods(self):
+        script = (self.REPO / "deploy/scripts/deploy.sh").read_text(encoding="utf-8")
+        self.assertNotIn("BUFFER_RESERVE", script)
+        self.assertNotIn("BUFFER_CAPACITY", script)
+        self.assertNotIn("set_buffer_policy", script)
+        self.assertFalse((self.REPO / "deploy/scripts/set_buffer_policy.sh").exists())
+        self.assertIn('status.get("allocation_mode") == "baseline"', script)
+        self.assertIn('status.get("R") is None', script)
+        self.assertIn('status.get("N") is None', script)
+        self.assertIn('status.get("physical_total") == 0', script)
+        # 다른 arm 이 남긴 compute 자원은 배포가 지운다(이 arm 의 컨트롤러에는 정리 루프가 없다).
+        self.assertIn("kubectl delete deployment -l app=compute-pod", script)
+        self.assertIn("kubectl delete pod -l app=compute-pod", script)
+
+    def test_jenkins_takes_no_r_or_n(self):
+        jenkinsfile = self.REPO / "Jenkinsfile"
+        if not jenkinsfile.exists():
+            self.skipTest("테스트 이미지에는 Jenkinsfile 이 없다")
+        text = jenkinsfile.read_text(encoding="utf-8")
+        self.assertNotIn("BUFFER_RESERVE", text)
+        self.assertNotIn("BUFFER_CAPACITY", text)
+        self.assertNotIn("parameters {", text)
 
 
 # ---------------------------------------------------------------- 장애 조건

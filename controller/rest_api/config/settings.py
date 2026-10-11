@@ -139,11 +139,11 @@ CACHES = {
 REDIS_URL = _env_first(('REDIS_URL',), 'redis://localhost:6379/0')
 WAIT_QUEUE_PREFIX = _env_first(('WAIT_QUEUE_PREFIX',), 'kda:waitq')
 DEFAULT_COMPUTE_TYPE = _env_first(('DEFAULT_COMPUTE_TYPE',), 'general')
-# 이 브랜치(exp-warm-buffer)는 Deployment 없이 컨트롤러가 버퍼 파드를 직접 만들고
-# 지우는 비교군이다. 브랜치가 곧 arm 이므로 모드는 상수다 - 환경변수로 읽으면
-# 오타 하나로 다른 arm 이 조용히 배포된다. 상태 API 와 평가 도구가 이 이름으로
-# arm 을 기록한다.
-COMPUTE_ALLOCATION_MODE = 'warm_buffer_direct'
+# 이 브랜치(exp-baseline)는 작업을 고사양 user pod 에서 직접 돌리는 비교군이다.
+# compute 파드를 만들지도 할당하지도 않는다(오케스트레이터가 그 루프를 시작하지 않는다).
+# 브랜치가 곧 arm 이므로 모드는 상수다 - 환경변수로 읽으면 오타 하나로 다른 arm 이
+# 조용히 배포된다. 상태 API 와 평가 도구가 이 이름으로 arm 을 기록한다.
+COMPUTE_ALLOCATION_MODE = 'baseline'
 COMPUTE_POD_IMAGE = _env_first(
     ('COMPUTE_POD_IMAGE',),
     'harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:latest',

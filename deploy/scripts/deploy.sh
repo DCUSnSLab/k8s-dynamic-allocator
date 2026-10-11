@@ -6,8 +6,6 @@ namespace="${DEPLOY_NAMESPACE}"
 storage_class="${DEPLOY_STORAGE_CLASS}"
 overlay="${DEPLOY_OVERLAY}"
 stage_label="${DEPLOY_STAGE_LABEL}"
-buffer_reserve="${BUFFER_RESERVE}"
-buffer_capacity="${BUFFER_CAPACITY}"
 rendered="${WORKSPACE}/.kda-deploy-${BUILD_NUMBER}.yaml"
 kustomization="${overlay}/kustomization.yaml"
 kustomization_backup="${WORKSPACE}/.kda-deploy-kustomization-${BUILD_NUMBER}.bak"
@@ -25,27 +23,6 @@ for required_command in kubectl sed grep sort diff wc tr; do
         exit 1
     fi
 done
-
-# Mirror the controller's own fail-closed rule (0 <= R <= N) so a bad build
-# parameter is rejected before anything is applied to the cluster.
-for policy_value in "${buffer_reserve}" "${buffer_capacity}"; do
-    case "${policy_value}" in
-        ''|*[!0-9]*)
-            echo "[PreflightFailed] buffer policy must be non-negative integers: R=${buffer_reserve} N=${buffer_capacity}"
-            exit 1
-            ;;
-    esac
-done
-if [ "${buffer_reserve}" -gt "${buffer_capacity}" ]; then
-    echo "[PreflightFailed] buffer policy must satisfy R <= N: R=${buffer_reserve} N=${buffer_capacity}"
-    exit 1
-fi
-# 이 arm 은 요청마다 파드를 만들 수도 있으므로 N=0 이면 어떤 요청도 파드를 받지
-# 못한다. 오류 없이 run 하나를 통째로 버리게 되므로 여기서 막는다(cold arm 과 같다).
-if [ "${buffer_capacity}" -lt 1 ]; then
-    echo "[PreflightFailed] the direct warm buffer needs N>=1: N=${buffer_capacity}"
-    exit 1
-fi
 
 cleanup_workspace() {
     if [ -f "${kustomization_backup}" ]; then
@@ -144,11 +121,6 @@ test -s "${rendered}"
 grep -F "${CONTROLLER_IMAGE}" "${rendered}" >/dev/null
 grep -F "${SWLABSSH_IMAGE}" "${rendered}" >/dev/null
 
-# 이 arm 은 Deployment 가 없어 R/N 을 컨트롤러 env 로 받는다. 적용 전에 넣어 rollout 을
-# 한 번만 한다(적용 뒤 set env 로 바꾸면 두 번 돌고, 그 사이 컨트롤러는 N 없이 뜬다).
-echo "[Render] Direct warm buffer policy R=${buffer_reserve} N=${buffer_capacity}"
-sh "${WORKSPACE}/deploy/scripts/set_buffer_policy.sh" "${rendered}" "${buffer_reserve}" "${buffer_capacity}"
-
 echo '[Validate] Client render and deploy-stage coverage'
 kubectl apply --dry-run=client \
     -n "${namespace}" \
@@ -232,12 +204,13 @@ apply_stage controller
 kubectl rollout status deployment/controller \
     -n "${namespace}" --timeout=5m
 
-# 이 arm 은 compute Deployment 를 쓰지 않는다. 다른 arm(develop, reuse)이 남긴 것이
-# 있으면 지운다 - 남겨 두면 그 파드가 노드 자원과 N 을 쥔다. 컨트롤러 리더도 남은
-# 것을 발견하면 0 으로 내린다. 이 계정에 지울 권한이 없어도 배포는 멈추지 않는다.
-kubectl delete deployment -l app=compute-pod -n "${namespace}" --ignore-not-found || echo '[Warning] could not delete the compute Deployment; the controller leader scales it to 0'
+# 이 arm 은 compute 파드를 쓰지 않는다. 다른 arm 이 남긴 compute Deployment 와 파드를
+# 지운다 - 남겨 두면 노드 자원을 쥐고 run 기록의 compute 집계에 섞인다. 이 arm 의
+# 컨트롤러는 정리 루프가 없으므로 배포가 지운다.
+kubectl delete deployment -l app=compute-pod -n "${namespace}" --ignore-not-found
+kubectl delete pod -l app=compute-pod -n "${namespace}" --ignore-not-found --wait=false
 
-echo '[Smoke] Wait for the direct warm buffer to report its policy'
+echo '[Smoke] Wait for the baseline controller with no compute pod'
 attempt=0
 until kubectl exec -n "${namespace}" deployment/controller -- \
     python -c '
@@ -245,28 +218,27 @@ import json
 import sys
 import urllib.request
 
-expected_r = int(sys.argv[1])
-expected_n = int(sys.argv[2])
-
 with urllib.request.urlopen(
     "http://127.0.0.1:9001/api/compute/status/",
     timeout=5,
 ) as response:
     status = json.load(response)
 
-# Deployment 가 없으므로 정책 캐시·깃발도 없다. 확인할 것은 컨트롤러가 이 arm 으로
-# 돌고 있고 받은 R/N 을 쓰고 있는가다.
+# 컨트롤러가 이 arm 으로 돌고, R/N 이 없고, compute 파드가 하나도 없는가(지우는 중인
+# 것 포함). 이전 arm 의 컨트롤러가 사라지기 직전에 만든 것이 있으면 아래에서 다시 지운다.
 ready = (
-    status.get("allocation_mode") == "warm_buffer_direct"
-    and status.get("R") == expected_r
-    and status.get("N") == expected_n
+    status.get("allocation_mode") == "baseline"
+    and status.get("R") is None
+    and status.get("N") is None
+    and status.get("physical_total") == 0
 )
 sys.exit(0 if ready else 1)
-' "${buffer_reserve}" "${buffer_capacity}" >/dev/null
+' >/dev/null
 do
+    kubectl delete pod -l app=compute-pod -n "${namespace}" --ignore-not-found --wait=false >/dev/null
     attempt=$((attempt + 1))
     if [ "${attempt}" -ge 40 ]; then
-        echo '[SmokeFailed] direct warm buffer policy was not active within 120 seconds'
+        echo '[SmokeFailed] baseline controller did not report zero compute pods within 120 seconds'
         kubectl exec -n "${namespace}" deployment/controller -- \
             python -c '
 import json
@@ -309,13 +281,6 @@ test "${actual_controller_image}" = "${CONTROLLER_IMAGE}"
 # compute 이미지는 Deployment 에 실리지 않는다. 컨트롤러가 그 이미지로 파드를 직접
 # 만들므로 컨트롤러 env 가 기준이다(아래 runtime_compute_image).
 test "${actual_swlabssh_image}" = "${SWLABSSH_IMAGE}"
-
-actual_buffer_reserve=$(kubectl exec -n "${namespace}" deployment/controller -- \
-    sh -c 'printf "%s" "$BUFFER_RESERVE"')
-actual_buffer_capacity=$(kubectl exec -n "${namespace}" deployment/controller -- \
-    sh -c 'printf "%s" "$BUFFER_CAPACITY"')
-test "${actual_buffer_reserve}" = "${buffer_reserve}"
-test "${actual_buffer_capacity}" = "${buffer_capacity}"
 
 runtime_compute_image=$(kubectl exec -n "${namespace}" \
     deployment/controller -- \
@@ -363,5 +328,5 @@ test "${fluent_bit_desired}" -gt 0
 test "${fluent_bit_ready}" -eq "${fluent_bit_desired}"
 
 echo "[Success] image tag=${IMAGE_TAG}"
-echo "[Success] direct warm buffer policy R=${buffer_reserve} N=${buffer_capacity}"
+echo "[Success] baseline arm (no compute pods, no R/N)"
 echo "[Success] SSH endpoint=${DEPLOY_SSH_HOST}:${DEPLOY_SSH_PORT}"
