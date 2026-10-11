@@ -66,12 +66,29 @@ class FakePipeline:
     def hget(self, key, field):
         self.ops.append(("hget", key, field))
 
+    def zadd(self, key, mapping, xx=False):
+        self.ops.append(("zadd", key, mapping, xx))
+
+    def zscore(self, key, member):
+        self.ops.append(("zscore", key, member))
+
     def execute(self):
         self.client.round_trips += 1
         out = []
         for op in self.ops:
             data = self.client.hashes.get(op[1], {})
-            if op[0] == "hgetall":
+            if op[0] == "zadd":
+                zset = self.client.zsets.setdefault(op[1], {})
+                changed = 0
+                for member, score in op[2].items():
+                    if op[3] and member not in zset:
+                        continue
+                    changed += int(zset.get(member) != score)
+                    zset[member] = score
+                out.append(changed)
+            elif op[0] == "zscore":
+                out.append(self.client.zsets.get(op[1], {}).get(op[2]))
+            elif op[0] == "hgetall":
                 out.append(dict(data))
             elif op[0] == "hget":
                 out.append(data.get(op[2]))
@@ -87,6 +104,8 @@ class FakeRedis:
         self.active = set()
         self.round_trips = 0
         self.zrank_calls = 0
+        self.zsets = {}
+        self.transactions = []
 
     def zrange(self, _key, _start, _end):
         return sorted(self.queue, key=lambda ticket_id: self.queue[ticket_id])
@@ -99,6 +118,7 @@ class FakeRedis:
         return set(self.active)
 
     def pipeline(self, transaction=False):
+        self.transactions.append(transaction)
         return FakePipeline(self)
 
 
@@ -143,6 +163,28 @@ class DirectQueueTests(unittest.TestCase):
         self.assertEqual(client.round_trips, 1)
         # 대기 티켓의 큐 위치를 읽지 않는다(포화에서 대기 수만큼 왕복이 늘던 것).
         self.assertEqual(client.zrank_calls, 0)
+
+
+class PendingCreateRefreshTests(unittest.TestCase):
+    def test_refresh_keeps_only_reservations_that_still_exist(self):
+        queue, client = make_queue()
+        key = queue._pending_create_key("general")
+        client.zsets[key] = {"warm-a": 100.0}
+        with patch.object(time, "time", return_value=200.0):
+            alive = queue.refresh_pending_creates("general", ["warm-a", "warm-gone"])
+        self.assertEqual(alive, {"warm-a"})
+        self.assertEqual(client.zsets[key], {"warm-a": 200.0})  # 지워진 것을 되살리지 않는다
+        self.assertEqual(client.round_trips, 1)
+        self.assertEqual(client.transactions, [True])
+
+    def test_same_score_refresh_still_counts_as_alive(self):
+        """ZADD XX CH 는 점수가 같으면 0 을 돌려준다. 그것을 예약 상실로 보면 안 된다."""
+        queue, client = make_queue()
+        key = queue._pending_create_key("general")
+        client.zsets[key] = {"warm-a": 300.0}
+        with patch.object(time, "time", return_value=300.0):
+            alive = queue.refresh_pending_creates("general", ["warm-a"])
+        self.assertEqual(alive, {"warm-a"})
 
 
 class BufferPolicyTests(unittest.TestCase):

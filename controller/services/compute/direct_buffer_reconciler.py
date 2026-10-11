@@ -46,6 +46,7 @@ class DirectBufferReconciler:
         self.resync_seconds = max(0.2, float(settings.WARM_BUFFER_RESYNC_SECONDS))
         self.cleanup_seconds = max(1.0, float(settings.BUFFER_RECONCILE_RESYNC_SECONDS))
         self.pending_ttl_seconds = max(1.0, float(settings.WARM_BUFFER_PENDING_CREATE_SECONDS))
+        self.lock_ttl_seconds = max(1.0, float(getattr(queues, "lock_ttl_seconds", 60) or 60))
         self.ready_timeout_seconds = max(1.0, float(settings.COLD_START_POD_READY_TIMEOUT_SECONDS))
         # 같은 순간 몰려오는 파드 이벤트를 한 바퀴로 합친다.
         self.debounce_seconds = 0.05
@@ -243,13 +244,20 @@ class DirectBufferReconciler:
         to_create: List[str] = []
         to_delete: List[Dict] = []
         record: Dict = {}
+        started = time.monotonic()
         try:
             plan = self._plan(ct)
             record = plan["record"]
-            for name in plan["create"]:
-                self.queues.add_pending_create(ct, name)
-                to_create.append(name)
             to_delete = plan["delete"]
+            if plan["create"]:
+                # 락 TTL 의 절반을 넘긴 계획은 버린다(보조 장치). 보장은 아래 등록이 한다 -
+                # 락을 아직 쥐고 있을 때만 원자적으로 예약한다.
+                if time.monotonic() - started > self.lock_ttl_seconds / 2.0:
+                    record["create_aborted"] = "slow_plan"
+                elif self.queues.add_pending_creates_if_locked(ct, plan["create"], lock_token):
+                    to_create = list(plan["create"])
+                else:
+                    record["create_aborted"] = "lock_lost"
         finally:
             try:
                 self.queues.release_allocator_lock(ct, lock_token)
@@ -410,12 +418,40 @@ class DirectBufferReconciler:
         return {"create": create, "delete": delete, "record": record}
 
     def _create_idle(self, ct: str, names: List[str]) -> int:
+        """예약한 이름을 차례로 만든다. 예약이 남아 있는 이름만 만든다.
+
+        호출마다 남은 예약 전부의 시각을 갱신해, 생성이 느려도 뒤쪽 예약이 차례를 기다리는
+        동안 만료되지 않게 한다. 이미 사라진 예약(다른 쪽이 그 자리를 빈자리로 셌다)은
+        되살리지도 만들지도 않는다 - 되살리면 같은 자리를 둘이 쓴다(가짜 시계로 재현:
+        N=16, 호출당 4.9초에서 19개).
+        """
         created = 0
-        for name in names:
+        remaining = list(names)
+        while remaining:
             try:
-                # 상한(응답 없는 생성 요청이 서버에 남아 있을 수 있는 시간)을 이 호출부터
-                # 센다. 앞 이름들의 생성이 오래 걸려도 뒤 이름의 예약이 먼저 만료되지 않는다.
-                self.queues.add_pending_create(ct, name)
+                alive = self.queues.refresh_pending_creates(ct, remaining)
+            except Exception as exc:
+                # 예약 상태를 모르면 만들지 않는다. 남은 예약은 상한이 지나면 빠진다.
+                logger.warning(
+                    "[Warning] operation=direct_buffer_create_refresh compute_type=%s remaining=%s reason=%r",
+                    ct,
+                    len(remaining),
+                    str(exc),
+                )
+                break
+            name = remaining.pop(0)
+            lost = [n for n in [name, *remaining] if n not in alive]
+            remaining = [n for n in remaining if n in alive]
+            if lost:
+                logger.warning(
+                    "[Warning] operation=direct_buffer_create compute_type=%s skipped=%s reason=%r",
+                    ct,
+                    lost,
+                    "reservation expired before create",
+                )
+            if name not in alive:
+                continue
+            try:
                 self.provider.create_idle_pod(ct, name)
                 created += 1
             except ApiException as exc:

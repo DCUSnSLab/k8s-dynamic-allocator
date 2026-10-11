@@ -753,6 +753,70 @@ class ComputeQueues:
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to record pending create {pod_name}: {exc}") from exc
 
+    def add_pending_creates_if_locked(
+        self, compute_type: str, pod_names: Iterable[str], lock_token: Optional[str]
+    ) -> bool:
+        """할당 락을 아직 쥐고 있을 때만 생성 예약을 한 번에 올린다. 못 올렸으면 False.
+
+        리더의 계획은 락 아래에서 자리를 셌다. 락이 그사이 만료돼 다른 쪽이 같은 자리를
+        셌다면 그 계획으로 예약하면 안 된다. 락 확인과 등록을 한 스크립트로 묶어 그 사이에
+        끼어들 틈을 없앤다(만료된 키는 GET 이 nil 이다).
+        """
+        names = [name for name in pod_names if name]
+        if not names:
+            return True
+        if not lock_token:
+            return False
+        compute_type_value = self.normalize_compute_type(compute_type)
+        script = """
+        if redis.call("get", KEYS[1]) ~= ARGV[1] then
+            return 0
+        end
+        for i = 3, #ARGV do
+            redis.call("zadd", KEYS[2], ARGV[2], ARGV[i])
+        end
+        return 1
+        """
+        client = self._redis_client()
+        try:
+            return bool(
+                client.eval(
+                    script,
+                    2,
+                    self._lock_key(compute_type_value),
+                    self._pending_create_key(compute_type_value),
+                    lock_token,
+                    repr(time.time()),
+                    *names,
+                )
+            )
+        except RedisError as exc:
+            raise QueueUnavailableError(f"Failed to record pending creates: {exc}") from exc
+
+    def refresh_pending_creates(self, compute_type: str, pod_names: Iterable[str]) -> set:
+        """아직 남아 있는 생성 예약만 시각을 갱신하고, 남아 있던 이름을 돌려준다.
+
+        예약을 세는 쪽(pending_creates)은 항상 만료된 것을 먼저 지우고 센다. 그래서
+        "누군가 빈자리로 셌다" 는 곧 "지워졌다" 이고, 지워진 예약은 되살리지 않는다
+        (XX: 있을 때만 갱신). 있는지는 ZADD 의 반환값이 아니라 ZSCORE 로 본다 - 갱신
+        시각이 이전과 같으면 ZADD XX CH 도 0 을 돌려준다. 한 트랜잭션, 한 번의 왕복이다.
+        """
+        names = [name for name in pod_names if name]
+        if not names:
+            return set()
+        key = self._pending_create_key(self.normalize_compute_type(compute_type))
+        now = time.time()
+        client = self._redis_client()
+        try:
+            with client.pipeline(transaction=True) as pipe:
+                for name in names:
+                    pipe.zadd(key, {name: now}, xx=True)
+                    pipe.zscore(key, name)
+                results = pipe.execute()
+        except RedisError as exc:
+            raise QueueUnavailableError(f"Failed to refresh pending creates: {exc}") from exc
+        return {name for name, score in zip(names, results[1::2]) if score is not None}
+
     def remove_pending_creates(self, compute_type: str, pod_names: Iterable[str]) -> None:
         names = [name for name in pod_names if name]
         if not names:

@@ -521,14 +521,30 @@ class ComputeAllocator:
             compute_pod=pod_name,
             claim_token=claim_token,
         )
+        current = None
         if self._owns_claim(recorded, claim_token):
-            # drain 이 락 안에서 이미 올렸다. 다시 올려 상한(생성 응답을 기다릴 수 있는
-            # 시간)을 지금부터 센다.
-            self.queues.add_pending_create(compute_type, pod_name)
-            if self._owns_claim(self.tickets.get_ticket(ticket_id), claim_token):
-                return pod_name
+            # drain 이 락 안에서 올린 예약을 갱신해 상한(생성 응답을 기다릴 수 있는 시간)을
+            # 지금부터 센다. 사라진 예약은 되살리지 않는다(XX).
+            alive = pod_name in self.queues.refresh_pending_creates(compute_type, [pod_name])
+            current = self.tickets.get_ticket(ticket_id)
+            if self._owns_claim(current, claim_token):
+                if alive:
+                    return pod_name
+                # 예약이 사라져도 claim 이 아직 유효하면 claim 이 자리를 쥐고 있다(파드 없는
+                # claim 으로 센다). 그때는 예약을 다시 올려 확인 뒤의 취소에 대비한다.
+                if not self.queues.is_allocation_stale(current):
+                    self.queues.add_pending_create(compute_type, pod_name)
+                    return pod_name
         # 만들지 않는다. drain 이 잡아 둔 자리도 돌려준다.
         self.queues.remove_pending_creates(compute_type, [pod_name])
+        if self._owns_claim(current, claim_token):
+            # 예약도 claim 도 자리를 보장하지 못한다. 순서를 지킨 채 다시 줄 세운다.
+            self.tickets.requeue_ticket(
+                ticket_id,
+                reason="Creation reservation expired before the pod was created",
+                increment_retry=False,
+                claim_token=claim_token,
+            )
         raise AllocationClaimLost(f"Ticket lost its claim before creating {pod_name}")
 
     @staticmethod

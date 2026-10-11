@@ -405,6 +405,7 @@ class FakeProvider:
 class FakeQueues:
     worker_identity = "worker"
     max_retries = 3
+    lock_ttl_seconds = 60
 
     def __init__(self, world: World):
         self.world = world
@@ -475,6 +476,25 @@ class FakeQueues:
     def add_pending_create(self, compute_type, name):
         with self.world.mu:
             self.world.pending[name] = time.time()
+
+    def add_pending_creates_if_locked(self, compute_type, names, lock_token):
+        with self.world.mu:
+            if self.world.lock_token != lock_token:
+                return False
+            for name in names:
+                self.world.pending[name] = time.time()
+            return True
+
+    def refresh_pending_creates(self, compute_type, names):
+        # 실제와 같은 계약: 남아 있는 것만 갱신하고, 남아 있던 이름을 돌려준다.
+        with self.world.mu:
+            alive = {name for name in names if name in self.world.pending}
+            for name in alive:
+                self.world.pending[name] = time.time()
+            return alive
+
+    def is_allocation_stale(self, ticket):
+        return bool(ticket.get("stale"))
 
     def remove_pending_creates(self, compute_type, names):
         with self.world.mu:
@@ -1194,6 +1214,127 @@ class DirectDeployContractTests(unittest.TestCase):
         self.assertNotIn("BUFFER_DYNAMIC_RESERVE_ENABLED", env)
         self.assertIn("BUFFER_RESERVE", env)
         self.assertIn("BUFFER_CAPACITY", env)
+
+
+
+# ---------------------------------------------------------------- 장애 조건
+
+
+class HoldAllocator(SimAllocator):
+    """세션이 끝나지 않는 할당(자리를 계속 쥔다)."""
+
+    def _execute_allocated_ticket(self, ticket):
+        with self.provider.world.mu:
+            self.provider.world.tickets[ticket["ticket_id"]]["status"] = "assigned"
+        return {"status": "assigned"}
+
+
+class DirectFaultTests(unittest.TestCase):
+    def test_slow_creates_cannot_exceed_n_after_reservations_expire(self):
+        """리뷰 재현: 호출당 4.9초로 순차 생성하면 뒤쪽 예약이 60초를 넘겨 만료된다.
+
+        그 자리를 다른 복제본이 빈자리로 세어 요청 파드를 만든다. 고치기 전에는 리더가
+        남은 이름을 마저 만들어 N=16 에 19 개가 됐다.
+        """
+        clock = {"now": 1_000_000.0}
+        world = World(capacity=16, reserve=16)
+        provider, queues, tickets, allocator, reconciler = make(world)
+        reconciler.policy.cooldown_seconds = lambda compute_type: 0.0
+        original_create = provider.create_idle_pod
+        state = {"stolen": False}
+
+        def slow_create(compute_type, name):
+            clock["now"] += 4.9
+            if clock["now"] - 1_000_000.0 > 60 and not state["stolen"]:
+                state["stolen"] = True
+                world.tick()
+                time.sleep(0.05)
+                world.tick()
+                world.enqueue(16)
+                for _ in range(2):
+                    with run_detached_threads_inline():
+                        HoldAllocator(provider, queues, tickets).drain_wait_queue_for_type(CT, no_stale)
+            return original_create(compute_type, name)
+
+        provider.create_idle_pod = slow_create
+        with patch("time.time", lambda: clock["now"]):
+            reconciler.reconcile_type(CT)
+        self.assertTrue(state["stolen"])
+        self.assertEqual(world.violations, [])
+        self.assertLessEqual(len(world.live()), 16)
+
+    def test_reservations_stay_alive_while_creates_are_slow(self):
+        """다른 쪽이 끼어들지 않으면 느린 생성도 끝까지 다 만든다(꼬리 예약이 만료되지 않는다)."""
+        clock = {"now": 2_000_000.0}
+        world = World(capacity=16, reserve=16)
+        provider, queues, tickets, allocator, reconciler = make(world)
+        reconciler.policy.cooldown_seconds = lambda compute_type: 0.0
+        original_create = provider.create_idle_pod
+
+        def slow_create(compute_type, name):
+            clock["now"] += 4.9
+            # 다른 복제본이 예약을 세면서 만료된 것을 지운다.
+            queues.pending_creates(CT, 60.0)
+            return original_create(compute_type, name)
+
+        provider.create_idle_pod = slow_create
+        with patch("time.time", lambda: clock["now"]):
+            reconciler.reconcile_type(CT)
+        self.assertEqual(world.created["idle"], 16)
+
+    def test_plan_is_not_registered_after_the_lock_is_lost(self):
+        world = World(capacity=10, reserve=3)
+        provider, queues, tickets, allocator, reconciler = make(world)
+        original_plan = reconciler._plan
+
+        def plan_then_lose_lock(ct):
+            plan = original_plan(ct)
+            world.lock_token = "someone-else"  # 계획 중에 락이 만료돼 남이 잡았다
+            return plan
+
+        reconciler._plan = plan_then_lose_lock
+        outcome = reconciler.reconcile_type(CT)
+        self.assertEqual(outcome["record"].get("create_aborted"), "lock_lost")
+        self.assertEqual(world.created["idle"], 0)
+        self.assertEqual(world.pending, {})
+
+    def test_request_pod_with_lost_reservation_but_fresh_claim_is_created(self):
+        world = World(capacity=5, reserve=0)
+        provider, queues, tickets, allocator, _ = make(world)
+        world.enqueue(1)
+        original_refresh = queues.refresh_pending_creates
+
+        def reservation_pruned(compute_type, names):
+            with world.mu:
+                for name in names:
+                    world.pending.pop(name, None)
+            return original_refresh(compute_type, names)
+
+        queues.refresh_pending_creates = reservation_pruned
+        with run_detached_threads_inline():
+            allocator.drain_wait_queue_for_type(CT, no_stale)
+        self.assertEqual(world.created["request"], 1)
+        self.assertEqual(world.tickets["t0001"]["status"], "assigned")
+
+    def test_request_pod_with_lost_reservation_and_stale_claim_is_requeued(self):
+        world = World(capacity=5, reserve=0)
+        provider, queues, tickets, allocator, _ = make(world)
+        world.enqueue(1)
+        original_refresh = queues.refresh_pending_creates
+
+        def reservation_and_claim_expired(compute_type, names):
+            with world.mu:
+                for name in names:
+                    world.pending.pop(name, None)
+                world.tickets["t0001"]["stale"] = True
+            return original_refresh(compute_type, names)
+
+        queues.refresh_pending_creates = reservation_and_claim_expired
+        with run_detached_threads_inline():
+            allocator.drain_wait_queue_for_type(CT, no_stale)
+        self.assertEqual(world.created["request"], 0)
+        self.assertEqual(world.tickets["t0001"]["status"], "queued")
+        self.assertEqual(world.tickets["t0001"]["retry_count"], 0)
 
 
 if __name__ == "__main__":
