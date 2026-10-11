@@ -1,9 +1,13 @@
-"""정리(cleanup)가 낡은 목록으로 사용 중인 파드를 지우지 않는다.
+"""정리(cleanup)가 낡은 목록으로 사용 중이거나 회복한 파드를 지우지 않는다.
 
-정리는 몇 초 전의 목록으로 "NotReady 가 오래된 파드" 를 고른다. 그 파드가 idle 이었다가
-그사이 Ready 로 돌아와 요청에 할당됐으면 지우면 안 된다.
-  - 정리는 목록에서 본 상태를 반납에 넘기고, 반납은 방금 읽은 상태와 비교한다.
-  - idle 은 읽은 버전을 전제로 지운다. 읽은 뒤 할당이 끼어들면 지워지지 않는다.
+정리는 몇 초 전의 목록으로 "NotReady 가 오래된 파드" 를 고른다. 그사이
+  - idle 이 Ready 로 돌아와 요청에 할당됐거나(라벨이 바뀐다),
+  - 라벨은 그대로(idle 또는 assigned)인 채 Ready 만 돌아왔으면
+지우면 안 된다.
+  - 정리는 목록에서 본 상태와 NotReady 기준(grace)을 반납에 넘긴다. 반납은 방금 읽은 파드로
+    둘 다 다시 판단한다(정리와 같은 기준).
+  - NotReady 사유의 삭제와 idle 삭제는 읽은 버전을 전제로 한다. 읽은 뒤 할당되거나 Ready 로
+    돌아오면(버전이 바뀐다) 지워지지 않는다.
   - 무시된 반납은 released 로 세지 않는다.
 """
 
@@ -103,8 +107,14 @@ class PodApi:
     namespace = "kda-test"
     api_request_timeout = 5
 
-    def __init__(self, status="idle"):
+    GRACE = 30.0
+
+    def __init__(self, status="idle", not_ready_for: Optional[float] = None):
+        """not_ready_for: Ready 였다가 떨어진 지 몇 초인가(None 이면 Ready)."""
         self.status = status
+        self.not_ready_since = (
+            None if not_ready_for is None else datetime.now(timezone.utc) - timedelta(seconds=not_ready_for)
+        )
         self.rv = 1
         self.deleted = False
         self.calls: List[str] = []
@@ -121,11 +131,21 @@ class PodApi:
                 resource_version=str(self.rv),
                 deletion_timestamp=None,
             ),
-            status=SimpleNamespace(pod_ip=""),
+            status=SimpleNamespace(pod_ip="", not_ready_since=self.not_ready_since),
         )
+
+    @staticmethod
+    def _pod_not_ready_since(pod):
+        # 실제(kubernetes_client._pod_not_ready_since)와 같은 뜻: Ready 면 None.
+        return pod.status.not_ready_since
 
     def claim(self):
         self.status = "assigned"
+        self.rv += 1
+
+    def recover(self):
+        """라벨은 그대로 두고 Ready 만 돌아온다(kubelet 이 상태를 써서 버전이 오른다)."""
+        self.not_ready_since = None
         self.rv += 1
 
     def get_pod_ip(self, name):
@@ -184,6 +204,13 @@ def releaser_for(pod, tickets=None):
     return ComputeReleaser(pod, Queues(), tickets or Tickets())
 
 
+def cleanup_release(pod, status, tickets=None):
+    """정리가 NotReady 사유로 부르는 것과 같은 호출."""
+    return releaser_for(pod, tickets).release_unreachable_compute_pod(
+        "pod-a", expected_status=status, min_not_ready_seconds=PodApi.GRACE
+    )
+
+
 class ReleaseExpectationTests(unittest.TestCase):
     def test_idle_seen_by_cleanup_but_assigned_now_is_left_alone(self):
         pod = PodApi(status="assigned")
@@ -221,6 +248,45 @@ class ReleaseExpectationTests(unittest.TestCase):
         self.assertTrue(pod.deleted)
 
 
+class NotReadyStillValidTests(unittest.TestCase):
+    """라벨은 그대로인 채 Ready 만 돌아온 경우(다른 세션 지적)."""
+
+    def test_assigned_pod_that_recovered_is_left_alone(self):
+        pod = PodApi(status="assigned", not_ready_for=None)
+        result = cleanup_release(pod, "assigned")
+        self.assertEqual(result["outcome"], "ignored")
+        self.assertEqual(pod.calls, [])
+        self.assertFalse(pod.deleted)
+
+    def test_idle_pod_that_recovered_is_left_alone(self):
+        pod = PodApi(status="idle", not_ready_for=None)
+        result = cleanup_release(pod, "idle")
+        self.assertEqual(result["outcome"], "ignored")
+        self.assertFalse(pod.deleted)
+
+    def test_pod_that_flapped_back_to_not_ready_recently_is_left_alone(self):
+        """회복했다가 방금 다시 NotReady: 정리의 기준(grace)을 아직 채우지 못했다."""
+        pod = PodApi(status="assigned", not_ready_for=PodApi.GRACE / 3)
+        result = cleanup_release(pod, "assigned")
+        self.assertEqual(result["outcome"], "ignored")
+        self.assertFalse(pod.deleted)
+
+    def test_recovery_between_read_and_delete_keeps_the_pod(self):
+        pod = PodApi(status="assigned", not_ready_for=PodApi.GRACE * 2)
+        tickets = Tickets(before_lookup=pod.recover)
+        result = cleanup_release(pod, "assigned", tickets)
+        self.assertEqual(result["outcome"], "ignored")
+        self.assertNotIn("delete", pod.calls)  # 조건 없는 삭제를 하지 않는다
+        self.assertFalse(pod.deleted)
+
+    def test_still_not_ready_past_grace_is_deleted(self):
+        for status in ("assigned", "idle"):
+            pod = PodApi(status=status, not_ready_for=PodApi.GRACE * 2)
+            result = cleanup_release(pod, status)
+            self.assertNotEqual(result.get("outcome"), "ignored", status)
+            self.assertTrue(pod.deleted, status)
+
+
 class CleanupPassesWhatItSawTests(unittest.TestCase):
     def _cleanup(self, buffer_status, outcome=None):
         calls: List[Dict] = []
@@ -238,8 +304,10 @@ class CleanupPassesWhatItSawTests(unittest.TestCase):
         if outcome:
             response["outcome"] = outcome
 
-        def release_unreachable(compute_pod, request_context=None, expected_status=None, **_):
-            calls.append({"pod": compute_pod, "expected_status": expected_status})
+        def release_unreachable(compute_pod, request_context=None, expected_status=None,
+                                min_not_ready_seconds=None, **_):
+            calls.append({"pod": compute_pod, "expected_status": expected_status,
+                          "min_not_ready_seconds": min_not_ready_seconds})
             return response
 
         manager = SimpleNamespace(
@@ -253,7 +321,7 @@ class CleanupPassesWhatItSawTests(unittest.TestCase):
 
     def test_idle_status_is_passed_to_the_release(self):
         calls, result = self._cleanup("idle")
-        self.assertEqual(calls, [{"pod": "pod-a", "expected_status": "idle"}])
+        self.assertEqual(calls, [{"pod": "pod-a", "expected_status": "idle", "min_not_ready_seconds": 30.0}])
         self.assertEqual(result["released"], ["pod-a"])
 
     def test_ignored_release_is_not_counted(self):
@@ -263,7 +331,7 @@ class CleanupPassesWhatItSawTests(unittest.TestCase):
 
     def test_unlabelled_pod_has_no_expectation(self):
         calls, result = self._cleanup("unknown")
-        self.assertEqual(calls, [{"pod": "pod-a", "expected_status": None}])
+        self.assertEqual(calls, [{"pod": "pod-a", "expected_status": None, "min_not_ready_seconds": 30.0}])
 
 
 if __name__ == "__main__":

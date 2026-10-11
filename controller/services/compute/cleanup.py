@@ -80,10 +80,12 @@ class ComputeCleanup:
                 if expected_status not in (self.provider.STATUS_IDLE, self.provider.STATUS_ASSIGNED):
                     expected_status = None
                 if unready:
+                    # 반납이 지우기 직전에 같은 기준으로 다시 본다(그새 Ready 로 돌아왔으면 둔다).
                     result = self.compute_manager.release_unreachable_compute_pod(
                         compute_pod,
                         request_context=request_context,
                         expected_status=expected_status,
+                        min_not_ready_seconds=self.not_ready_grace_seconds,
                     )
                 else:
                     result = self.compute_manager.release_compute_pod(

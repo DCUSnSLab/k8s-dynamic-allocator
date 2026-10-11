@@ -1,5 +1,6 @@
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Callable, Dict, Optional
 
 from kubernetes.client.rest import ApiException
@@ -49,13 +50,23 @@ class ComputeReleaser:
         compute_pod: str,
         request_context: Optional[Dict[str, object]] = None,
         expected_status: Optional[str] = None,
+        min_not_ready_seconds: Optional[float] = None,
     ) -> Dict:
         """Release a Compute Pod whose agent is already known to be silent.
 
         Skips the unmount call, which would wait out its full timeout before
         failing anyway. Everything else matches an ordinary release.
+
+        min_not_ready_seconds 는 호출자(정리)가 "NotReady 가 오래됐다" 고 본 기준이다. 방금
+        읽은 파드가 그새 Ready 로 돌아왔거나 그 기준을 채우지 못하면 손대지 않는다.
         """
-        return self._release(compute_pod, request_context, unmount=False, expected_status=expected_status)
+        return self._release(
+            compute_pod,
+            request_context,
+            unmount=False,
+            expected_status=expected_status,
+            min_not_ready_seconds=min_not_ready_seconds,
+        )
 
     def _release(
         self,
@@ -63,11 +74,14 @@ class ComputeReleaser:
         request_context: Optional[Dict[str, object]],
         unmount: bool,
         expected_status: Optional[str] = None,
+        min_not_ready_seconds: Optional[float] = None,
     ) -> Dict:
         # Tags this thread with the ticket's label so its own log lines attribute
         # correctly; the caller's label comes back once the release is done.
         with request_label_scope():
-            return self._release_with_retries(compute_pod, request_context, unmount, expected_status)
+            return self._release_with_retries(
+                compute_pod, request_context, unmount, expected_status, min_not_ready_seconds
+            )
 
     def _release_with_retries(
         self,
@@ -75,6 +89,7 @@ class ComputeReleaser:
         request_context: Optional[Dict[str, object]],
         unmount: bool,
         expected_status: Optional[str] = None,
+        min_not_ready_seconds: Optional[float] = None,
     ) -> Dict:
         release_started_ms = int(time.time() * 1000)
         request_context_value = dict(request_context or {})
@@ -107,6 +122,10 @@ class ComputeReleaser:
             pod_status = labels.get(self.provider.LABEL_STATUS)
             if expected_status and pod_status != expected_status:
                 return self._ignore_release(compute_pod, expected_status, pod_status, "stale_snapshot")
+            # 라벨은 그대로인 채 Ready 만 돌아왔을 수 있다. 정리 사유(NotReady 가 오래됐다)가
+            # 지금도 맞는지 정리와 같은 기준으로 다시 본다.
+            if min_not_ready_seconds is not None and not self._still_not_ready(pod, min_not_ready_seconds):
+                return self._ignore_release(compute_pod, expected_status or "", pod_status, "recovered")
 
             assigned_context = dict(request_context_value)
             # An empty dict means the caller already looked and found nothing.
@@ -148,10 +167,10 @@ class ComputeReleaser:
                         str(exc),
                     )
 
-            if pod_status == self.provider.STATUS_IDLE:
-                # idle 은 읽은 버전을 전제로 지운다. 읽은 뒤 할당(claim PATCH)이 끼어들면 버전이
-                # 바뀌어 지워지지 않는다(409). 버전만 바뀐 경우(kubelet 상태 갱신)는 다음 정리가
-                # 다시 본다.
+            if pod_status == self.provider.STATUS_IDLE or min_not_ready_seconds is not None:
+                # 읽은 버전을 전제로 지운다. 읽은 뒤 할당(claim PATCH)이 끼어들거나 Ready 로
+                # 돌아오면(kubelet 이 상태를 쓴다) 버전이 바뀌어 지워지지 않는다(409). 그 밖의
+                # 이유로 버전만 바뀐 경우는 다음 정리가 다시 본다.
                 released_now = self.provider.delete_idle_pod(
                     compute_pod,
                     getattr(pod.metadata, "uid", "") or "",
@@ -218,6 +237,13 @@ class ComputeReleaser:
         finally:
             if cleanup_context:
                 self.clear_assigned_request_context_best_effort(compute_pod)
+
+    def _still_not_ready(self, pod, min_not_ready_seconds: float) -> bool:
+        """정리의 기준(cleanup._not_ready_seconds)과 같다: Ready 였다가 떨어진 뒤 그만큼 지났나."""
+        not_ready_since = self.provider._pod_not_ready_since(pod)
+        if not isinstance(not_ready_since, datetime):
+            return False
+        return (datetime.now(timezone.utc) - not_ready_since).total_seconds() >= min_not_ready_seconds
 
     @staticmethod
     def _ignore_release(compute_pod: str, expected_status: str, pod_status: Optional[str], reason: str) -> Dict:
