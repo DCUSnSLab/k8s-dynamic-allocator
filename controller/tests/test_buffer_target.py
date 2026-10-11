@@ -92,7 +92,7 @@ class BufferTargetTests(unittest.TestCase):
         """끝내 Ready 가 안 되는 파드가 축소를 영구히 막지 못한다.
 
         이것이 없으면 교착이 셋 겹친다. 축소가 막히면 replicas 가 고정되고,
-        그러면 게이트 해제 예산(min(replicas, N-assigned, desired))도 고정되어
+        그러면 게이트 해제 예산(min(replicas, N-assigned))도 고정되어
         남은 게이트 파드가 영구히 안 풀리고, maxUnavailable 이 회복되지 않아
         롤링 업데이트까지 멈춘다.
 
@@ -419,6 +419,19 @@ class SchedulingGateTests(unittest.TestCase):
         self.assertEqual(provider.ungated, 2)
         self.assertEqual(38 + provider.ungated, 40)
 
+    def test_replicas_kept_by_cooldown_are_released_above_desired(self):
+        """비포화에서 축소 쿨다운으로 목표보다 높게 남은 replicas 도 게이트를 푼다.
+
+        예산에 desired 가 들어가 있으면 이 파드들이 게이트에 묶여 버퍼 노릇을 못 한다
+        (10/11 DEV_MOUNTAIN 5~15분: replicas 5.8, Ready 여유 0.4, 게이트 대기 9.9초).
+        """
+        queues = GateQueues(queued=0)            # 목표 = R = 2
+        provider = GateProvider(current=5, assigned=10, ungated=1, gated=4)
+        result = refill(gate_reconciler(provider, queues))
+        self.assertEqual(result["reason"], "released")
+        self.assertEqual(provider.ungated, 5)
+        self.assertEqual(result["budget"], 5)
+
     def test_rollout_old_ungated_pod_leaves_budget_for_new_pod(self):
         queues = GateQueues(queued=0)
         provider = GateProvider(current=2, assigned=0, ungated=1, gated=1)
@@ -469,8 +482,8 @@ class SchedulingGateTests(unittest.TestCase):
 
     def test_unknown_patch_counts_as_released_until_settled(self):
         """응답 없는 게이트 PATCH 는 반영됐다고 치고 같은 자리를 다시 풀지 않는다."""
-        queues = GateQueues(queued=0)  # 목표 = R = 2
-        provider = GateProvider(current=3, assigned=0, ungated=0, gated=3)
+        queues = GateQueues(queued=0)
+        provider = GateProvider(current=2, assigned=0, ungated=0, gated=2)   # 예산 = replicas 2
         provider.fail_release["gated-0"] = TimeoutError("read timed out")
         reconciler = gate_reconciler(provider, queues)
         result = refill(reconciler)
@@ -490,7 +503,7 @@ class SchedulingGateTests(unittest.TestCase):
     def test_unknown_patch_that_landed_late_is_not_double_counted(self):
         """늦게 적용된 원래 PATCH 가 버전을 바꾸면 다시 보낸 요청은 test 에 걸린다."""
         queues = GateQueues(queued=0)
-        provider = GateProvider(current=3, assigned=0, ungated=0, gated=3)
+        provider = GateProvider(current=2, assigned=0, ungated=0, gated=2)
         provider.fail_release["gated-0"] = TimeoutError("read timed out")
         reconciler = gate_reconciler(provider, queues)
         refill(reconciler)
@@ -499,7 +512,7 @@ class SchedulingGateTests(unittest.TestCase):
         provider.ungated += 1
         result = refill(reconciler)
         self.assertEqual(reconciler._gate_unknown, {})
-        # 예산 2 = 늦게 풀린 gated-0 + gated-1. 셋째는 풀지 않는다.
+        # 예산 2 = 늦게 풀린 gated-0 + gated-1.
         self.assertEqual(provider.released, ["gated-1"])
         self.assertEqual(provider.ungated, 2)
         self.assertEqual(result["reason"], "released")
@@ -513,8 +526,8 @@ class SchedulingGateTests(unittest.TestCase):
         class Rejected(Exception):
             status = 403
 
-        queues = GateQueues(queued=0)   # 목표 = R = 2
-        provider = GateProvider(current=3, assigned=0, ungated=0, gated=3)
+        queues = GateQueues(queued=0)
+        provider = GateProvider(current=2, assigned=0, ungated=0, gated=2)   # 예산 = replicas 2
         provider.fail_release["gated-0"] = TimeoutError("read timed out")
         reconciler = gate_reconciler(provider, queues)
         refill(reconciler)
@@ -536,13 +549,13 @@ class SchedulingGateTests(unittest.TestCase):
             status = 403
 
         queues = GateQueues(queued=0)
-        provider = GateProvider(current=2, assigned=0, ungated=0, gated=3)
-        provider.current = 3
+        provider = GateProvider(current=2, assigned=0, ungated=0, gated=2)
         provider.fail_release["gated-0"] = Rejected()
         reconciler = gate_reconciler(provider, queues)
         refill(reconciler)
         self.assertEqual(reconciler._gate_unknown, {})
-        self.assertEqual(provider.released, ["gated-1", "gated-2"])
+        # 거절된 gated-0 은 미상으로 묶이지 않으므로 다음 바퀴에서 다시 시도되어 풀린다.
+        self.assertEqual(provider.released, ["gated-1", "gated-0"])
 
     def test_old_generation_refill_stops_writing(self):
         queues = GateQueues(queued=0)

@@ -281,7 +281,7 @@ class BufferCapacityReconciler:
             함수는 "한 번도 Ready 가 된 적 없는 파드" 를 **의도적으로** 제외한다.
             즉 cleanup 이 치워 줄 것이라는 기대는 성립하지 않는다.
           - 축소가 영구히 막히면 replicas 가 고정되고, 그러면 게이트 해제 예산
-            (min(replicas, N-assigned, desired))도 고정되어 남은 게이트 파드가
+            (min(replicas, N-assigned))도 고정되어 남은 게이트 파드가
             영구히 안 풀린다. 그 상태에서는 롤링 업데이트의 maxUnavailable 이
             회복되지 않아 이미지 전개까지 멈춘다.
 
@@ -1373,9 +1373,9 @@ class BufferCapacityReconciler:
         N 안전: 노드 위 파드 수(게이트 풀린 available + assigned)를 늘리는 것은
         게이트 해제뿐이다. claim 은 게이트 풀린 available 하나를 assigned 로 바꿀
         뿐이라 합이 그대로이고, 반납(삭제)은 합을 줄인다. 그래서 게이트 해제끼리만
-        직렬화하면 되고(공급 락), 할당 락은 잡지 않는다. 예산은 예전 그대로
-        min(replicas, N - assigned, desired) 이다. 읽은 뒤 claim 이 끼어들어도
-        "풀린 수 + assigned" 가 그대로라 예산을 넘지 않는다.
+        직렬화하면 되고(공급 락), 할당 락은 잡지 않는다. 예산은
+        min(replicas, N - assigned) 이다(아래 게이트 해제 단계의 설명 참조). 읽은 뒤
+        claim 이 끼어들어도 "풀린 수 + assigned" 가 그대로라 예산을 넘지 않는다.
 
         replicas 쓰기는 CAS 로만 한다. 할당기가 claim 직후 replicas 를 내리는
         것(할당 락)과 동시에 일어날 수 있기 때문이다.
@@ -1542,7 +1542,22 @@ class BufferCapacityReconciler:
                         policy["N"],
                         unowned,
                     )
-                budget = min(current, room, desired)
+                # 예산은 replicas 와 남은 자리다: 축소 안정화 구간(쿨다운) 동안 용량을 데워
+                # 둔다. HPA 의 scale-down stabilization window 와 같은 형태다.
+                #
+                # 0f9944e 는 의도적으로 "현재 수요(desired) 안에서만 들인다" 를 택했다
+                # (min(replicas, room, desired)). 그러면 쿨다운으로 남긴 replicas 가 게이트에
+                # 묶여, 수요가 다시 와도 부팅부터 해야 하므로 쿨다운이 지연 면에서 아무 일도
+                # 하지 않는다. 10/11 DEV_MOUNTAIN 5~15분(rho 0.3->0.75)에서 replicas 평균 5.8
+                # 인데 Ready 여유 0.4, 게이트 대기 평균 9.9초였다. 그래서 바꾼다.
+                #
+                # 대가는 쿨다운 동안 노는(그리고 끝나면 지워지는) 파드다. 수요 기반이던 게이트
+                # 코드의 로그로 "desired 를 빼면 더 풀렸을 수" 를 재 보니 몰림이 끝난 직후는
+                # 0~3개(옛 HIGH 피크 뒤 0, 사전 점검 몰림 끝 최대 3)였고, 비포화 오르막에 평균
+                # 2.9개(최대 7)로 몰렸다 - 버퍼가 필요한 바로 그 구간이다. 관측값 상한은
+                # 실측 낭비가 크게 나올 때 넣는다. 포화에서는 desired == room 이라 같다.
+                # N 은 room 상한이 지킨다.
+                budget = min(current, room)
                 ungated = int(snapshot["ungated_available"])
                 with self._refill_condition:
                     unknown = dict(self._gate_unknown.get(compute_type, {}))
