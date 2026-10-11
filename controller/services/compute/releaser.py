@@ -22,8 +22,6 @@ def _elapsed_ms(started: float) -> int:
 class ComputeReleaser:
     _RELEASE_MAX_ATTEMPTS = 2
     _RELABEL_MARGIN_SECONDS = 20.0
-    # 반납이 할당 락을 다시 잡아 보는 간격. 할당 락은 기다리지 않는 락이라 비면 바로 잡는다.
-    _ALLOCATOR_LOCK_POLL_SECONDS = 0.05
 
     def __init__(
         self,
@@ -37,14 +35,9 @@ class ComputeReleaser:
         self.tickets = tickets
         self._on_released = on_released or (lambda compute_type: None)
         self.release_lock_stale_seconds = settings.RELEASE_LOCK_STALE_SECONDS
-        # 반납된 파드를 idle 로 되돌릴지 정하는 함수(리더 조정과 같은 식). 없으면 지운다.
-        self._return_policy: Optional[Callable[[str], Dict]] = None
 
     def set_release_callback(self, on_released: Callable[[Optional[str]], None]) -> None:
         self._on_released = on_released
-
-    def set_return_policy(self, return_policy: Callable[[str], Dict]) -> None:
-        self._return_policy = return_policy
 
     def release_compute_pod(
         self,
@@ -277,11 +270,18 @@ class ComputeReleaser:
                         str(exc),
                     )
 
-            released_now = self.provider.release_pod(compute_pod)
+            # 처음 읽은 뒤(그사이 unmount 를 기다렸다) 파드가 바뀌었을 수 있다. 늦게 반영된
+            # 되돌리기로 idle 이 되어 다음 요청에 할당됐다면 그 파드는 이 반납의 것이 아니다.
+            # 다시 읽어 상태·티켓이 그대로일 때만, 그 버전을 전제로 지운다.
+            delete_state = self._delete_if_unchanged(compute_pod, pod_status, pod_ticket)
+            if delete_state == "changed":
+                self._drop_release_lock_best_effort(lock_ticket, lock_token)
+                lock_ticket, lock_token = "", None
+                return self._ignore_release(compute_pod, ticket_id, pod_ticket, "changed_before_delete")
             pod_settled = True
             cleanup_context = True
             context_owner = ticket_id
-            if not released_now:
+            if delete_state != "deleted":
                 return self._ignore_release(compute_pod, ticket_id, pod_ticket, "already_released")
 
             release_ms = int((time.perf_counter() - release_started) * 1000)
@@ -552,62 +552,21 @@ class ComputeReleaser:
         if current_hash and annotations.get(provider.ANNOTATION_TEMPLATE_HASH) != current_hash:
             return _delete("deleted_outdated", reuse_count=reuse_count, **scrub_fields)
 
-        # 되돌릴지는 할당 락 아래에서 정하고 그 아래에서 되돌린다. 리더의 계획과 drain 도
-        # 이 락 아래에서 버퍼를 세므로, 같은 빈자리를 반납과 리더가 함께 채우지 않는다.
-        # 기다리는 상한은 반납 잠금이 낡았다고 볼 때까지다(그 뒤에는 정리가 이 파드를 지울
-        # 수 있어 되돌리면 안 된다). 그때까지 못 잡으면 지운다.
-        alloc_token = self._acquire_allocator_lock_for_return(compute_type, lock_started)
-        if not alloc_token:
-            return _delete("deleted_lock_busy", reuse_count=reuse_count, **scrub_fields)
-
-        decision: Optional[Dict] = None
-        decision_error: Optional[Exception] = None
-        relabel_error: Optional[Exception] = None
-        available_since = ""
+        # 되돌린다. 버퍼 목표를 넘는지는 여기서 정하지 않는다 - 리더가 같은 목표식으로
+        # 넘는 idle 을 줄인다(쿨다운 창을 지키며, 오래된 파드를 남기고 새것부터). 여기서
+        # 판정하려면 할당 락 아래에서 목록을 읽어야 하고(포화에서 반납마다 drain 을 막는다),
+        # 리더 메모리에만 있는 쿨다운 창을 공유해야 한다. 되돌린 파드는 계속 같은 자리를
+        # 쥐므로 N 은 바뀌지 않는다.
+        available_since = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         relabel_started = time.perf_counter()
         try:
-            try:
-                decision = (self._return_policy or (lambda _ct: {"keep": False}))(compute_type)
-            except Exception as exc:
-                decision_error = exc
-            if decision and decision.get("keep"):
-                available_since = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-                relabel_started = time.perf_counter()
-                try:
-                    provider.return_pod(compute_pod, target_ticket, reuse_count + 1, available_since)
-                except Exception as exc:
-                    relabel_error = exc
-        finally:
-            try:
-                self.queues.release_allocator_lock(compute_type, alloc_token)
-            except Exception as exc:
-                logger.warning(
-                    "[Warning] operation=allocator_lock_release compute_type=%s reason=%r",
-                    compute_type,
-                    str(exc),
-                )
-
-        decision_fields = {
-            "return_target": (decision or {}).get("target"),
-            "return_idle_total": (decision or {}).get("idle_total"),
-        }
-        if decision_error is not None or decision is None:
-            logger.warning(
-                "[Warning] operation=compute_return_decision compute_pod=%s reason=%r",
-                compute_pod,
-                str(decision_error),
-            )
-            return _delete("deleted_return_failed", reuse_count=reuse_count, **scrub_fields)
-        if not decision.get("keep"):
-            # 버퍼가 이미 목표만큼 있다(제안 arm 이 반납 파드를 지우는 것과 같다).
-            return _delete("deleted_over_target", reuse_count=reuse_count, **scrub_fields, **decision_fields)
-
-        if relabel_error is not None:
+            provider.return_pod(compute_pod, target_ticket, reuse_count + 1, available_since)
+        except Exception as exc:
             relabel_ms = _elapsed_ms(relabel_started)
             logger.warning(
                 "[Warning] operation=compute_return compute_pod=%s reason=%r",
                 compute_pod,
-                str(relabel_error),
+                str(exc),
             )
             # The patch may have landed or the Pod may have moved on, so it is
             # deleted only if it still carries this ticket. No retry: a second
@@ -620,7 +579,7 @@ class ComputeReleaser:
                 return _failed("return_settle", settle_exc)
             # Decided by what the Pod is now, not by how the patch failed: a
             # conflict can still leave the Pod ours to delete.
-            fields = dict(scrub_fields, relabel_ms=relabel_ms, **decision_fields)
+            fields = dict(scrub_fields, relabel_ms=relabel_ms)
             if state == "ours":
                 return _delete("deleted_return_failed", reuse_count=reuse_count, **fields)
             if state == "returned":
@@ -630,30 +589,7 @@ class ComputeReleaser:
             return _finish("lost_external", reuse_count=reuse_count, **fields)
 
         relabel_ms = _elapsed_ms(relabel_started)
-        return _finish(
-            "returned",
-            relabel_ms=relabel_ms,
-            reuse_count=reuse_count + 1,
-            **scrub_fields,
-            **decision_fields,
-        )
-
-    def _acquire_allocator_lock_for_return(self, compute_type: str, lock_started: float) -> Optional[str]:
-        while True:
-            try:
-                token = self.queues.acquire_allocator_lock(compute_type)
-            except QueueUnavailableError as exc:
-                logger.warning(
-                    "[Warning] operation=return_allocator_lock compute_type=%s reason=%r",
-                    compute_type,
-                    str(exc),
-                )
-                return None
-            if token:
-                return token
-            if self._lock_too_old_to_relabel(lock_started):
-                return None
-            time.sleep(self._ALLOCATOR_LOCK_POLL_SECONDS)
+        return _finish("returned", relabel_ms=relabel_ms, reuse_count=reuse_count + 1, **scrub_fields)
 
     def _current_template_hash(self, compute_type: str) -> str:
         reader = getattr(self.provider, "template_hash", None)
@@ -725,6 +661,41 @@ class ComputeReleaser:
             "outcome": "ignored",
             "message": f"Release ignored ({reason}): {compute_pod}",
         }
+
+    def _delete_if_unchanged(self, compute_pod: str, status: Optional[str], ticket_id: str) -> str:
+        """다시 읽은 상태·티켓이 같을 때만 지운다. "deleted", "gone", "changed" 중 하나.
+
+        삭제는 uid + resourceVersion 전제 조건이라, 읽은 뒤 바뀌면 지우지 않고 다시 읽는다
+        (kubelet 의 상태 갱신으로도 버전이 바뀐다).
+        """
+        for _ in range(self._RELEASE_MAX_ATTEMPTS + 1):
+            try:
+                pod = self.provider.v1.read_namespaced_pod(
+                    compute_pod,
+                    self.provider.namespace,
+                    _request_timeout=self.provider.api_request_timeout,
+                )
+            except ApiException as exc:
+                if exc.status == 404:
+                    return "gone"
+                raise
+            metadata = pod.metadata
+            if getattr(metadata, "deletion_timestamp", None):
+                return "gone"
+            labels = metadata.labels or {}
+            annotations = metadata.annotations or {}
+            if (
+                labels.get(self.provider.LABEL_STATUS) != status
+                or (annotations.get(self.provider.ANNOTATION_ALLOCATION_TICKET) or "").strip() != ticket_id
+            ):
+                return "changed"
+            if self.provider.delete_pod_if_unchanged(
+                compute_pod,
+                getattr(metadata, "uid", "") or "",
+                getattr(metadata, "resource_version", "") or "",
+            ):
+                return "deleted"
+        return "changed"
 
     def _delete_pod(self, compute_pod: str) -> bool:
         """Delete with one retry; False when the Pod was already gone or terminating."""

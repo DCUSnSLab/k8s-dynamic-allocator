@@ -380,7 +380,8 @@ class ComputeAllocator:
                     claimed_by=ticket.get("claimed_by"),
                     claim_token=claim_token,
                     compute_ready_at=ready_at,
-                    compute_available_at=ready_at,
+                    # 되돌린 파드는 Ready 시각이 첫 부팅이다. 대기하던 요청이 본 것은 되돌린 시각이다.
+                    compute_available_at=pod.get("available_at") or ready_at,
                 )
                 committed = recorded
             else:

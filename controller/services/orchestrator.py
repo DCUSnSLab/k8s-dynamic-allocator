@@ -84,8 +84,8 @@ logger = logging.getLogger(__name__)
 class Orchestrator:
     def __init__(self):
         # exp-reuse: 제안(Deployment 없이 컨트롤러가 버퍼 파드를 직접 만들고 지운다)에
-        # 재사용을 더했다. 사용자가 반납한 파드는 정리한 뒤 버퍼 목표 안이면 idle 로
-        # 되돌리고 아니면 지운다. 할당은 두 복제본이 할당 락 아래에서 한다.
+        # 재사용을 더했다. 사용자가 반납한 파드는 정리한 뒤 idle 로 되돌리고, 목표를 넘는
+        # idle 은 리더가 제안과 같은 식으로 줄인다. 할당은 두 복제본이 할당 락 아래에서 한다.
         self.provider = DirectBufferProvider()
         self.queues = ComputeQueues()
         self.tickets = self.queues.tickets
@@ -97,9 +97,6 @@ class Orchestrator:
             # Full sweep; it calls recover_journaled_orphans itself.
             on_periodic_cleanup=self.cleanup.check_stale_allocations,
         )
-        # 재사용: 반납된 파드를 idle 로 되돌릴지는 리더 조정과 같은 식으로 정한다(할당 락
-        # 아래에서). 반납은 어느 복제본에서나 오므로 리더가 아니어도 부른다.
-        self.compute_manager.releaser.set_return_policy(self.capacity_reconciler.return_decision)
         self.status = ControllerStatus(
             self.provider,
             self.queues,

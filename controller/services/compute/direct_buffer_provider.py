@@ -227,8 +227,9 @@ class DirectBufferProvider(KubernetesClient):
             "allocation_claim_token": annotations.get(self.ANNOTATION_ALLOCATION_CLAIM, ""),
             "phase": getattr(status, "phase", None),
             "ready": ready,
-            # P_ready 에 들어간다. 되돌린 파드는 되돌린 시각부터 센다.
-            "ready_at": self._pod_available_at(pod) if ready else None,
+            "ready_at": self._pod_ready_at(pod) if ready else None,
+            # 할당 가능해진 시각. 되돌린 파드는 첫 부팅 때부터 Ready 라서 되돌린 시각이다.
+            "available_at": self._pod_available_at(pod) if ready else None,
             "not_ready_since": self._pod_not_ready_since(pod),
             "terminating": getattr(metadata, "deletion_timestamp", None) is not None,
             "ip": getattr(status, "pod_ip", None),
@@ -469,8 +470,11 @@ class DirectBufferProvider(KubernetesClient):
             raise
         return True
 
-    @timing.timed("k8s.delete_pod")
     def delete_idle_pod(self, pod_name: str, uid: str, expected_resource_version: str) -> bool:
+        return self.delete_pod_if_unchanged(pod_name, uid, expected_resource_version)
+
+    @timing.timed("k8s.delete_pod")
+    def delete_pod_if_unchanged(self, pod_name: str, uid: str, expected_resource_version: str) -> bool:
         """idle 파드를 지운다. 읽은 뒤 바뀌었으면(그사이 할당됐으면) 지우지 않고 False.
 
         삭제 전제 조건(uid + resourceVersion)이라 할당과 같은 파드를 두고 겹쳐도

@@ -202,7 +202,9 @@ class ComputeCleanup:
         status = pod_info.get("buffer_status")
         if status == "assigned":
             return status, str(pod_info.get("allocation_ticket_id") or "").strip()
-        if status == "available":
+        # 할당 가능한 파드: Deployment arm 은 available, 직접 관리 arm 은 idle 이다. 정리가
+        # 본 뒤에 할당됐으면 삭제가 그것을 알아보고 손대지 않아야 한다.
+        if status in ("available", "idle"):
             return status, ""
         # No label to hold the Pod to; such a Pod is never handed to anyone.
         return None, ""

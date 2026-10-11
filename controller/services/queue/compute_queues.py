@@ -711,33 +711,6 @@ class ComputeQueues:
             missing.append(compute_pod)
         return missing
 
-    def _buffer_target_key(self, compute_type: str) -> str:
-        return f"{self.prefix}:buffer-target:{compute_type}"
-
-    def publish_buffer_target(self, compute_type: str, target: int, ttl_seconds: float) -> None:
-        """리더의 이번 바퀴 버퍼 목표(쿨다운 창 최댓값 포함). 반납 판정이 읽는다."""
-        client = self._redis_client()
-        try:
-            client.set(
-                self._buffer_target_key(self.normalize_compute_type(compute_type)),
-                str(int(target)),
-                px=max(1, int(float(ttl_seconds) * 1000)),
-            )
-        except RedisError as exc:
-            raise QueueUnavailableError(f"Failed to publish buffer target: {exc}") from exc
-
-    def read_buffer_target(self, compute_type: str) -> Optional[int]:
-        """리더가 최근에 적은 버퍼 목표. 없거나(만료) 읽을 수 없는 값이면 None."""
-        client = self._redis_client()
-        try:
-            raw = client.get(self._buffer_target_key(self.normalize_compute_type(compute_type)))
-        except RedisError as exc:
-            raise QueueUnavailableError(f"Failed to read buffer target: {exc}") from exc
-        try:
-            return int(raw) if raw is not None else None
-        except (TypeError, ValueError):
-            return None
-
     def claimable_queued_count(self, compute_type: str) -> int:
         """지금 claim 할 수 있는 대기 티켓 수.
 

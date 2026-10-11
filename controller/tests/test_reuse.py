@@ -1,11 +1,12 @@
-"""재사용 arm: 반납된 파드를 정리한 뒤 버퍼 목표 안이면 idle 로 되돌리고, 아니면 지운다.
+"""재사용 arm: 반납된 파드를 정리한 뒤 idle 로 되돌린다. 목표를 넘는 idle 은 리더가 줄인다.
 
-  - 되돌릴지는 리더의 계획과 같은 식이다(이 파드가 받아 간 요청에서 빠진다). 쿨다운 창의
-    목표는 리더가 적어 둔 값을 읽는다.
-  - 판정과 되돌리기는 할당 락 아래에서 한다. 락을 못 잡거나, 목표 밖이거나, 옛 템플릿
-    세대이거나, 정리에 실패하면 지운다. 늦은 반납(다른 티켓)은 아무것도 바꾸지 않는다.
+  - 정리(scrub)에 실패하거나 옛 템플릿 세대면 되돌리지 않고 지운다. 늦은 반납(다른 티켓)과
+    중복 반납은 아무것도 바꾸지 않는다. 되돌리기 PATCH 가 실패하면 지금 상태를 다시 읽어
+    정한다(아직 우리 것이면 지운다).
+  - 정리(cleanup)·일반 반납의 삭제는 지우기 직전에 다시 읽어, 처음 본 상태·티켓 그대로일
+    때만 그 버전을 전제로 지운다. 그사이 되돌려져 다음 요청에 할당된 파드는 지우지 않는다.
   - 반납·재할당·리더 조정이 동시에 돌아도 N 을 넘지 않고, 한 파드를 두 요청이 동시에
-    쓰지 않는다.
+    쓰지 않으며, 버퍼는 R 로 돌아온다.
 """
 
 import contextlib
@@ -36,113 +37,7 @@ from test_direct_buffer import (
 )
 
 
-# ---------------------------------------------------------------------- 반납 판정
-
-
-class ReuseQueues(FakeQueues):
-    """리더가 적는 버퍼 목표를 담는다(실제로는 만료가 있는 Redis 키)."""
-
-    def __init__(self, world):
-        super().__init__(world)
-        self.buffer_target: Optional[int] = None
-
-    def publish_buffer_target(self, compute_type, target, ttl_seconds):
-        self.buffer_target = int(target)
-
-    def read_buffer_target(self, compute_type):
-        return self.buffer_target
-
-
-class ReuseProvider(FakeProvider):
-    def return_pod(self, name, ticket_id, reuse_count, available_since):
-        self.calls.append(("return", name, ticket_id))
-        with self.world.mu:
-            pod = self.world.pods.get(name)
-            if (not pod or pod["terminating"] or pod["buffer_status"] != "assigned"
-                    or pod["annotations"].get("ticket") != ticket_id):
-                raise RuntimeError(f"{name} is no longer assigned to ticket {ticket_id}")
-            pod["buffer_status"] = "idle"
-            pod["annotations"] = {"reuse": str(reuse_count), "available_since": available_since}
-            self.world.bump(pod)
-
-
-def make_reuse(world: World, create_latency: float = 0.0):
-    provider = ReuseProvider(world, create_latency=create_latency)
-    queues = ReuseQueues(world)
-    tickets = FakeTickets(world)
-    queues.tickets = tickets
-    allocator = SimAllocator(provider, queues, tickets)
-    reconciler = DirectBufferReconciler(provider, queues)
-    return provider, queues, tickets, allocator, reconciler
-
-
-class ReturnDecisionTests(unittest.TestCase):
-    def _settled(self, world, count, prefix="busy"):
-        for index in range(count):
-            world.add_pod(f"{prefix}-{index}", "assigned", {"ticket": f"x{index}"}, ready=True)
-
-    def test_returns_while_buffer_is_below_reserve(self):
-        world = World(capacity=10, reserve=2)
-        self._settled(world, 1)
-        provider, queues, tickets, allocator, reconciler = make_reuse(world)
-        decision = reconciler.return_decision(CT)
-        self.assertTrue(decision["keep"])
-        self.assertEqual(decision["target"], 2)
-
-    def test_deletes_when_buffer_already_meets_the_target(self):
-        world = World(capacity=10, reserve=2)
-        self._settled(world, 1)
-        world.add_pod("idle-a", "idle", {}, ready=True)
-        world.add_pod("idle-b", "idle", {}, ready=True)
-        provider, queues, tickets, allocator, reconciler = make_reuse(world)
-        self.assertFalse(reconciler.return_decision(CT)["keep"])
-
-    def test_creating_idle_counts_as_buffer(self):
-        world = World(capacity=10, reserve=2)
-        self._settled(world, 1)
-        world.add_pod("idle-a", "idle", {}, ready=True)
-        provider, queues, tickets, allocator, reconciler = make_reuse(world)
-        queues.add_pending_create(CT, "idle-creating", "idle")
-        self.assertFalse(reconciler.return_decision(CT)["keep"])
-
-    def test_published_window_target_keeps_more_than_reserve(self):
-        """몰림 뒤 리더의 쿨다운 창이 목표를 붙잡고 있으면 그만큼 되돌린다(지웠다가 다시 만들지 않게)."""
-        world = World(capacity=10, reserve=1)
-        self._settled(world, 1)
-        world.add_pod("idle-a", "idle", {}, ready=True)
-        provider, queues, tickets, allocator, reconciler = make_reuse(world)
-        self.assertFalse(reconciler.return_decision(CT)["keep"])
-        queues.buffer_target = 4
-        decision = reconciler.return_decision(CT)
-        self.assertTrue(decision["keep"])
-        self.assertEqual(decision["target"], 4)
-
-    def test_returning_pod_leaves_settled_so_full_capacity_still_returns(self):
-        """N 이 꽉 찬 채 대기가 있으면, 반납 파드는 빠지는 자리만큼 목표 안에 든다."""
-        world = World(capacity=3, reserve=0)
-        self._settled(world, 3)
-        world.enqueue(2)
-        provider, queues, tickets, allocator, reconciler = make_reuse(world)
-        decision = reconciler.return_decision(CT)
-        self.assertTrue(decision["keep"])
-        self.assertEqual(decision["queued"], 2)
-        self.assertEqual(decision["target"], 1)
-
-    def test_outdated_or_stuck_idle_is_not_counted_as_buffer(self):
-        world = World(capacity=10, reserve=1)
-        self._settled(world, 1)
-        world.add_pod("idle-old", "idle", {}, ready=True, template_hash="gen-0")
-        provider, queues, tickets, allocator, reconciler = make_reuse(world)
-        self.assertTrue(reconciler.return_decision(CT)["keep"])
-
-    def test_leader_publishes_its_target_each_pass(self):
-        world = World(capacity=10, reserve=3)
-        provider, queues, tickets, allocator, reconciler = make_reuse(world)
-        reconciler.reconcile_type(CT)
-        self.assertEqual(queues.buffer_target, 3)
-
-
-# ---------------------------------------------------------------------- releaser 의 되돌리기
+# ---------------------------------------------------------------------- 가짜 모듈
 
 
 class FakeAgentError(Exception):
@@ -155,7 +50,13 @@ class FakeTicketMismatch(FakeAgentError):
         self.current_ticket_id = current_ticket_id
 
 
-AGENT = {"scrub": lambda ticket_id: {"status": "success", "scrub_ms": 3}}
+AGENT: Dict = {}
+
+
+def reset_agent():
+    AGENT.clear()
+    AGENT["scrub"] = lambda ticket_id: {"status": "success", "scrub_ms": 3}
+    AGENT["unmount"] = lambda ticket_id: {"status": "success"}
 
 
 class FakeAgent:
@@ -172,13 +73,13 @@ class FakeAgent:
         return AGENT["scrub"](ticket_id)
 
     def unmount(self, ticket_id=None):
-        return {"status": "success"}
+        return AGENT["unmount"](ticket_id)
 
 
 EVENTS: List[Dict] = []
 
 
-def load_releaser_class():
+def _stub_modules():
     modules = {}
     for name in ("controller", "controller.services", "controller.services.compute"):
         package = types.ModuleType(name)
@@ -186,7 +87,8 @@ def load_releaser_class():
         modules[name] = package
     settings = types.ModuleType("config.settings")
     settings.RELEASE_LOCK_STALE_SECONDS = 60.0
-    settings.request_label_scope = contextlib.nullcontext
+    settings.COMPUTE_NOT_READY_GRACE_SECONDS = 30.0
+    settings.request_label_scope = lambda *args, **kwargs: contextlib.nullcontext()
     settings.set_request_label = lambda *args, **kwargs: None
     config = types.ModuleType("config")
     config.settings = settings
@@ -197,7 +99,8 @@ def load_releaser_class():
     modules["controller.services"].ticket_format = ticket_format
     queue = types.ModuleType("controller.services.queue")
     queue.QueueUnavailableError = type("QueueUnavailableError", (Exception,), {})
-    queue.safe_int = lambda value, default=0: int(value) if str(value or "").strip().lstrip("-").isdigit() else default
+    queue.safe_int = lambda value, default=0: int(value) if str(value or "").strip().isdigit() else default
+    queue.release_lock_age_seconds = lambda token, now=None: None
     agent_client = types.ModuleType("controller.services.compute.agent_client")
     agent_client.AgentTicketMismatch = FakeTicketMismatch
     agent_client.ComputeAgent = FakeAgent
@@ -218,20 +121,28 @@ def load_releaser_class():
         "kubernetes.client": kclient,
         "kubernetes.client.rest": rest,
     })
-    name = "controller.services.compute.releaser"
-    with patch.dict(sys.modules, modules):
-        spec = importlib.util.spec_from_file_location(name, ROOT / "services" / "compute" / "releaser.py")
+    return modules
+
+
+def load_module(short):
+    name = f"controller.services.compute.{short}"
+    with patch.dict(sys.modules, _stub_modules()):
+        spec = importlib.util.spec_from_file_location(name, ROOT / "services" / "compute" / f"{short}.py")
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
-    return module.ComputeReleaser
+    return module
 
 
-ComputeReleaser = load_releaser_class()
+ComputeReleaser = load_module("releaser").ComputeReleaser
+ComputeCleanup = load_module("cleanup").ComputeCleanup
+
+
+# ---------------------------------------------------------------------- releaser
 
 
 class PodApi:
-    """releaser 가 직접 읽는 파드 한 개."""
+    """releaser 가 직접 읽고 쓰는 파드 한 개(apiserver 대역)."""
 
     LABEL_STATUS = "compute-status"
     LABEL_COMPUTE_TYPE = "compute-type"
@@ -245,25 +156,30 @@ class PodApi:
     namespace = "kda-test"
     api_request_timeout = 5
 
-    def __init__(self, queues, ticket_id="t1", template_hash="gen-1", current_hash="gen-1"):
-        self.queues = queues
+    def __init__(self, ticket_id="t1", template_hash="gen-1", current_hash="gen-1", status="assigned"):
         self.current_hash = current_hash
-        self.labels = {"compute-status": "assigned", "compute-type": CT}
-        self.annotations = {
-            self.ANNOTATION_ALLOCATION_TICKET: ticket_id,
-            self.ANNOTATION_ALLOCATION_CLAIM: "claim",
-            self.ANNOTATION_TEMPLATE_HASH: template_hash,
-        }
+        self.labels = {"compute-status": status, "compute-type": CT}
+        self.annotations = {self.ANNOTATION_TEMPLATE_HASH: template_hash}
+        if ticket_id:
+            self.annotations[self.ANNOTATION_ALLOCATION_TICKET] = ticket_id
+            self.annotations[self.ANNOTATION_ALLOCATION_CLAIM] = "claim"
+        self.uid = "uid-1"
+        self.rv = 1
         self.deleted = False
         self.calls: List[str] = []
+        self.return_error: Optional[Exception] = None
+        self.after_failed_return = None  # 실패한 PATCH 뒤의 실제 상태를 꾸민다
         self.v1 = SimpleNamespace(read_namespaced_pod=self._read)
+
+    def bump(self):
+        self.rv += 1
 
     def _read(self, name, namespace, _request_timeout=None):
         if self.deleted:
             raise FakeApiException(404, "NotFound")
         return SimpleNamespace(
             metadata=SimpleNamespace(labels=dict(self.labels), annotations=dict(self.annotations),
-                                     deletion_timestamp=None),
+                                     deletion_timestamp=None, uid=self.uid, resource_version=str(self.rv)),
             status=SimpleNamespace(pod_ip="10.0.0.9"),
         )
 
@@ -271,12 +187,17 @@ class PodApi:
         return self.current_hash
 
     def return_pod(self, name, ticket_id, reuse_count, available_since):
-        # 되돌리기는 할당 락 아래에서만 일어나야 한다.
-        self.calls.append("return" if self.queues.lock_token else "return_without_lock")
+        self.calls.append("return")
+        if self.return_error is not None:
+            if self.after_failed_return:
+                self.after_failed_return(self, available_since)
+            raise self.return_error
         self.labels["compute-status"] = "idle"
         self.annotations.pop(self.ANNOTATION_ALLOCATION_TICKET, None)
+        self.annotations.pop(self.ANNOTATION_ALLOCATION_CLAIM, None)
         self.annotations[self.ANNOTATION_REUSE_COUNT] = str(reuse_count)
         self.annotations[self.ANNOTATION_AVAILABLE_SINCE] = available_since
+        self.bump()
 
     def release_pod(self, name):
         self.calls.append("delete")
@@ -285,32 +206,22 @@ class PodApi:
         self.deleted = True
         return True
 
+    def delete_pod_if_unchanged(self, name, uid, rv):
+        self.calls.append("delete_if_unchanged")
+        if self.deleted or uid != self.uid or rv != str(self.rv):
+            return False
+        self.deleted = True
+        return True
 
-class LockQueues:
-    def __init__(self):
-        self.lock_token: Optional[str] = None
-        self.held_by_other = False
 
+class Queues:
     def normalize_compute_type(self, value):
         return (value or CT).strip().lower() or CT
 
-    def acquire_allocator_lock(self, compute_type):
-        if self.held_by_other or self.lock_token:
-            return None
-        self.lock_token = "alloc"
-        return self.lock_token
-
-    def release_allocator_lock(self, compute_type, token):
-        if self.lock_token == token:
-            self.lock_token = None
-            return True
-        return False
-
 
 class ReleaseTickets:
-    def __init__(self, ticket_id="t1"):
-        self.ticket_id = ticket_id
-        self.dropped = []
+    def __init__(self):
+        self.lock_free = True
 
     def get_assigned_request_context(self, compute_pod):
         return {}
@@ -319,76 +230,52 @@ class ReleaseTickets:
         return {"ticket_id": ticket_id, "compute_pod": "pod-a", "status": "assigned", "compute_type": CT}
 
     def acquire_release_lock(self, ticket_id):
-        return "release-token"
+        return "release-token" if self.lock_free else None
+
+    def take_over_release_lock(self, ticket_id, stale_token):
+        return "taken-over"
 
     def drop_release_lock(self, ticket_id, token):
-        self.dropped.append(ticket_id)
         return True
 
     def clear_assigned_request_context_if_owner(self, compute_pod, ticket_id):
         return []
 
+    def clear_assigned_request_context(self, compute_pod):
+        return []
+
+
+def released_outcomes():
+    return [e["outcome"] for e in EVENTS if e["event"] == "Released"]
+
 
 class ReleaserReturnTests(unittest.TestCase):
     def setUp(self):
         EVENTS.clear()
-        AGENT["scrub"] = lambda ticket_id: {"status": "success", "scrub_ms": 3}
+        reset_agent()
 
-    def _releaser(self, keep=True, **pod_kwargs):
-        queues = LockQueues()
-        pod = PodApi(queues, **pod_kwargs)
-        releaser = ComputeReleaser(pod, queues, ReleaseTickets())
-        decisions = []
+    def _releaser(self, **pod_kwargs):
+        pod = PodApi(**pod_kwargs)
+        tickets = ReleaseTickets()
+        return ComputeReleaser(pod, Queues(), tickets), pod, tickets
 
-        def policy(compute_type):
-            # 판정도 할당 락 아래에서만 불린다.
-            decisions.append(bool(queues.lock_token))
-            return {"keep": keep, "target": 2, "idle_total": 1 if keep else 2}
-
-        releaser.set_return_policy(policy)
-        return releaser, pod, queues, decisions
-
-    def _released_outcome(self):
-        released = [e for e in EVENTS if e["event"] == "Released"]
-        self.assertEqual(len(released), 1, EVENTS)
-        return released[0]["outcome"]
-
-    def test_returns_to_idle_under_the_allocator_lock(self):
-        releaser, pod, queues, decisions = self._releaser(keep=True)
+    def test_returns_to_idle_after_scrub(self):
+        releaser, pod, _ = self._releaser()
         result = releaser.return_compute_pod("pod-a", ticket_id="t1")
         self.assertEqual(result["outcome"], "returned")
         self.assertEqual(pod.calls, ["return"])
-        self.assertEqual(decisions, [True])
-        self.assertIsNone(queues.lock_token)  # 락을 놓았다
         self.assertEqual(pod.labels["compute-status"], "idle")
+        self.assertNotIn(pod.ANNOTATION_ALLOCATION_TICKET, pod.annotations)
         self.assertEqual(pod.annotations[pod.ANNOTATION_REUSE_COUNT], "1")
 
-    def test_over_target_is_deleted(self):
-        releaser, pod, queues, decisions = self._releaser(keep=False)
+    def test_outdated_template_is_deleted(self):
+        releaser, pod, _ = self._releaser(template_hash="gen-0")
         releaser.return_compute_pod("pod-a", ticket_id="t1")
         self.assertEqual(pod.calls, ["delete"])
-        self.assertEqual(self._released_outcome(), "deleted_over_target")
-        self.assertIsNone(queues.lock_token)
-
-    def test_lock_never_free_deletes_instead_of_returning(self):
-        releaser, pod, queues, decisions = self._releaser(keep=True)
-        queues.held_by_other = True
-        # 반납 잠금이 곧 낡는다고 보게 만든다(기다리는 상한이 곧바로 지난다).
-        releaser.release_lock_stale_seconds = releaser._RELABEL_MARGIN_SECONDS + 0.3
-        releaser.return_compute_pod("pod-a", ticket_id="t1")
-        self.assertEqual(pod.calls, ["delete"])
-        self.assertEqual(decisions, [])
-        self.assertEqual(self._released_outcome(), "deleted_lock_busy")
-
-    def test_outdated_template_is_deleted_without_taking_the_lock(self):
-        releaser, pod, queues, decisions = self._releaser(keep=True, template_hash="gen-0")
-        releaser.return_compute_pod("pod-a", ticket_id="t1")
-        self.assertEqual(pod.calls, ["delete"])
-        self.assertEqual(decisions, [])
-        self.assertEqual(self._released_outcome(), "deleted_outdated")
+        self.assertEqual(released_outcomes(), ["deleted_outdated"])
 
     def test_scrub_failure_is_deleted(self):
-        releaser, pod, queues, decisions = self._releaser(keep=True)
+        releaser, pod, _ = self._releaser()
 
         def failed(ticket_id):
             raise FakeAgentError("leftover processes")
@@ -396,39 +283,162 @@ class ReleaserReturnTests(unittest.TestCase):
         AGENT["scrub"] = failed
         releaser.return_compute_pod("pod-a", ticket_id="t1")
         self.assertEqual(pod.calls, ["delete"])
-        self.assertEqual(self._released_outcome(), "deleted_scrub_failed")
+        self.assertEqual(released_outcomes(), ["deleted_scrub_failed"])
 
-    def test_decision_error_deletes(self):
-        releaser, pod, queues, decisions = self._releaser(keep=True)
+    def test_agent_serving_another_ticket_changes_nothing(self):
+        releaser, pod, _ = self._releaser()
 
-        def broken(compute_type):
-            raise OSError("apiserver timeout")
+        def mismatch(ticket_id):
+            raise FakeTicketMismatch("scrub refused", "t2")
 
-        releaser.set_return_policy(broken)
-        releaser.return_compute_pod("pod-a", ticket_id="t1")
-        self.assertEqual(pod.calls, ["delete"])
-        self.assertIsNone(queues.lock_token)
-        self.assertEqual(self._released_outcome(), "deleted_return_failed")
-
-    def test_late_release_for_another_ticket_changes_nothing(self):
-        releaser, pod, queues, decisions = self._releaser(keep=True, ticket_id="t2")
+        AGENT["scrub"] = mismatch
         result = releaser.return_compute_pod("pod-a", ticket_id="t1")
         self.assertEqual(result["outcome"], "ignored")
         self.assertEqual(pod.calls, [])
-        self.assertEqual(decisions, [])
 
-    def test_no_policy_means_delete(self):
-        queues = LockQueues()
-        pod = PodApi(queues)
-        ComputeReleaser(pod, queues, ReleaseTickets()).return_compute_pod("pod-a", ticket_id="t1")
-        self.assertEqual(pod.calls, ["delete"])
+    def test_late_release_for_another_ticket_changes_nothing(self):
+        releaser, pod, _ = self._releaser(ticket_id="t2")
+        result = releaser.return_compute_pod("pod-a", ticket_id="t1")
+        self.assertEqual(result["outcome"], "ignored")
+        self.assertEqual(pod.calls, [])
+
+    def test_duplicate_release_changes_nothing(self):
+        releaser, pod, tickets = self._releaser()
+        tickets.lock_free = False  # 같은 티켓의 다른 반납이 잠금을 쥐고 있다
+        result = releaser.return_compute_pod("pod-a", ticket_id="t1")
+        self.assertEqual(result["outcome"], "ignored")
+        self.assertEqual(pod.calls, [])
+
+    def _failed_return(self, after):
+        releaser, pod, _ = self._releaser()
+        pod.return_error = RuntimeError("patch timed out")
+        pod.after_failed_return = after
+        result = releaser.return_compute_pod("pod-a", ticket_id="t1")
+        return result, pod
+
+    def test_failed_return_still_ours_is_deleted(self):
+        result, pod = self._failed_return(None)
+        self.assertEqual(pod.calls, ["return", "delete"])
+        self.assertEqual(released_outcomes(), ["deleted_return_failed"])
+
+    def test_failed_return_that_landed_counts_as_returned(self):
+        def landed(api, available_since):
+            api.labels["compute-status"] = "idle"
+            api.annotations.pop(api.ANNOTATION_ALLOCATION_TICKET, None)
+            api.annotations[api.ANNOTATION_AVAILABLE_SINCE] = available_since
+
+        result, pod = self._failed_return(landed)
+        self.assertEqual(pod.calls, ["return"])
+        self.assertEqual(released_outcomes(), ["returned"])
+
+    def test_failed_return_after_pod_moved_on_leaves_it(self):
+        def moved(api, available_since):
+            api.annotations[api.ANNOTATION_ALLOCATION_TICKET] = "t9"
+
+        result, pod = self._failed_return(moved)
+        self.assertEqual(pod.calls, ["return"])
+        self.assertEqual(released_outcomes(), ["lost_external"])
+
+    def test_failed_return_of_deleted_pod_is_ignored(self):
+        def gone(api, available_since):
+            api.deleted = True
+
+        result, pod = self._failed_return(gone)
+        self.assertEqual(result["outcome"], "ignored")
+        self.assertEqual(pod.calls, ["return"])
+
+
+class ReleaserDeleteTests(unittest.TestCase):
+    """정리(cleanup)·일반 반납의 삭제: 지우기 직전에 다시 읽고 그 버전을 전제로 지운다."""
+
+    def setUp(self):
+        EVENTS.clear()
+        reset_agent()
+
+    def test_pod_returned_and_reassigned_during_unmount_is_not_deleted(self):
+        """검토 D: 늦게 반영된 되돌리기로 idle 이 된 뒤 다음 요청이 가져간 파드."""
+        pod = PodApi(ticket_id="t1")
+
+        def reassigned(ticket_id):
+            pod.labels["compute-status"] = "idle"
+            pod.annotations.pop(pod.ANNOTATION_ALLOCATION_TICKET, None)
+            pod.bump()
+            pod.labels["compute-status"] = "assigned"
+            pod.annotations[pod.ANNOTATION_ALLOCATION_TICKET] = "t2"
+            pod.bump()
+            return {"status": "success"}
+
+        AGENT["unmount"] = reassigned
+        releaser = ComputeReleaser(pod, Queues(), ReleaseTickets())
+        result = releaser.release_stale_locked_compute_pod("pod-a", "t1", "stale-token")
+        self.assertEqual(result["outcome"], "ignored")
+        self.assertFalse(pod.deleted)
+
+    def test_status_bump_alone_is_retried_and_deleted(self):
+        pod = PodApi(ticket_id="t1")
+        original = pod.delete_pod_if_unchanged
+        bumped = {"done": False}
+
+        def kubelet_bump_once(name, uid, rv):
+            if not bumped["done"]:
+                bumped["done"] = True
+                pod.bump()  # 상태 갱신으로 버전만 바뀌었다
+            return original(name, uid, rv)
+
+        pod.delete_pod_if_unchanged = kubelet_bump_once
+        releaser = ComputeReleaser(pod, Queues(), ReleaseTickets())
+        result = releaser.release_compute_pod("pod-a", expected_status="assigned", expected_ticket_id="t1")
+        self.assertEqual(result["status"], "success")
+        self.assertNotEqual(result.get("outcome"), "ignored")
+        self.assertTrue(pod.deleted)
+
+    def test_idle_seen_by_cleanup_but_assigned_now_is_left_alone(self):
+        """검토 A: 정리는 NotReady idle 을 봤지만, 그사이 Ready 로 돌아와 할당됐다."""
+        pod = PodApi(ticket_id="t2", status="assigned")
+        releaser = ComputeReleaser(pod, Queues(), ReleaseTickets())
+        expected = ComputeCleanup._snapshot_expectation({"buffer_status": "idle"})
+        self.assertEqual(expected, ("idle", ""))
+        result = releaser.release_unreachable_compute_pod(
+            "pod-a", expected_status=expected[0], expected_ticket_id=expected[1]
+        )
+        self.assertEqual(result["outcome"], "ignored")
+        self.assertFalse(pod.deleted)
+
+
+# ---------------------------------------------------------------------- 리더가 넘는 idle 을 줄인다
+
+
+class LeaderTrimTests(unittest.TestCase):
+    def test_excess_returned_idle_is_trimmed_newest_first(self):
+        world = World(capacity=10, reserve=1)
+        world.add_pod("returned-old", "idle", {"reuse": "3"}, ready=True, age_seconds=300)
+        world.add_pod("fresh-new", "idle", {}, ready=True, age_seconds=5)
+        provider = FakeProvider(world)
+        queues = FakeQueues(world)
+        queues.tickets = FakeTickets(world)
+        reconciler = DirectBufferReconciler(provider, queues)
+        reconciler.reconcile_type(CT)
+        self.assertFalse(world.pods["returned-old"]["terminating"])
+        self.assertTrue(world.pods["fresh-new"]["terminating"])
 
 
 # ---------------------------------------------------------------------- 동시 실행
 
 
+class ReuseProvider(FakeProvider):
+    def return_pod(self, name, ticket_id, reuse_count, available_since):
+        with self.world.mu:
+            pod = self.world.pods.get(name)
+            if (not pod or pod["terminating"] or pod["buffer_status"] != "assigned"
+                    or pod["annotations"].get("ticket") != ticket_id):
+                raise RuntimeError(f"{name} is no longer assigned to ticket {ticket_id}")
+            pod["buffer_status"] = "idle"
+            pod["annotations"] = {"reuse": str(reuse_count), "available_since": available_since}
+            self.world.bump(pod)
+
+
 class ReuseAllocator(SimAllocator):
-    """세션이 끝나면 releaser 와 같은 순서로 반납한다: 할당 락 → 판정 → 되돌리기/지우기."""
+    """세션이 끝나면 정리 후 되돌린다(락·판정 없음). 목표를 넘으면 리더가 줄인다."""
 
     def _execute_allocated_ticket(self, ticket):
         world = self.provider.world
@@ -452,22 +462,12 @@ class ReuseAllocator(SimAllocator):
             with world.mu:
                 world.holders.pop(pod, None)
                 world.tickets[ticket_id]["status"] = "done"
-            token = None
-            while token is None:
-                token = self.queues.acquire_allocator_lock(CT)
             try:
-                keep = world.return_policy(CT)["keep"]
-                if keep:
-                    try:
-                        self.provider.return_pod(pod, ticket_id, 1, datetime.now(timezone.utc).isoformat())
-                        with world.mu:
-                            world.returned += 1
-                        return
-                    except RuntimeError:
-                        pass
-            finally:
-                self.queues.release_allocator_lock(CT, token)
-            self.provider.release_pod(pod)
+                self.provider.return_pod(pod, ticket_id, 1, datetime.now(timezone.utc).isoformat())
+                with world.mu:
+                    world.returned += 1
+            except RuntimeError:
+                self.provider.release_pod(pod)
 
         threading.Timer(self.hold_seconds * random.uniform(0.5, 2.0), _session_end).start()
         return {"status": "assigned"}
@@ -481,13 +481,12 @@ class ReuseConcurrencyTests(unittest.TestCase):
         world.double_use = []
         world.returned = 0
         provider = ReuseProvider(world, create_latency=0.01)
-        queues = ReuseQueues(world)
+        queues = FakeQueues(world)
         tickets = FakeTickets(world)
         queues.tickets = tickets
         allocator = ReuseAllocator(provider, queues, tickets)
         allocator2 = ReuseAllocator(provider, queues, tickets)
         reconciler = DirectBufferReconciler(provider, queues)
-        world.return_policy = reconciler.return_decision
         stop = threading.Event()
         errors: List[BaseException] = []
 
