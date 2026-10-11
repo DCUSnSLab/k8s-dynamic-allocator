@@ -405,6 +405,38 @@ class ReleaserDeleteTests(unittest.TestCase):
         self.assertFalse(pod.deleted)
 
 
+# ---------------------------------------------------------------------- arm 이름 계약
+
+
+class ArmNameContractTests(unittest.TestCase):
+    """arm 이름이 settings·controller.yaml·provider·배포 smoke 에서 같다.
+
+    provider 에 develop 의 이름이 남아 상태 API 가 다른 arm 을 말했고, 배포 smoke 가 그것으로
+    실패했다(exp-reuse 빌드 실패). 문자열을 서로 대조해 다시 어긋나지 않게 한다.
+    """
+
+    REPO = ROOT.parent
+
+    def test_all_places_name_the_same_arm(self):
+        import re
+        import yaml
+
+        settings_text = (ROOT / "rest_api" / "config" / "settings.py").read_text(encoding="utf-8")
+        mode = re.search(r"^COMPUTE_ALLOCATION_MODE = '([^']+)'", settings_text, re.M).group(1)
+        self.assertEqual(mode, "warm_buffer_direct_reuse")
+
+        documents = list(yaml.safe_load_all((self.REPO / "deploy/base/controller.yaml").read_text(encoding="utf-8")))
+        controller = next(d for d in documents if d and d.get("kind") == "Deployment")
+        env = {item["name"]: item.get("value") for item in controller["spec"]["template"]["spec"]["containers"][0]["env"]}
+        self.assertEqual(env["COMPUTE_ALLOCATION_MODE"], mode)
+
+        provider = (ROOT / "services" / "compute" / "direct_buffer_provider.py").read_text(encoding="utf-8")
+        self.assertIn("allocation_mode = settings.COMPUTE_ALLOCATION_MODE", provider)
+
+        deploy = (self.REPO / "deploy/scripts/deploy.sh").read_text(encoding="utf-8")
+        self.assertIn(f'status.get("allocation_mode") == "{mode}"', deploy)
+
+
 # ---------------------------------------------------------------------- 리더가 넘는 idle 을 줄인다
 
 

@@ -66,7 +66,9 @@ MANIFESTS_DIR = os.path.join(
 
 
 class DirectBufferProvider(KubernetesClient):
-    allocation_mode = "warm_buffer_direct"
+    # 상태 API 와 배포 smoke 가 이 값으로 arm 을 확인한다. 브랜치마다 settings 의 상수 하나만
+    # 고치면 되게 거기서 읽는다(여기에 따로 적었다가 어긋나 배포 smoke 가 실패한 적이 있다).
+    allocation_mode = settings.COMPUTE_ALLOCATION_MODE
     # 리더의 버퍼 조정이 파드 이벤트로 깨어나고, 생성 시간 표본도 이벤트에서 얻는다.
     uses_availability_watch = True
 
