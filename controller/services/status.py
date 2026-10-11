@@ -11,167 +11,31 @@ class ControllerStatus:
         self.tickets = tickets
         self.capacity_reconciler = capacity_reconciler
 
-    def _desired_replicas(self, policy: Dict, buffer_assigned: int) -> int:
-        """What the reconciler would target, so the report cannot disagree with it."""
-        if self.capacity_reconciler is None:
-            return min(int(policy["R"]), max(0, int(policy["N"]) - int(buffer_assigned)))
-        compute_type = policy.get("compute_type") or ""
-        queued = None
-        if getattr(self.capacity_reconciler, "dynamic_reserve", False):
-            try:
-                queued = self.queues.queued_count(compute_type)
-            except Exception:
-                queued = None
-        return self.capacity_reconciler.desired_replicas(
-            policy["R"],
-            policy["N"],
-            buffer_assigned,
-            queued,
-        )
-
     def get_buffer_status(self) -> Dict:
-        buffer_list = self.provider.list_buffer_status()
-
-        available_count = sum(
-            1
-            for pod in buffer_list
-            if pod["buffer_status"] == "available"
-            and not pod.get("terminating", False)
-        )
-        assigned_count = sum(
-            1
-            for pod in buffer_list
-            if pod["buffer_status"] == "assigned"
-            and not pod.get("terminating", False)
-        )
-        terminating_count = sum(
-            1 for pod in buffer_list if pod.get("terminating", False)
-        )
-        logical_total = available_count + assigned_count
-
+        """버퍼 상태. 배포 smoke 검사와 run 기록(시뮬레이터)이 읽는다."""
+        snapshot = self.provider.snapshot()
+        pods = snapshot["pods"]
+        capacity = self.provider.read_capacity()
         response = {
-            "total": logical_total,
-            "available": available_count,
-            "assigned": assigned_count,
-            "pods": buffer_list,
+            "allocation_mode": self.provider.allocation_mode,
+            "R": self.provider.read_reserve(),
+            "N": capacity,
+            "capacity": capacity,
+            "total": len(snapshot["active_names"]),
+            "available": len(snapshot["idle"]),
+            "available_ready": len(snapshot["idle_ready"]),
+            "assigned": int(snapshot["assigned"]),
+            "terminating": sum(1 for pod in pods if pod["terminating"]),
+            "physical_total": len(pods),
+            "pods": [
+                {key: (value.isoformat() if hasattr(value, "isoformat") else value)
+                 for key, value in pod.items() if key != "annotations"}
+                for pod in pods
+            ],
         }
-
-        response["physical_total"] = len(buffer_list)
-        response["terminating"] = terminating_count
-        try:
-            response["policy_ready"] = self.queues.is_buffer_policy_ready()
-        except Exception as exc:
-            response["policy_ready"] = False
-            response["policy_ready_error"] = str(exc)
-        response["buffers"] = self._buffer_policy_status(buffer_list)
         if self.capacity_reconciler is not None:
             response["leader_control"] = self.capacity_reconciler.get_status()
         return response
-
-    def _buffer_policy_status(self, buffer_list) -> Dict:
-        deployments_by_type = {}
-        deployment_list_error = ""
-        try:
-            for deployment in self.provider.list_buffer_deployments():
-                metadata = getattr(deployment, "metadata", None)
-                labels = getattr(metadata, "labels", None) or {}
-                compute_type = self.queues.normalize_compute_type(
-                    labels.get(self.provider.LABEL_COMPUTE_TYPE)
-                )
-                deployments_by_type.setdefault(compute_type, []).append(deployment)
-        except Exception as exc:
-            deployment_list_error = str(exc)
-
-        compute_types = {
-            self.queues.normalize_compute_type(pod.get("compute_type"))
-            for pod in buffer_list
-            if pod.get("compute_type") and pod.get("compute_type") != "unknown"
-        }
-        compute_types.update(deployments_by_type)
-
-        buffers = {}
-        for compute_type in sorted(compute_types):
-            pods = [
-                pod
-                for pod in buffer_list
-                if self.queues.normalize_compute_type(pod.get("compute_type"))
-                == compute_type
-            ]
-            buffer_available = sum(
-                1
-                for pod in pods
-                if pod.get("buffer_status") == self.provider.STATUS_AVAILABLE
-                and not pod.get("terminating", False)
-            )
-            buffer_assigned = sum(
-                1
-                for pod in pods
-                if pod.get("buffer_status") == self.provider.STATUS_ASSIGNED
-                and not pod.get("terminating", False)
-            )
-
-            item = {
-                "compute_type": compute_type,
-                "buffer_total": buffer_available + buffer_assigned,
-                "buffer_available": buffer_available,
-                "buffer_assigned": buffer_assigned,
-                "physical_total": len(pods),
-                "terminating": sum(
-                    1 for pod in pods if pod.get("terminating", False)
-                ),
-                "policy_valid": False,
-                "policy_cached": False,
-                "gate_active": False,
-            }
-
-            matching = deployments_by_type.get(compute_type, [])
-            if deployment_list_error:
-                item["policy_error"] = deployment_list_error
-            elif len(matching) != 1:
-                item["policy_error"] = (
-                    "Exactly one warm-buffer Deployment is required per compute-type"
-                )
-            else:
-                try:
-                    policy = self.provider.parse_deployment_policy(matching[0])
-                    item.update(
-                        {
-                            "deployment_name": policy["deployment_name"],
-                            "R": policy["R"],
-                            "N": policy["N"],
-                            # The reconciler owns this formula; a copy here went
-                            # stale the moment the buffer could be sized from the
-                            # queue. Falls back to the fixed form only when no
-                            # reconciler was handed in (unit tests do that).
-                            "desired_replicas": self._desired_replicas(
-                                policy, buffer_assigned
-                            ),
-                            "current_replicas": self.provider.read_deployment_replicas(
-                                policy["deployment_name"]
-                            ),
-                            "policy_valid": True,
-                            "policy_error": "",
-                        }
-                    )
-                except Exception as exc:
-                    item["policy_error"] = str(exc)
-
-            try:
-                cached = self.queues.get_buffer_policy(compute_type)
-                item["policy_cached"] = cached is not None
-                item["gate_active"] = self.queues.is_scale_down_gated(
-                    compute_type
-                )
-                if item["policy_valid"] and cached is None:
-                    item["policy_error"] = (
-                        "Policy is valid but is not active in the shared cache yet"
-                    )
-            except Exception as exc:
-                if not item.get("policy_error"):
-                    item["policy_error"] = str(exc)
-
-            buffers[compute_type] = item
-        return buffers
 
     def get_queue_status(self, compute_type: Optional[str] = None) -> Dict:
         if not compute_type:

@@ -34,11 +34,18 @@ from services.compute.manifest_images import override_compute_agent_image
 expected_image = os.environ["EXPECTED_COMPUTE_POD_IMAGE"]
 assert settings.COMPUTE_POD_IMAGE == expected_image
 
-with open("/app/manifests/compute-general.yaml", encoding="utf-8") as manifest_file:
-    workload = yaml.safe_load(manifest_file)
+# 컨트롤러가 직접 만드는 compute 파드의 템플릿.
+for path in (
+    "/app/manifests/direct_buffer/compute-general-pod.yaml",
+):
+    with open(path, encoding="utf-8") as manifest_file:
+        workload = yaml.safe_load(manifest_file)
 
     override_compute_agent_image(workload, settings.COMPUTE_POD_IMAGE)
-    pod_spec = workload["spec"]["template"]["spec"]
+    if workload["kind"] == "Deployment":
+        pod_spec = workload["spec"]["template"]["spec"]
+    else:
+        pod_spec = workload["spec"]
 
     compute_agent = next(
         container

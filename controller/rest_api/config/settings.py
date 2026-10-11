@@ -139,10 +139,11 @@ CACHES = {
 REDIS_URL = _env_first(('REDIS_URL',), 'redis://localhost:6379/0')
 WAIT_QUEUE_PREFIX = _env_first(('WAIT_QUEUE_PREFIX',), 'kda:waitq')
 DEFAULT_COMPUTE_TYPE = _env_first(('DEFAULT_COMPUTE_TYPE',), 'general')
-# This branch is the proposal system and carries no other allocation path,
-# so the mode is a constant rather than a switch: reading it from the
-# environment would let a typo silently deploy an arm that is not here.
-COMPUTE_ALLOCATION_MODE = 'warm_buffer'
+# 이 브랜치(exp-warm-buffer)는 Deployment 없이 컨트롤러가 버퍼 파드를 직접 만들고
+# 지우는 비교군이다. 브랜치가 곧 arm 이므로 모드는 상수다 - 환경변수로 읽으면
+# 오타 하나로 다른 arm 이 조용히 배포된다. 상태 API 와 평가 도구가 이 이름으로
+# arm 을 기록한다.
+COMPUTE_ALLOCATION_MODE = 'warm_buffer_direct'
 COMPUTE_POD_IMAGE = _env_first(
     ('COMPUTE_POD_IMAGE',),
     'harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:latest',
@@ -174,8 +175,8 @@ WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS = _env_int_any(
     ('WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS',),
     60,
 )
-# How long a Compute Pod may stay NotReady before cleanup deletes it and lets the
-# Deployment backfill a usable one. 30s matches Kubernetes' own default
+# How long a Compute Pod may stay NotReady before cleanup deletes it (the buffer
+# reconciler then creates a usable one if the target still asks for it). 30s matches Kubernetes' own default
 # livenessProbe verdict (periodSeconds 10 x failureThreshold 3). 0 disables.
 COMPUTE_NOT_READY_GRACE_SECONDS = _env_int_any(
     ('COMPUTE_NOT_READY_GRACE_SECONDS',),
@@ -184,10 +185,6 @@ COMPUTE_NOT_READY_GRACE_SECONDS = _env_int_any(
 ASSIGNED_CONTEXT_TTL_SECONDS = _env_int_any(
     ('ASSIGNED_CONTEXT_TTL_SECONDS',),
     2592000,
-)
-COMPUTE_AVAILABLE_TTL_SECONDS = _env_int_any(
-    ('COMPUTE_AVAILABLE_TTL_SECONDS',),
-    600,
 )
 WAIT_QUEUE_MAX_RETRIES = _env_int_any(('WAIT_QUEUE_MAX_RETRIES',), 3)
 WAIT_QUEUE_WORKER_INTERVAL_SECONDS = _env_float_any(
@@ -215,36 +212,10 @@ COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS = _env_float_any(
     ('COMPUTE_AVAILABILITY_WATCH_RETRY_SECONDS',),
     1.0,
 )
-BUFFER_RECONCILE_DEBOUNCE_SECONDS = _env_float_any(
-    ('BUFFER_RECONCILE_DEBOUNCE_SECONDS',),
-    0.2,
-)
+# 리더의 주기 정리(만료된 claim 복구, 고아 파드 회수, 남은 Deployment 버퍼 내리기) 간격.
 BUFFER_RECONCILE_RESYNC_SECONDS = _env_int_any(
     ('BUFFER_RECONCILE_RESYNC_SECONDS',),
     60,
-)
-BUFFER_POLICY_READY_TTL_SECONDS = _env_int_any(
-    ('BUFFER_POLICY_READY_TTL_SECONDS',),
-    15,
-)
-BUFFER_POLICY_READY_RENEW_SECONDS = _env_int_any(
-    ('BUFFER_POLICY_READY_RENEW_SECONDS',),
-    5,
-)
-BUFFER_SCALE_DOWN_GATE_TTL_SECONDS = _env_int_any(
-    ('BUFFER_SCALE_DOWN_GATE_TTL_SECONDS',),
-    15,
-)
-BUFFER_SCALE_DOWN_GATE_RENEW_SECONDS = _env_int_any(
-    ('BUFFER_SCALE_DOWN_GATE_RENEW_SECONDS',),
-    5,
-)
-# Size the warm buffer from the queue instead of holding a fixed R. Off by
-# default so one build can run both policies and the comparison does not have to
-# span two builds and two days.
-BUFFER_DYNAMIC_RESERVE_ENABLED = _env_bool_any(
-    ('BUFFER_DYNAMIC_RESERVE_ENABLED',),
-    False,
 )
 
 # The cooldown itself is not configured - it is the larger of two observed
@@ -262,23 +233,33 @@ BUFFER_SCALE_DOWN_COOLDOWN_MIN_SAMPLES = _env_int_any(
     10,
 )
 
-# 공급 락(supply-lock:{type})의 TTL. 공급 한 바퀴(목록 1회 + replicas 올리기 +
-# 게이트 몇 개)는 수 초 안에 끝나므로 짧게 둔다. 리더가 죽으면 이 시간 뒤 풀린다.
-BUFFER_SUPPLY_LOCK_TTL_SECONDS = _env_int_any(
-    ('BUFFER_SUPPLY_LOCK_TTL_SECONDS',),
-    15,
+# ---- warm_buffer_direct (Deployment 없이 컨트롤러가 직접 관리하는 버퍼)
+#
+# R(미리 띄워 둘 최소 개수)과 N(노드 위 compute 파드 상한). Deployment 가 없으므로
+# 어노테이션 대신 컨트롤러 환경변수로 받는다. deploy.sh 가 빌드 파라미터를 넣는다.
+# 실험 중 바꿀 일이 없어 시작 시 한 번 읽는다(값은 status API 와 로그에 남는다).
+# N 이 비면 상한이 없다는 뜻이고 시작 로그에 경고가 남는다 - 상한 없는 run 은
+# 다른 arm 과 같은 제약 아래가 아니다.
+WARM_BUFFER_RESERVE = _env_first(('BUFFER_RESERVE', 'WARM_BUFFER_RESERVE'), '0').strip()
+WARM_BUFFER_CAPACITY = _env_first(('BUFFER_CAPACITY', 'WARM_BUFFER_CAPACITY'), '').strip()
+# 리더가 버퍼를 맞추는 주기의 상한. 파드 이벤트·반납·요청 도착으로 바로 깨어나므로
+# 이 값은 놓친 이벤트를 메우는 바닥일 뿐이다.
+WARM_BUFFER_RESYNC_SECONDS = _env_float_any(('WARM_BUFFER_RESYNC_SECONDS',), 2.0)
+# 생성 요청을 보냈지만 목록에 아직 안 보이는 파드를 N 에 세는 시간의 상한. 응답을 못
+# 받은 생성 요청이 서버에 남아 있을 수 있는 시간은 apiserver 요청 timeout(기본
+# --request-timeout 60s)이 상한이라 그 값을 쓴다. 그 뒤에도 목록에 없으면 만들어지지
+# 않은 것이다.
+WARM_BUFFER_PENDING_CREATE_SECONDS = _env_float_any(('WARM_BUFFER_PENDING_CREATE_SECONDS',), 60.0)
+# Ready 를 기다리는 상한과 폴링 간격. cold start 와 같은 값이다.
+COLD_START_POD_READY_TIMEOUT_SECONDS = _env_float_any(
+    ('COLD_START_POD_READY_TIMEOUT_SECONDS',),
+    300.0,
 )
-# 공급 한 바퀴에서 목록을 다시 읽기 전에 연달아 푸는 게이트 수. N 안전과는 무관하다
-# (예산 안에서만 푼다). 푸는 도중 큐가 비어 목표가 내려갔을 때 쓸데없이 들이는 파드
-# 수를 이 값 이하로 묶는다.
-BUFFER_REFILL_BATCH_LIMIT = _env_int_any(
-    ('BUFFER_REFILL_BATCH_LIMIT',),
-    4,
+COLD_START_POD_READY_POLL_SECONDS = _env_float_any(
+    ('COLD_START_POD_READY_POLL_SECONDS',),
+    0.5,
 )
-BUFFER_SCALE_DOWN_WAIT_TIMEOUT_SECONDS = _env_int_any(
-    ('BUFFER_SCALE_DOWN_WAIT_TIMEOUT_SECONDS',),
-    10,
-)
+
 COMPUTE_AGENT_TIMEOUT_SECONDS = _env_float_any(('COMPUTE_AGENT_TIMEOUT_SECONDS',), 30.0)
 COMPUTE_AGENT_MOUNT_TIMEOUT_SECONDS = _env_float_any(
     ('COMPUTE_AGENT_MOUNT_TIMEOUT_SECONDS',),

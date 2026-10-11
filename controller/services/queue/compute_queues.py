@@ -10,10 +10,6 @@ from typing import Dict, Iterable, List, Optional
 
 from config import settings
 
-# 도착 기록을 얼마나 들고 있을지. 창 길이가 아니라 상한이다 - 창은 파드 생성 시간이
-# 정하고 (실측 6.5초), 그보다 훨씬 긴 이 값은 기록이 무한히 쌓이는 것만 막는다.
-ARRIVALS_TTL_SECONDS = 900
-
 # Queue repair and claim both walk Redis-backed ticket indexes. Keep their
 # timing summaries sparse so a saturated queue can be diagnosed without a log
 # line (or a ticket identifier) for every claim.
@@ -121,11 +117,8 @@ class ComputeQueues:
         ticket_ttl_seconds: Optional[int] = None,
         allocating_ttl_seconds: Optional[int] = None,
         assigned_context_ttl_seconds: Optional[int] = None,
-        compute_available_ttl_seconds: Optional[int] = None,
         max_retries: Optional[int] = None,
         worker_identity: Optional[str] = None,
-        scale_down_gate_ttl_seconds: Optional[int] = None,
-        buffer_policy_ready_ttl_seconds: Optional[int] = None,
     ):
         self.redis_url = redis_url or settings.REDIS_URL
         self.prefix = prefix or settings.WAIT_QUEUE_PREFIX
@@ -133,25 +126,12 @@ class ComputeQueues:
             (default_compute_type or settings.DEFAULT_COMPUTE_TYPE).strip().lower() or "general"
         )
         self.lock_ttl_seconds = lock_ttl_seconds or settings.WAIT_QUEUE_LOCK_TTL_SECONDS
-        self.supply_lock_ttl_seconds = int(
-            getattr(settings, "BUFFER_SUPPLY_LOCK_TTL_SECONDS", 15) or 15
-        )
-        self.scale_down_gate_ttl_seconds = (
-            scale_down_gate_ttl_seconds or settings.BUFFER_SCALE_DOWN_GATE_TTL_SECONDS
-        )
-        self.provider_policy_ready_ttl_seconds = (
-            buffer_policy_ready_ttl_seconds
-            or settings.BUFFER_POLICY_READY_TTL_SECONDS
-        )
         self.wait_timeout_seconds = wait_timeout_seconds or settings.WAIT_QUEUE_TIMEOUT_SECONDS
         self.ticket_ttl_seconds = ticket_ttl_seconds or settings.WAIT_QUEUE_TICKET_TTL_SECONDS
         self.allocating_ttl_seconds = allocating_ttl_seconds or settings.WAIT_QUEUE_ALLOCATING_TTL_SECONDS
         self.client_timeout_seconds = settings.WAIT_QUEUE_CLIENT_TIMEOUT_SECONDS
         self.assigned_context_ttl_seconds = (
             assigned_context_ttl_seconds or settings.ASSIGNED_CONTEXT_TTL_SECONDS
-        )
-        self.compute_available_ttl_seconds = (
-            compute_available_ttl_seconds or settings.COMPUTE_AVAILABLE_TTL_SECONDS
         )
         self.max_retries = max_retries or settings.WAIT_QUEUE_MAX_RETRIES
         self.worker_identity = worker_identity or os.getenv("HOSTNAME", "controller-unknown")
@@ -288,23 +268,8 @@ class ComputeQueues:
     def _types_key(self) -> str:
         return f"{self.prefix}:types"
 
-    def _arrivals_key(self, compute_type: str) -> str:
-        return f"{self.prefix}:arrivals:{compute_type}"
-
-    def _releases_key(self, compute_type: str) -> str:
-        return f"{self.prefix}:releases:{compute_type}"
-
     def _lock_key(self, compute_type: str) -> str:
         return f"{self.prefix}:lock:{compute_type}"
-
-    def _supply_lock_key(self, compute_type: str) -> str:
-        return f"{self.prefix}:supply-lock:{compute_type}"
-
-    def _buffer_policy_key(self, compute_type: str) -> str:
-        return f"{self.prefix}:buffer-policy:{compute_type}"
-
-    def _scale_down_gate_key(self, compute_type: str) -> str:
-        return f"{self.prefix}:scale-down-gate:{compute_type}"
 
     def _churn_samples_key(self, compute_type: str, kind: str) -> str:
         return f"{self.prefix}:churn:{kind}:{compute_type}"
@@ -349,56 +314,11 @@ class ComputeQueues:
                 continue
         return values
 
-    def _buffer_policy_ready_key(self) -> str:
-        return f"{self.prefix}:buffer-policy-ready"
-
     def _assigned_request_key(self, compute_pod: str) -> str:
         return f"{self.prefix}:assigned-request:{compute_pod}"
 
     def _compute_ticket_key(self, compute_pod: str) -> str:
         return f"{self.prefix}:compute-ticket:{compute_pod}"
-
-    def _compute_available_key(self, compute_pod: str) -> str:
-        return f"{self.prefix}:compute-available:{compute_pod}"
-
-    def record_compute_available(self, compute_pod: str, compute_available_at: Optional[str] = None) -> bool:
-        compute_pod_value = (compute_pod or "").strip()
-        if not compute_pod_value:
-            return False
-
-        observed_at = compute_available_at or _iso_now()
-        client = self._redis_client()
-        try:
-            return bool(
-                client.set(
-                    self._compute_available_key(compute_pod_value),
-                    observed_at,
-                    nx=True,
-                    ex=max(1, int(self.compute_available_ttl_seconds)),
-                )
-            )
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to record compute availability for {compute_pod_value}: {exc}"
-            ) from exc
-
-    def pop_compute_available_at(self, compute_pod: str) -> str:
-        compute_pod_value = (compute_pod or "").strip()
-        if not compute_pod_value:
-            return ""
-
-        client = self._redis_client()
-        key = self._compute_available_key(compute_pod_value)
-        try:
-            pipe = client.pipeline(transaction=True)
-            pipe.get(key)
-            pipe.delete(key)
-            value, _ = pipe.execute()
-            return value or ""
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to pop compute availability for {compute_pod_value}: {exc}"
-            ) from exc
 
     def register_compute_types(self, compute_types: Iterable[str]) -> List[str]:
         normalized = []
@@ -438,86 +358,6 @@ class ComputeQueues:
                 return True
         return False
 
-    def record_arrival(self, compute_type: str, ticket_id: str, pipe=None) -> None:
-        """티켓이 들어온 시각을 남긴다. 버퍼 크기를 정할 때 쓰는 유일한 수요 신호다.
-
-        큐 길이가 아니라 도착 시각을 쓰는 이유는 둘이 재는 것이 다르기 때문이다.
-        큐 길이는 공급이 모자랐던 결과가 쌓인 양이고 (리틀의 법칙으로 λ x 대기시간),
-        버퍼가 덮어야 하는 것은 파드 하나를 세우는 동안 새로 오는 양 (λ x 생성시간)
-        이다. 실측에서 대기시간이 195초, 생성시간이 6.5초였으니 큐 길이를 그대로
-        목표로 삼으면 30배 과대 추정이 된다.
-
-        파이프라인을 받으면 거기 실어 티켓 생성과 원자적으로 묶는다.
-        """
-        key = self._arrivals_key(self.normalize_compute_type(compute_type))
-        now_ms = time.time() * 1000.0
-        target = pipe if pipe is not None else self._redis_client()
-        target.zadd(key, {ticket_id: now_ms})
-        if pipe is None:
-            try:
-                target.expire(key, ARRIVALS_TTL_SECONDS)
-            except RedisError:
-                pass
-        else:
-            target.expire(key, ARRIVALS_TTL_SECONDS)
-
-    def record_release(self, compute_type: str, compute_pod: str) -> None:
-        """파드가 반납된 시각을 남긴다. 버퍼 크기를 정하는 수요 신호다.
-
-        도착이 아니라 반납을 세는 이유는, 버퍼가 덮어야 하는 것이 "자리가 비는
-        속도" 이기 때문이다. 한가할 때는 둘이 같지만 (들어온 만큼 끝난다) 밀릴
-        때는 갈라진다 - 큐가 길면 도착은 시스템이 끝내 주는 만큼으로 눌리는 반면,
-        반납은 작업이 끝날 때마다 일어나 실제 회전 속도를 그대로 보여 준다.
-        실측에서 동시 요청이 상한에 막히자 도착률이 완료율과 같아져, 가장 바쁠 때
-        수요가 가장 작게 읽혔다.
-
-        할당이 아니라 반납인 이유는 버퍼가 비면 할당이 막히기 때문이다. 할당을
-        세면 "버퍼가 없어서 못 쓴" 것이 "수요가 없다" 로 읽혀 스스로를 굶긴다.
-        """
-        key = self._releases_key(self.normalize_compute_type(compute_type))
-        try:
-            client = self._redis_client()
-            client.zadd(key, {f"{compute_pod}:{time.time()}": time.time() * 1000.0})
-            client.expire(key, ARRIVALS_TTL_SECONDS)
-        except RedisError:
-            # 수요 신호는 없어도 고정 정책으로 돌아갈 뿐이라 반납을 막지 않는다.
-            pass
-
-    def release_count(self, compute_type: str, window_seconds: float) -> int:
-        """최근 window_seconds 동안 반납된 파드 수."""
-        if window_seconds <= 0:
-            return 0
-        key = self._releases_key(self.normalize_compute_type(compute_type))
-        now_ms = time.time() * 1000.0
-        client = self._redis_client()
-        try:
-            client.zremrangebyscore(key, 0, now_ms - (ARRIVALS_TTL_SECONDS * 1000.0))
-        except RedisError:
-            pass
-        return int(client.zcount(key, now_ms - window_seconds * 1000.0, now_ms))
-
-    def arrival_count(self, compute_type: str, window_seconds: float) -> int:
-        """최근 window_seconds 동안 들어온 티켓 수.
-
-        추정이 아니라 관측이다. window 로 파드 생성 시간을 주면 "지금 파드를 세우기
-        시작하면 그것이 준비될 때까지 몇 건이 더 오는가"가 그대로 나오고, 그 수만큼
-        미리 떠 있으면 아무도 생성을 기다리지 않는다.
-
-        창 밖으로 나간 기록은 읽을 때 정리한다. 키에 TTL 도 걸려 있어 큐가 조용해지면
-        알아서 사라진다.
-        """
-        if window_seconds <= 0:
-            return 0
-        key = self._arrivals_key(self.normalize_compute_type(compute_type))
-        now_ms = time.time() * 1000.0
-        client = self._redis_client()
-        oldest_ms = now_ms - (ARRIVALS_TTL_SECONDS * 1000.0)
-        try:
-            client.zremrangebyscore(key, 0, oldest_ms)
-        except RedisError:
-            pass
-        return int(client.zcount(key, now_ms - window_seconds * 1000.0, now_ms))
-
     def queued_count(self, compute_type: str) -> int:
         """How many tickets are waiting for a Compute Pod right now.
 
@@ -553,36 +393,6 @@ class ComputeQueues:
             if self.has_queued_tickets(compute_type_value):
                 queued_types.append(compute_type_value)
         return sorted(set(queued_types))
-
-    def mark_compute_unavailable_started(self, compute_type: str) -> int:
-        compute_type_value = self.normalize_compute_type(compute_type)
-        now = _iso_now()
-        client = self._redis_client()
-        marked = 0
-        try:
-            pipe = client.pipeline(transaction=False)
-            for ticket_id in self._queue_ids(compute_type_value):
-                raw = self.tickets.get_ticket_raw(ticket_id)
-                if not raw:
-                    continue
-                if str(raw.get("status") or "").lower() != "queued":
-                    continue
-                if raw.get("compute_unavailable_started_at"):
-                    continue
-                pipe.hsetnx(
-                    self._ticket_key(ticket_id),
-                    "compute_unavailable_started_at",
-                    now,
-                )
-                pipe.expire(self._ticket_key(ticket_id), self.ticket_ttl_seconds)
-                marked += 1
-            if marked:
-                pipe.execute()
-            return marked
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to mark compute unavailable start for {compute_type_value}: {exc}"
-            ) from exc
 
     def get_ticket_position(self, ticket_id: str) -> Optional[int]:
         """1-based place in the arrival-ordered queue, or None when absent."""
@@ -716,193 +526,11 @@ class ComputeQueues:
             "waiting_users": waiting_users,
         }
 
-    def set_buffer_policy(
-        self,
-        compute_type: str,
-        deployment_name: str,
-        R: int,
-        N: int,
-        resource_version: str = "",
-    ) -> Dict[str, object]:
-        compute_type_value = self.normalize_compute_type(compute_type)
-        deployment_name_value = (deployment_name or "").strip()
-        try:
-            buffer_reserve = int(R)
-            buffer_capacity = int(N)
-        except (TypeError, ValueError) as exc:
-            raise QueueUnavailableError(
-                f"Invalid buffer policy for {compute_type_value}: R and N must be integers"
-            ) from exc
-
-        if not deployment_name_value:
-            raise QueueUnavailableError(
-                f"Invalid buffer policy for {compute_type_value}: deployment_name is required"
-            )
-        if buffer_reserve < 0 or buffer_capacity < 0 or buffer_reserve > buffer_capacity:
-            raise QueueUnavailableError(
-                f"Invalid buffer policy for {compute_type_value}: require 0 <= R <= N"
-            )
-
-        policy = {
-            "compute_type": compute_type_value,
-            "deployment_name": deployment_name_value,
-            "R": buffer_reserve,
-            "N": buffer_capacity,
-            "resource_version": (resource_version or "").strip(),
-        }
-        payload = {
-            "deployment_name": deployment_name_value,
-            "R": str(buffer_reserve),
-            "N": str(buffer_capacity),
-            "resource_version": policy["resource_version"],
-        }
-        client = self._redis_client()
-        try:
-            client.hset(self._buffer_policy_key(compute_type_value), mapping=payload)
-            return policy
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to store buffer policy for {compute_type_value}: {exc}"
-            ) from exc
-
-    def get_buffer_policy(self, compute_type: str) -> Optional[Dict[str, object]]:
-        compute_type_value = self.normalize_compute_type(compute_type)
-        client = self._redis_client()
-        try:
-            raw = client.hgetall(self._buffer_policy_key(compute_type_value))
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to read buffer policy for {compute_type_value}: {exc}"
-            ) from exc
-
-        if not raw:
-            return None
-
-        try:
-            buffer_reserve = int(raw["R"])
-            buffer_capacity = int(raw["N"])
-            deployment_name = (raw["deployment_name"] or "").strip()
-        except (KeyError, TypeError, ValueError) as exc:
-            raise QueueUnavailableError(
-                f"Invalid stored buffer policy for {compute_type_value}"
-            ) from exc
-
-        if (
-            not deployment_name
-            or buffer_reserve < 0
-            or buffer_capacity < 0
-            or buffer_reserve > buffer_capacity
-        ):
-            raise QueueUnavailableError(
-                f"Invalid stored buffer policy for {compute_type_value}"
-            )
-
-        return {
-            "compute_type": compute_type_value,
-            "deployment_name": deployment_name,
-            "R": buffer_reserve,
-            "N": buffer_capacity,
-            "resource_version": (raw.get("resource_version") or "").strip(),
-        }
-
-    def clear_buffer_policy(self, compute_type: str) -> bool:
-        compute_type_value = self.normalize_compute_type(compute_type)
-        client = self._redis_client()
-        try:
-            return bool(client.delete(self._buffer_policy_key(compute_type_value)))
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to clear buffer policy for {compute_type_value}: {exc}"
-            ) from exc
-
-    def publish_buffer_policy_ready(self, token: str) -> bool:
-        token_value = (token or "").strip()
-        if not token_value:
-            raise QueueUnavailableError("Buffer policy readiness token is required")
-        client = self._redis_client()
-        try:
-            return bool(
-                client.set(
-                    self._buffer_policy_ready_key(),
-                    token_value,
-                    ex=max(1, int(self.provider_policy_ready_ttl_seconds)),
-                )
-            )
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to publish buffer policy readiness: {exc}"
-            ) from exc
-
-    def renew_buffer_policy_ready(self, token: str) -> bool:
-        token_value = (token or "").strip()
-        if not token_value:
-            return False
-        client = self._redis_client()
-        renew_script = """
-        if redis.call("get", KEYS[1]) == ARGV[1] then
-            return redis.call("expire", KEYS[1], ARGV[2])
-        end
-        return 0
-        """
-        try:
-            return bool(
-                client.eval(
-                    renew_script,
-                    1,
-                    self._buffer_policy_ready_key(),
-                    token_value,
-                    max(1, int(self.provider_policy_ready_ttl_seconds)),
-                )
-            )
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to renew buffer policy readiness: {exc}"
-            ) from exc
-
-    def clear_buffer_policy_ready(self, token: Optional[str] = None) -> bool:
-        client = self._redis_client()
-        try:
-            if not token:
-                return bool(client.delete(self._buffer_policy_ready_key()))
-            release_script = """
-            if redis.call("get", KEYS[1]) == ARGV[1] then
-                return redis.call("del", KEYS[1])
-            end
-            return 0
-            """
-            return bool(
-                client.eval(
-                    release_script,
-                    1,
-                    self._buffer_policy_ready_key(),
-                    token,
-                )
-            )
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to clear buffer policy readiness: {exc}"
-            ) from exc
-
-    def is_buffer_policy_ready(self) -> bool:
-        client = self._redis_client()
-        try:
-            return bool(client.exists(self._buffer_policy_ready_key()))
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to inspect buffer policy readiness: {exc}"
-            ) from exc
-
     # ---- 토큰 락 공통 (SET NX + 토큰, 토큰 비교 후 expire/del)
     #
-    # 락이 둘이다. 할당 락(lock:{type})은 claim 과 그 직후 replicas 낮추기를,
-    # 공급 락(supply-lock:{type})은 리더의 공급(replicas 올리기 + 게이트 해제)을
-    # 직렬화한다. 공급이 할당 락을 쓰던 시절에는 포화 구간에서 그 락이 90% 차 있었고
-    # 게이트 해제가 그중 40% 를 차지했다(10/11 계측). 노드 위 파드 수(게이트 풀린
-    # available + assigned)를 늘리는 것은 게이트 해제뿐이고 claim 은 그 합을 바꾸지
-    # 않으므로 두 경로가 같은 락을 쓸 이유가 없다.
-    #
-    # 순서 규칙: 공급 락을 쥔 채 할당 락을 잡지 않는다. 둘 다 필요한 경로(축소,
-    # 정책 게시)는 할당 락 -> 공급 락 순서로 잡는다.
+    # 락은 할당 락(lock:{type}) 하나다. 두 복제본의 할당(N 여유 계산 + claim + idle
+    # 파드 할당)과 리더의 버퍼 계획(만들 이름 예약, 지울 파드 결정)이 이 락 아래에서
+    # 같은 목록을 보고 결정한다. 파드 생성·삭제 호출 자체는 락 밖에서 한다.
 
     def _acquire_token_lock(
         self, key: str, ttl: int, owner: Optional[str], lock: str, label: str
@@ -975,113 +603,6 @@ class ComputeQueues:
             self._lock_key(compute_type_value), token, compute_type_value
         )
 
-    def acquire_supply_lock(self, compute_type: str, owner: Optional[str] = None) -> Optional[str]:
-        compute_type_value = self.normalize_compute_type(compute_type)
-        return self._acquire_token_lock(
-            self._supply_lock_key(compute_type_value),
-            self.supply_lock_ttl_seconds,
-            owner,
-            "supply",
-            "supply " + compute_type_value,
-        )
-
-    def renew_supply_lock(self, compute_type: str, token: Optional[str]) -> bool:
-        compute_type_value = self.normalize_compute_type(compute_type)
-        return self._renew_token_lock(
-            self._supply_lock_key(compute_type_value),
-            self.supply_lock_ttl_seconds,
-            token,
-            "supply " + compute_type_value,
-        )
-
-    def release_supply_lock(self, compute_type: str, token: Optional[str]) -> bool:
-        compute_type_value = self.normalize_compute_type(compute_type)
-        return self._release_token_lock(
-            self._supply_lock_key(compute_type_value), token, "supply " + compute_type_value
-        )
-
-    def acquire_scale_down_gate(
-        self,
-        compute_type: str,
-        owner: Optional[str] = None,
-    ) -> Optional[str]:
-        compute_type_value = self.normalize_compute_type(compute_type)
-        client = self._redis_client()
-        token = owner or uuid.uuid4().hex
-        try:
-            acquired = client.set(
-                self._scale_down_gate_key(compute_type_value),
-                token,
-                nx=True,
-                ex=self.scale_down_gate_ttl_seconds,
-            )
-            return token if acquired else None
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to acquire scale-down gate for {compute_type_value}: {exc}"
-            ) from exc
-
-    def renew_scale_down_gate(self, compute_type: str, token: Optional[str]) -> bool:
-        if not token:
-            return False
-
-        compute_type_value = self.normalize_compute_type(compute_type)
-        client = self._redis_client()
-        renew_script = """
-        if redis.call("get", KEYS[1]) == ARGV[1] then
-            return redis.call("expire", KEYS[1], ARGV[2])
-        end
-        return 0
-        """
-        try:
-            result = client.eval(
-                renew_script,
-                1,
-                self._scale_down_gate_key(compute_type_value),
-                token,
-                self.scale_down_gate_ttl_seconds,
-            )
-            return bool(result)
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to renew scale-down gate for {compute_type_value}: {exc}"
-            ) from exc
-
-    def release_scale_down_gate(self, compute_type: str, token: Optional[str]) -> bool:
-        if not token:
-            return False
-
-        compute_type_value = self.normalize_compute_type(compute_type)
-        client = self._redis_client()
-        release_script = """
-        if redis.call("get", KEYS[1]) == ARGV[1] then
-            return redis.call("del", KEYS[1])
-        end
-        return 0
-        """
-        try:
-            result = client.eval(
-                release_script,
-                1,
-                self._scale_down_gate_key(compute_type_value),
-                token,
-            )
-            return bool(result)
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to release scale-down gate for {compute_type_value}: {exc}"
-            ) from exc
-
-    def is_scale_down_gated(self, compute_type: str) -> bool:
-        compute_type_value = self.normalize_compute_type(compute_type)
-        client = self._redis_client()
-        try:
-            return bool(client.exists(self._scale_down_gate_key(compute_type_value)))
-        except RedisError as exc:
-            raise QueueUnavailableError(
-                f"Failed to inspect scale-down gate for {compute_type_value}: {exc}"
-            ) from exc
-
     def is_allocation_stale(self, ticket: Dict[str, object]) -> bool:
         allocation_deadline = ticket.get("allocation_deadline")
         if isinstance(allocation_deadline, datetime):
@@ -1136,6 +657,126 @@ class ComputeQueues:
                     stale.append(ticket)
         stale.sort(key=lambda item: item.get("created_at") or _utc_now())
         return stale
+
+    # ---- 버퍼 파드 직접 관리: 자리 예약(파드 없는 claim, 생성 중 목록)
+
+    def allocating_missing_pods(
+        self,
+        active_pod_names,
+        compute_type: Optional[str] = None,
+    ) -> List[str]:
+        """파드가 아직 목록에 안 보여서 자리를 대신 쥐고 있는 claim 들의 파드 이름.
+
+        이름을 아직 안 적은 claim 은 "" 다. 호출자가 생성 중 목록과 이름으로 겹침을
+        빼고 센다 - 요청 파드는 만들기 전에 이름을 티켓과 생성 중 목록 양쪽에 올리므로,
+        그대로 더하면 같은 자리를 두 번 센다.
+
+        요청 때 만드는 파드는 claim 뒤 할당 락 밖에서 만들어진다. 그래서 "이 claim 의
+        파드가 방금 읽은 목록에 있나" 로 판정한다 - 티켓에 이름이 적혔는지로 보면
+        생성 응답과 LIST 가 따라잡는 사이의 틈에서 자리가 사라진다. 파드가 목록에 있으면
+        세지 않는다(두 번 세면 용량이 반으로 준다). 만료된 claim 도 세지 않는다 - 생성
+        전에 죽은 작업자의 티켓은 정리가 큐로 돌려보낸다. 그런 claim 이 그래도 파드를
+        만들 수 있는 경우는 생성 중 목록이 막는다(할당 쪽 _reserve_request_pod).
+
+        할당 락 아래에서 매 패스 부르므로 티켓은 한 번의 왕복으로 읽는다.
+        """
+        known = set(active_pod_names or ())
+        types = [self.normalize_compute_type(compute_type)] if compute_type else self.known_compute_types()
+        ticket_ids = [ticket_id for type_name in types for ticket_id in self._active_ticket_ids(type_name)]
+        if not ticket_ids:
+            return []
+        client = self._redis_client()
+        try:
+            with client.pipeline(transaction=False) as pipe:
+                for ticket_id in ticket_ids:
+                    pipe.hgetall(self._ticket_key(ticket_id))
+                raws = pipe.execute()
+        except RedisError as exc:
+            raise QueueUnavailableError(f"Failed to read allocating tickets: {exc}") from exc
+        missing: List[str] = []
+        for ticket_id, raw in zip(ticket_ids, raws):
+            # 상태부터 거른다. _ticket_to_dict 는 티켓마다 큐 위치(ZRANK)를 다시 읽어,
+            # 대기 티켓이 많은 포화에서 그 수만큼 왕복이 는다.
+            if not raw or str(raw.get("status") or "").lower() != "allocating":
+                continue
+            ticket = self.tickets._raw_to_ticket_dict(ticket_id, raw)
+            compute_pod = str(ticket.get("compute_pod") or "")
+            if compute_pod and compute_pod in known:
+                continue
+            if self.is_allocation_stale(ticket):
+                continue
+            missing.append(compute_pod)
+        return missing
+
+    def claimable_queued_count(self, compute_type: str) -> int:
+        """지금 claim 할 수 있는 대기 티켓 수.
+
+        queued_count 와 달리 claim 이 건너뛰는 티켓(클라이언트가 폴링을 멈춤)을 빼고
+        센다. 그런 티켓은 큐에 자리를 지킨 채 대기 제한(기본 30분)까지 남을 수 있어,
+        버퍼 조정이 그것을 "대기 수요" 로 보면 그동안 미리 만들기를 멈춘다.
+        """
+        compute_type_value = self.normalize_compute_type(compute_type)
+        ticket_ids = self._queue_ids(compute_type_value)
+        if not ticket_ids:
+            return 0
+        client = self._redis_client()
+        try:
+            with client.pipeline(transaction=False) as pipe:
+                for ticket_id in ticket_ids:
+                    pipe.hmget(self._ticket_key(ticket_id), "status", "last_poll_ms", "created_at")
+                rows = pipe.execute()
+        except RedisError as exc:
+            raise QueueUnavailableError(
+                f"Failed to read queued tickets for {compute_type_value}: {exc}"
+            ) from exc
+        count = 0
+        for status, last_poll_ms, created_at in rows:
+            if str(status or "").lower() != "queued":
+                continue
+            fields = {"last_poll_ms": last_poll_ms, "created_at": parse_datetime(created_at)}
+            if self.is_client_disconnected(fields):
+                continue
+            count += 1
+        return count
+
+    def _pending_create_key(self, compute_type: str) -> str:
+        return f"{self.prefix}:direct-creating:{compute_type}"
+
+    def add_pending_create(self, compute_type: str, pod_name: str) -> None:
+        """만들기로 한 idle 파드 이름을 생성 요청 전에 적는다. N 계산에 들어간다."""
+        client = self._redis_client()
+        try:
+            client.zadd(
+                self._pending_create_key(self.normalize_compute_type(compute_type)),
+                {pod_name: time.time()},
+            )
+        except RedisError as exc:
+            raise QueueUnavailableError(f"Failed to record pending create {pod_name}: {exc}") from exc
+
+    def remove_pending_creates(self, compute_type: str, pod_names: Iterable[str]) -> None:
+        names = [name for name in pod_names if name]
+        if not names:
+            return
+        client = self._redis_client()
+        try:
+            client.zrem(self._pending_create_key(self.normalize_compute_type(compute_type)), *names)
+        except RedisError as exc:
+            raise QueueUnavailableError(f"Failed to clear pending creates: {exc}") from exc
+
+    def pending_creates(self, compute_type: str, max_age_seconds: float) -> List[str]:
+        """아직 목록에 안 보였을 수 있는 생성 요청 이름. 상한보다 오래된 것은 버린다.
+
+        응답 없는 생성 요청이 서버에 남아 있을 수 있는 시간의 상한(apiserver 요청
+        timeout)이 지나면 그 요청은 끝났다. 그때까지 목록에 없으면 만들어지지 않았다.
+        """
+        key = self._pending_create_key(self.normalize_compute_type(compute_type))
+        cutoff = time.time() - max(0.0, float(max_age_seconds))
+        client = self._redis_client()
+        try:
+            client.zremrangebyscore(key, "-inf", cutoff)
+            return list(client.zrange(key, 0, -1))
+        except RedisError as exc:
+            raise QueueUnavailableError(f"Failed to read pending creates: {exc}") from exc
 
     def claim_next_ticket(self, compute_type: str, worker_id: Optional[str] = None) -> Optional[Dict[str, object]]:
         started = time.perf_counter()

@@ -1,7 +1,6 @@
 import logging
 import threading
 import time
-from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
 from config import settings
@@ -155,12 +154,7 @@ class ComputeQueueProcessor:
             )
             return
 
-        self._remember_compute_available(
-            compute_type_value=compute_type_value,
-            compute_pod=compute_pod,
-            compute_available_at=compute_available_at,
-            source=source,
-        )
+        del compute_pod, compute_available_at, source
         self.kick_wait_queue_worker(compute_type_value)
 
     def refresh_compute_types(self, force: bool = False) -> None:
@@ -337,42 +331,6 @@ class ComputeQueueProcessor:
             name="queue-kick",
             daemon=True,
         ).start()
-
-    def _remember_compute_available(
-        self,
-        *,
-        compute_type_value: str,
-        compute_pod: str,
-        compute_available_at: str,
-        source: str,
-    ) -> None:
-        compute_pod_value = (compute_pod or "").strip()
-        if not compute_pod_value:
-            return
-
-        observed_at = compute_available_at or datetime.now(timezone.utc).isoformat()
-        try:
-            recorded = self.queues.record_compute_available(
-                compute_pod_value,
-                observed_at,
-            )
-        except QueueUnavailableError as exc:
-            logger.debug(
-                "[ComputeAvailableSkipped] compute_type=%s compute_pod=%s reason=%r",
-                compute_type_value,
-                compute_pod_value,
-                str(exc),
-            )
-            return
-
-        if recorded:
-            logger.debug(
-                "[ComputeAvailable] compute_type=%s compute_pod=%s compute_available_ts_ms=%s source=%s",
-                compute_type_value,
-                compute_pod_value,
-                ticket_format.datetime_to_epoch_ms(observed_at),
-                source or "watch",
-            )
 
     def _compute_types_with_stale_allocations(self) -> List[str]:
         compute_types = []

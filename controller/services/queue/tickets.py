@@ -192,9 +192,6 @@ class Tickets:
             )
             pipe.sadd(self.queue._active_key(compute_type_value), ticket_id_value)
             pipe.sadd(self.queue._types_key(), compute_type_value)
-            # 도착 시각. 버퍼 크기를 정하는 수요 신호이고, 티켓과 같은 트랜잭션에
-            # 실어 둘이 어긋나지 않게 한다.
-            self.queue.record_arrival(compute_type_value, ticket_id_value, pipe=pipe)
             pipe.execute()
             return self.get_ticket(ticket_id_value) or {"ticket_id": ticket_id_value, **ticket}
         except RedisError as exc:
@@ -485,6 +482,29 @@ class Tickets:
                 "compute_ready_at": compute_ready_at or ticket.get("compute_ready_at") or "",
                 "error": "",
             },
+        )
+
+    def record_allocating_pod(
+        self,
+        ticket_id: str,
+        compute_pod: str,
+        claim_token: Optional[str] = None,
+    ) -> Optional[Dict[str, object]]:
+        """할당 중인 티켓에 파드 이름만 적는다(cold start 와 같다).
+
+        mark_allocating 과 따로 둔다. 이름은 파드 오브젝트가 생기는 순간 적어야 N 계산이
+        그 claim 을 "생성 중" 으로 세지 않게 되고, IP 는 Ready 뒤에야 생긴다. 상태·claim
+        토큰·마감은 건드리지 않으므로 곧 정리될 claim 을 연장하지 않는다.
+        """
+        ticket = self.get_ticket(ticket_id)
+        if not ticket:
+            return None
+        return self._ticket_transition(
+            ticket_id,
+            compute_type=self.queue.normalize_compute_type(ticket.get("compute_type")),
+            expected_statuses={"allocating"},
+            expected_claim_token=claim_token or ticket.get("claim_token") or None,
+            updates={"compute_pod": compute_pod},
         )
 
     def extend_allocation_deadline(self, ticket_id: str, claim_token: str) -> bool:

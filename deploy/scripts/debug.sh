@@ -9,8 +9,6 @@ kubectl get pods,deployments,daemonsets,services,persistentvolumeclaims \
 echo '[Diagnostics] Deployments'
 kubectl describe deployment/controller \
     -n "${DEPLOY_NAMESPACE}"
-kubectl describe deployment/compute-general \
-    -n "${DEPLOY_NAMESPACE}"
 kubectl describe deployment/controller-queue-redis \
     -n "${DEPLOY_NAMESPACE}"
 kubectl describe deployment/swlabssh \

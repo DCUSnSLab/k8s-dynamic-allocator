@@ -1,15 +1,15 @@
 import logging
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from config import settings
 
 from .. import ticket_format
-from ..queue import QueueUnavailableError
 from .agent_client import ComputeAgent, ComputeAgentError
-from .warm_buffer_provider import PodConflictError
+from .direct_buffer_provider import AllocationClaimLost
+
 
 try:
     from .. import timing
@@ -129,6 +129,15 @@ class ComputeAllocator:
                     **timer.fields(),
                 )
 
+    # ------------------------------------------------------------------
+    # 할당. 버퍼 파드는 Deployment 없이 컨트롤러가 직접 만들고 지운다.
+    #
+    # cold start 의 할당 경로에 "놀고 있는(idle) 파드를 먼저 쓴다" 만 더했다.
+    #   - 할당 락 아래에서: 목록 1회, N 여유 계산, 티켓 claim, idle 파드 할당(조건부 PATCH)
+    #   - 락 밖에서(티켓마다 스레드): idle 이 없던 티켓은 파드를 만들고, Ready 를 기다려
+    #     마운트한다. cold start 와 같은 함수 순서다.
+    # 포화에서는 idle 이 없으므로 cold start 와 같은 경로가 된다.
+
     def _drain_wait_queue_for_type_impl(
         self,
         compute_type: str,
@@ -144,22 +153,12 @@ class ComputeAllocator:
             "failed": 0,
             "errors": [],
         }
-
-        reserved_tickets: List[Dict] = []
-        effective_batch, mount_concurrency = self._compute_wait_queue_batch_plan()
+        # (티켓, idle 파드 이름 또는 None=새로 만듦, 마운트만 남은 확정 티켓 또는 None)
+        work: List[Tuple[Dict, Optional[str], Optional[Dict]]] = []
+        effective_batch, _mount_concurrency = self._compute_wait_queue_batch_plan()
         lock_token = None
         lock_renewed_at = 0.0
         try:
-            if not self.queues.is_buffer_policy_ready():
-                result["queued"] += 1
-                result["capacity_blocked"] = "policy_not_ready"
-                return result
-
-            if self.queues.is_scale_down_gated(compute_type_value):
-                result["queued"] += 1
-                result["capacity_blocked"] = "scale_down"
-                return result
-
             lock_token = self.queues.acquire_allocator_lock(compute_type_value)
             if not lock_token:
                 result["queued"] += 1
@@ -167,195 +166,459 @@ class ComputeAllocator:
                 return result
             lock_renewed_at = time.monotonic()
 
-            if not self.queues.is_buffer_policy_ready():
-                result["queued"] += 1
-                result["capacity_blocked"] = "policy_not_ready"
-                return result
-
-            if self.queues.is_scale_down_gated(compute_type_value):
-                result["queued"] += 1
-                result["capacity_blocked"] = "scale_down"
-                return result
-
-            stale_tickets = self.queues.find_stale_allocating_tickets(
-                compute_type_value
-            )
-            if stale_tickets:
-                self.queues.release_allocator_lock(
-                    compute_type_value,
-                    lock_token,
-                )
-                lock_token = None
-                for stale_ticket in stale_tickets:
-                    recovered = recover_stale_ticket(stale_ticket)
-                    if recovered["status"] == "requeued":
-                        result["stale_recovered"] += 1
-                    elif recovered["status"] == "failed":
-                        result["failed"] += 1
-                    elif recovered["status"] == "error":
-                        result["errors"].append(recovered)
-
-                if (
-                    not self.queues.is_buffer_policy_ready()
-                    or self.queues.is_scale_down_gated(compute_type_value)
-                ):
-                    result["queued"] += 1
-                    result["capacity_blocked"] = "policy_or_scale_down"
-                    return result
-
-                lock_token = self.queues.acquire_allocator_lock(
-                    compute_type_value
-                )
-                if not lock_token:
-                    result["queued"] += 1
-                    result["lock_missed"] = True
-                    return result
-                lock_renewed_at = time.monotonic()
-
-                if (
-                    not self.queues.is_buffer_policy_ready()
-                    or self.queues.is_scale_down_gated(compute_type_value)
-                ):
-                    result["queued"] += 1
-                    result["capacity_blocked"] = "policy_or_scale_down"
-                    return result
+            for stale_ticket in self.queues.find_stale_allocating_tickets(compute_type_value):
+                recovered = recover_stale_ticket(stale_ticket)
+                if recovered["status"] == "requeued":
+                    result["stale_recovered"] += 1
+                elif recovered["status"] == "failed":
+                    result["failed"] += 1
+                elif recovered["status"] == "error":
+                    result["errors"].append(recovered)
 
             if not self.queues.has_queued_tickets(compute_type_value):
                 return result
 
-            policy = self.queues.get_buffer_policy(compute_type_value)
-            if not policy:
-                result["queued"] += 1
-                result["capacity_blocked"] = "policy_unavailable"
-                return result
-
-            snapshot = self.provider.list_buffer_snapshot(compute_type=compute_type_value)
-            available = snapshot["available_candidates"][:effective_batch]
-            if not available:
-                self._mark_compute_unavailable_started(compute_type_value)
-                result["queued"] += 1
-                return result
-
-            reserved_pods: set = set()
-            remaining_capacity = max(
-                0,
-                int(policy["N"]) - int(snapshot["buffer_assigned"]),
-            )
-            max_claims = min(effective_batch, len(available), remaining_capacity)
-            if max_claims <= 0:
-                result["queued"] += 1
-                result["capacity_blocked"] = "buffer_capacity"
-                return result
-
-            for _ in range(max_claims):
-                renew_interval = max(
-                    1.0,
-                    float(getattr(settings, "WAIT_QUEUE_LOCK_RENEW_SECONDS", 20)),
-                )
-                if time.monotonic() - lock_renewed_at >= renew_interval:
-                    if not self.queues.renew_allocator_lock(
+            try:
+                snapshot = self.provider.snapshot(compute_type_value)
+                capacity = self.provider.read_capacity(compute_type_value)
+                active = snapshot["active_names"]
+                # claim 을 먼저, 생성 중 목록을 나중에 읽는다. 요청 파드는 (이름을 티켓에
+                # 적음 → 생성 중 목록에 올림 → 소유 재확인 → 생성) 순서로 만들어지므로,
+                # 이 순서로 읽으면 그사이 취소가 끼어도 둘 중 하나에는 반드시 잡힌다.
+                missing_claims = self.queues.allocating_missing_pods(active, compute_type_value)
+                # 목록에 보인 이름(지우는 중 포함)은 목록 쪽에서 이미 셌거나 자리를
+                # 돌려주는 중이다. 리더 조정의 계산과 같게 둔다.
+                listed = {pod["name"] for pod in snapshot["pods"]}
+                pending_names = {
+                    name
+                    for name in self.queues.pending_creates(
                         compute_type_value,
-                        lock_token,
-                    ):
-                        result["queued"] += 1
+                        float(getattr(settings, "WARM_BUFFER_PENDING_CREATE_SECONDS", 60.0)),
+                    )
+                    if name not in listed
+                }
+                # 같은 요청 파드가 claim 과 생성 중 목록 양쪽에 있으면 한 번만 센다.
+                pending_tickets = sum(
+                    1 for name in missing_claims if not name or name not in pending_names
+                )
+            except Exception as exc:
+                # 상한을 확인할 수 없으면 이번에는 하나도 claim 하지 않는다(cold start 와
+                # 같다). 1초 뒤 작업자가 다시 온다. 확인 못 한 채 한 묶음을 내주면 상한이
+                # 꺼진다.
+                logger.warning(
+                    "[Warning] operation=direct_capacity_check compute_type=%s reason=%r",
+                    compute_type_value,
+                    str(exc),
+                )
+                result["queued"] += 1
+                result["capacity_blocked"] = "capacity_unknown"
+                return result
+
+            # Ready 인 idle 먼저, 그다음 오래된(먼저 부팅을 시작한) 것부터. Ready 였다가
+            # NotReady 가 된 파드(에이전트가 죽음)는 내주지 않는다 - 정리가 곧 지운다.
+            idle = sorted(
+                (
+                    pod for pod in snapshot["idle"]
+                    if pod["ready"] or pod.get("not_ready_since") is None
+                ),
+                key=lambda pod: (
+                    not pod["ready"],
+                    pod["created"].timestamp() if pod.get("created") else float("inf"),
+                ),
+            )
+            # N 이 없으면 하나도 만들지 않는다(설정 누락으로 상한 없는 run 이 되지 않게).
+            new_slots = max(
+                0,
+                int(capacity or 0) - len(active) - pending_tickets - len(pending_names),
+            )
+            limit = min(effective_batch, len(idle) + new_slots)
+            if limit <= 0:
+                result["queued"] += 1
+                result["capacity_blocked"] = "capacity"
+                return result
+
+            idle_iter = iter(idle)
+            renew_interval = max(
+                1.0, float(getattr(settings, "WAIT_QUEUE_LOCK_RENEW_SECONDS", 20))
+            )
+            for _ in range(limit):
+                if time.monotonic() - lock_renewed_at >= renew_interval:
+                    if not self.queues.renew_allocator_lock(compute_type_value, lock_token):
                         result["lock_lost"] = True
                         break
                     lock_renewed_at = time.monotonic()
 
-                ticket = self.queues.claim_next_ticket(
-                    compute_type_value,
-                    worker_id=self.queues.worker_identity,
-                )
-                if not ticket:
-                    break
-
-                reservation = self._reserve_compute_pod_for_ticket(
-                    ticket=ticket,
-                    compute_type_value=compute_type_value,
-                    candidate_pods=available,
-                    reserved_pods=reserved_pods,
-                    result=result,
-                )
-                if reservation:
-                    reserved_tickets.append(reservation)
-                    result["claimed"] += 1
-                    continue
-                break
-
-            if reserved_tickets:
-                # Serialize the replica correction with claims and leader scale-up.
-                # A slow batch can outlive the lock, so verify ownership inside
-                # the correction before each conditional Deployment patch.
+                ticket = None
                 try:
-                    if not self._lower_replicas_for_claims(
-                        compute_type_value=compute_type_value,
-                        policy=policy,
-                        claims=len(reserved_tickets),
-                        lock_token=lock_token,
-                    ):
-                        result["lock_lost"] = True
-                        logger.warning(
-                            "[Warning] operation=buffer_slot_return compute_type=%s "
-                            "claims=%s reason=%r",
-                            compute_type_value,
-                            len(reserved_tickets),
-                            "allocator lock lost before replica correction",
-                        )
-                except Exception as exc:
-                    # Reserved tickets still need their mounts. The leader will
-                    # reconcile replicas if Redis or the Kubernetes API fails.
-                    logger.warning(
-                        "[Warning] operation=buffer_slot_return compute_type=%s "
-                        "claims=%s reason=%r",
+                    ticket = self.queues.claim_next_ticket(
                         compute_type_value,
-                        len(reserved_tickets),
+                        worker_id=self.queues.worker_identity,
+                    )
+                    if not ticket:
+                        break
+
+                    claimed_pod, committed, ticket_alive = self._claim_idle_for_ticket(
+                        ticket, idle_iter
+                    )
+                    if not ticket_alive:
+                        # 묶는 사이 취소됐다. 이 티켓 몫으로 새 파드를 만들지 않는다.
+                        ticket = None
+                        continue
+                    if claimed_pod:
+                        work.append((ticket, claimed_pod, committed))
+                    elif new_slots > 0:
+                        # 자리를 락 안에서 생성 중 목록으로 옮겨 둔다. 스레드가 늦게 떠서
+                        # 그사이 claim 이 만료돼도(만료된 claim 은 세지 않는다) 자리가
+                        # 비지 않는다. 스레드가 소유를 확인하지 못하면 이 이름을 지운다.
+                        self.queues.add_pending_create(
+                            compute_type_value, self.provider.request_pod_name(ticket)
+                        )
+                        new_slots -= 1
+                        work.append((ticket, None, None))
+                    else:
+                        # idle 이 다 남의 것이 됐고 새로 만들 자리도 없다. 순서를 지킨 채
+                        # 돌려놓는다.
+                        self.tickets.requeue_ticket(
+                            ticket["ticket_id"],
+                            reason="No idle compute pod and no capacity",
+                            increment_retry=False,
+                            claim_token=ticket.get("claim_token"),
+                        )
+                        result["queued"] += 1
+                        break
+                    result["claimed"] += 1
+                except Exception as exc:
+                    # 이미 claim 한 앞의 일감은 아래에서 그대로 시작한다. 이 티켓만
+                    # 돌려놓는다(idle PATCH 결과를 모르는 경우 그 파드는 claim 토큰이
+                    # 어긋나 정리가 회수한다).
+                    logger.warning(
+                        "[Warning] operation=direct_claim compute_type=%s ticket_id=%s reason=%r",
+                        compute_type_value,
+                        (ticket or {}).get("ticket_id"),
                         str(exc),
                     )
+                    result["errors"].append({"status": "error", "message": str(exc)})
+                    if ticket:
+                        try:
+                            self.tickets.requeue_ticket(
+                                ticket["ticket_id"],
+                                reason=f"Claim failed: {exc}",
+                                increment_retry=False,
+                                claim_token=ticket.get("claim_token"),
+                            )
+                        except Exception:
+                            pass
+                    break
         finally:
             if lock_token:
                 try:
                     self.queues.release_allocator_lock(compute_type_value, lock_token)
                 except Exception as exc:
-                    if not reserved_tickets:
+                    if not work:
                         raise
                     logger.warning(
                         "[Warning] operation=allocator_lock_release compute_type=%s "
                         "claims=%s reason=%r",
                         compute_type_value,
-                        len(reserved_tickets),
+                        len(work),
                         str(exc),
                     )
 
-        if not reserved_tickets:
-            return result
-
-        executions: List[Dict] = []
-        if mount_concurrency <= 1 or len(reserved_tickets) == 1:
-            for ticket in reserved_tickets:
-                executions.append(self._safe_execute_allocated_ticket(ticket, compute_type_value))
-        else:
-            with ThreadPoolExecutor(
-                max_workers=mount_concurrency,
-                thread_name_prefix="waitq-mount",
-            ) as executor:
-                futures = [
-                    executor.submit(self._safe_execute_allocated_ticket, ticket, compute_type_value)
-                    for ticket in reserved_tickets
-                ]
-                for future in as_completed(futures):
-                    executions.append(future.result())
-
-        for execution in executions:
-            status = execution.get("status")
-            if status == "assigned":
-                result["assigned"] += 1
-            elif status == "queued":
-                result["queued"] += 1
-            elif status == "failed":
-                result["failed"] += 1
-            else:
-                result["errors"].append(execution)
+        for ticket, idle_pod, committed in work:
+            threading.Thread(
+                target=self._safe_execute_direct_ticket,
+                args=(ticket, compute_type_value, idle_pod, committed),
+                name=f"direct-{str(ticket.get('ticket_short') or ticket.get('ticket_id') or '')[:10]}",
+                daemon=True,
+            ).start()
+        if not work:
+            result["queued"] += 1
         return result
+
+    def _claim_idle_for_ticket(
+        self, ticket: Dict, idle_iter
+    ) -> Tuple[Optional[str], Optional[Dict], bool]:
+        """남은 idle 파드를 차례로 이 티켓에 묶어 본다.
+
+        (묶은 파드 이름 또는 None, 마운트만 남은 확정 티켓 또는 None, 티켓이 살아 있나).
+        PATCH 가 resourceVersion 을 test 하므로, 그사이 다른 쪽이 가져갔거나 리더가
+        지우기 시작한 파드는 실패하고 다음 것으로 넘어간다.
+
+        Ready 인 파드는 방금 읽은 목록에 IP 와 Ready 시각이 있으므로 여기서 바로 할당을
+        확정한다(Deployment 버퍼와 같다). 락 밖에서 파드를 다시 읽는 왕복이 없다.
+        """
+        ticket_id = ticket["ticket_id"]
+        claim_token = ticket.get("claim_token") or ""
+        user_pod = ticket.get("user_pod") or "unknown"
+        for pod in idle_iter:
+            if not self.provider.claim_idle_pod(
+                pod["name"],
+                pod.get("resource_version") or "",
+                user_pod,
+                ticket_id,
+                claim_token,
+                expected_annotations=pod.get("annotations"),
+            ):
+                continue
+            if pod["ready"] and pod.get("ip"):
+                ready_at = pod.get("ready_at")
+                recorded = self.tickets.mark_allocating(
+                    ticket_id,
+                    compute_pod=pod["name"],
+                    compute_pod_ip=pod["ip"],
+                    claimed_by=ticket.get("claimed_by"),
+                    claim_token=claim_token,
+                    compute_ready_at=ready_at,
+                    compute_available_at=ready_at,
+                )
+                committed = recorded
+            else:
+                recorded = self.tickets.record_allocating_pod(
+                    ticket_id,
+                    compute_pod=pod["name"],
+                    claim_token=claim_token,
+                )
+                committed = None
+            if not self._owns_claim(recorded, claim_token):
+                # 티켓이 그사이 취소됐다. 묶은 파드는 버린다(요청 하나에 하나만 쓴다).
+                try:
+                    self.provider.release_pod(pod["name"])
+                except Exception:
+                    pass
+                return None, None, False
+            return pod["name"], committed, True
+        return None, None, True
+
+    def _safe_execute_direct_ticket(
+        self,
+        ticket: Dict,
+        compute_type_value: str,
+        idle_pod: Optional[str],
+        committed: Optional[Dict] = None,
+    ) -> Dict:
+        if committed is None:
+            try:
+                committed, response = self._provision_direct_ticket(ticket, idle_pod)
+            except Exception as exc:
+                logger.exception(
+                    "[Failed] operation=provision_direct_ticket ticket_id=%s compute_type=%s reason=%r",
+                    ticket.get("ticket_id"),
+                    compute_type_value,
+                    str(exc),
+                )
+                return self._handle_provision_failure(ticket=ticket, compute_pod=idle_pod or "", exc=exc)
+            if committed is None:
+                return response  # 이미 정리를 마친 응답(소유를 잃음, 재시도 등)
+        # 마운트 단계. 여기서 난 예외로 파드를 지우지 않는다 - 할당이 확정된 뒤일 수 있다
+        # (mark_assigned 뒤 문맥 기록 실패 등). 남은 정리는 stale 회수와 고아 정리가 한다.
+        try:
+            return self._execute_allocated_ticket(committed)
+        except Exception as exc:
+            logger.exception(
+                "[Failed] operation=execute_allocated_ticket ticket_id=%s compute_type=%s reason=%r",
+                ticket.get("ticket_id"),
+                compute_type_value,
+                str(exc),
+            )
+            return {
+                "ticket_id": ticket.get("ticket_id", ""),
+                "compute_type": compute_type_value,
+                "status": "error",
+                "message": str(exc),
+            }
+
+    def _provision_direct_ticket(
+        self, ticket: Dict, idle_pod: Optional[str]
+    ) -> Tuple[Optional[Dict], Optional[Dict]]:
+        """파드를 마련해(새로 만들거나 부팅 중인 idle 을 기다려) 할당을 확정한다.
+
+        (확정된 티켓, None) 이면 호출자가 마운트한다. (None, 응답) 이면 이미 정리를
+        마쳤다(소유를 잃음, 재시도로 돌려보냄 등).
+        """
+        ticket_id = ticket.get("ticket_id", "")
+        claim_token = ticket.get("claim_token") or ""
+        compute_pod = idle_pod or ""
+
+        try:
+            if not compute_pod:
+                compute_pod = self._reserve_request_pod(ticket)
+                try:
+                    self.provider.create_pod_for_ticket(ticket, compute_pod)
+                except Exception as exc:
+                    status = getattr(exc, "status", None)
+                    if isinstance(status, int) and 400 <= status < 500:
+                        # 확정된 거절이라 만들어지지 않았다. 생성 중 목록의 자리를 돌려준다.
+                        # 응답 없음·5xx 는 서버에 반영됐을 수 있어 그대로 둔다(상한이 지나면
+                        # 빠진다). 409(이미 있음)는 공급자가 상태 없는 오류로 바꿔 올린다.
+                        try:
+                            self.queues.remove_pending_creates(
+                                ticket.get("compute_type"), [compute_pod]
+                            )
+                        except Exception:
+                            pass
+                    raise
+            ready_pod = self.provider.wait_pod_ready(
+                compute_pod,
+                keep_claim=lambda: self.tickets.extend_allocation_deadline(ticket_id, claim_token),
+                # 미리 만든 파드는 이미 있다. 사라졌으면 기다리지 않는다.
+                must_exist=bool(idle_pod),
+            )
+            compute_pod_ip = getattr(ready_pod.status, "pod_ip", "") or self.provider.get_pod_ip(compute_pod) or ""
+            if not compute_pod_ip:
+                raise RuntimeError("Compute IP unavailable after pod Ready")
+
+            compute_ready_at = self.provider._pod_ready_at(ready_pod)
+            committed = self.tickets.mark_allocating(
+                ticket_id,
+                compute_pod=compute_pod,
+                compute_pod_ip=compute_pod_ip,
+                claimed_by=ticket.get("claimed_by"),
+                claim_token=claim_token,
+                compute_ready_at=compute_ready_at,
+                compute_available_at=compute_ready_at if idle_pod else None,
+            )
+            if not self._owns_claim(committed, claim_token):
+                try:
+                    self.provider.release_pod(compute_pod)
+                except Exception:
+                    pass
+                current = self.tickets.get_ticket(ticket_id)
+                return None, ticket_format.ticket_response(
+                    current or ticket,
+                    "Ticket no longer owns the allocation",
+                )
+            return committed, None
+        except AllocationClaimLost:
+            # 지금 티켓을 쥔 쪽(취소, 또는 claim 만료 뒤 다른 작업자)이 뒤를 맡는다.
+            # 우리 파드만 버린다.
+            try:
+                self.provider.release_pod(compute_pod)
+            except Exception:
+                pass
+            current = self.tickets.get_ticket(ticket_id)
+            return None, ticket_format.ticket_response(
+                current or ticket,
+                "Ticket no longer owns the allocation",
+            )
+        except Exception as exc:
+            return None, self._handle_provision_failure(ticket=ticket, compute_pod=compute_pod, exc=exc)
+
+    def _reserve_request_pod(self, ticket: Dict) -> str:
+        """요청 파드의 자리를 생성 중 목록에 옮겨 놓고 이름을 돌려준다.
+
+        claim 은 취소되거나 만료되는 순간 N 계산에서 빠진다. 그 뒤에 이 스레드가 파드를
+        만들면 그 자리를 다른 claim 이 이미 받아 N 을 넘는다(가짜 클러스터 동시 실행
+        테스트에서 재현했다. cold start 도 같은 틈이 있다). 그래서 이름을 티켓과 생성 중
+        목록에 먼저 올리고, 소유를 다시 확인한 뒤에 만든다. 확인 뒤의 취소는 생성 중
+        목록이 자리를 쥐고 있고, 확인 전의 취소는 여기서 멈춘다.
+        """
+        ticket_id = ticket.get("ticket_id", "")
+        claim_token = ticket.get("claim_token") or ""
+        compute_type = ticket.get("compute_type")
+        pod_name = self.provider.request_pod_name(ticket)
+        recorded = self.tickets.record_allocating_pod(
+            ticket_id,
+            compute_pod=pod_name,
+            claim_token=claim_token,
+        )
+        if self._owns_claim(recorded, claim_token):
+            # drain 이 락 안에서 이미 올렸다. 다시 올려 상한(생성 응답을 기다릴 수 있는
+            # 시간)을 지금부터 센다.
+            self.queues.add_pending_create(compute_type, pod_name)
+            if self._owns_claim(self.tickets.get_ticket(ticket_id), claim_token):
+                return pod_name
+        # 만들지 않는다. drain 이 잡아 둔 자리도 돌려준다.
+        self.queues.remove_pending_creates(compute_type, [pod_name])
+        raise AllocationClaimLost(f"Ticket lost its claim before creating {pod_name}")
+
+    @staticmethod
+    def _owns_claim(ticket: Optional[Dict], claim_token: str) -> bool:
+        return (
+            bool(ticket)
+            and ticket.get("status") == "allocating"
+            and (not claim_token or ticket.get("claim_token") == claim_token)
+        )
+
+    def _handle_provision_failure(
+        self,
+        *,
+        ticket: Dict,
+        compute_pod: str,
+        exc: Exception,
+    ) -> Dict:
+        """파드를 만들거나 Ready 를 기다리다 실패했다(cold start 와 같다).
+
+        파드는 지우고 티켓은 재시도 예산 안에서 큐로 돌려보낸다. 미리 만든(idle) 파드가
+        부팅 중에 죽은 경우도 여기로 온다 - 요청은 실패시키지 않고 다시 줄 세운다.
+        """
+        ticket_id = ticket.get("ticket_id", "")
+        claim_token = ticket.get("claim_token") or ""
+        reason = f"Compute provisioning failed: {exc}"
+
+        current = self.tickets.get_ticket(ticket_id)
+        in_use = (
+            bool(current)
+            and str(current.get("status") or "").lower() == "assigned"
+            and (current.get("compute_pod") or "") == compute_pod
+        )
+        if compute_pod and not in_use:
+            try:
+                self.provider.release_pod(compute_pod)
+            except Exception as release_exc:
+                logger.warning(
+                    "[Warning] operation=release_after_provision_error ticket_id=%s compute_pod=%s reason=%r",
+                    ticket_id,
+                    compute_pod,
+                    str(release_exc),
+                )
+
+        if not current:
+            return {
+                "ticket_id": ticket_id,
+                "compute_type": self.queues.normalize_compute_type(ticket.get("compute_type")),
+                "status": "failed",
+                "message": reason,
+            }
+
+        current_status = str(current.get("status") or "").lower()
+        if current_status in {"assigned", "failed", "cancelled"}:
+            return ticket_format.ticket_response(current, reason)
+
+        if int(current.get("retry_count") or 0) < int(current.get("max_retries") or self.queues.max_retries):
+            requeued = self.tickets.requeue_ticket(
+                ticket_id,
+                reason=reason,
+                increment_retry=True,
+                claim_token=claim_token,
+            )
+            requeued_ticket = requeued if requeued and requeued.get("status") == "queued" else self.tickets.get_ticket(ticket_id)
+            if requeued_ticket:
+                ticket_format.log_queue_event(
+                    "debug",
+                    "Requeued",
+                    requeued_ticket,
+                    include_ticket_fields=(),
+                    compute_pod=compute_pod,
+                    compute_pod_ip=requeued_ticket.get("compute_pod_ip"),
+                    retry_count=requeued_ticket.get("retry_count"),
+                    reason=reason,
+                )
+            return ticket_format.ticket_response(requeued_ticket, reason)
+
+        failed = self.tickets.mark_failed(ticket_id, reason, claim_token=claim_token)
+        failed_ticket = failed if failed and failed.get("status") == "failed" else self.tickets.get_ticket(ticket_id)
+        if failed_ticket:
+            ticket_format.log_queue_event(
+                "info",
+                "Failed",
+                failed_ticket,
+                include_ticket_fields=(),
+                compute_pod=compute_pod,
+                compute_pod_ip=failed_ticket.get("compute_pod_ip"),
+                retry_count=failed_ticket.get("retry_count"),
+                reason=reason,
+            )
+        return ticket_format.ticket_response(failed_ticket, reason)
 
     def _compute_wait_queue_batch_plan(self) -> Tuple[int, int]:
         """Return (effective_batch, mount_concurrency) clamped against TTL."""
@@ -385,262 +648,6 @@ class ComputeAllocator:
         effective_batch = min(configured_batch, safe_ceiling)
         effective_concurrency = min(configured_concurrency, effective_batch)
         return effective_batch, effective_concurrency
-
-    def _mark_compute_unavailable_started(self, compute_type_value: str) -> None:
-        try:
-            self.queues.mark_compute_unavailable_started(compute_type_value)
-        except QueueUnavailableError as exc:
-            logger.debug(
-                "[ComputeUnavailableMarkSkipped] compute_type=%s reason=%r",
-                compute_type_value,
-                str(exc),
-            )
-
-    def _safe_execute_allocated_ticket(self, ticket: Dict, compute_type_value: str) -> Dict:
-        try:
-            return self._execute_allocated_ticket(ticket)
-        except Exception as exc:
-            logger.exception(
-                "[Failed] operation=execute_allocated_ticket ticket_id=%s compute_type=%s reason=%r",
-                ticket.get("ticket_id"),
-                compute_type_value,
-                str(exc),
-            )
-            return {
-                "ticket_id": ticket.get("ticket_id", ""),
-                "compute_type": compute_type_value,
-                "status": "error",
-                "message": str(exc),
-            }
-
-    def _lower_replicas_for_claims(
-        self,
-        *,
-        compute_type_value: str,
-        policy: Dict,
-        claims: int,
-        lock_token: str,
-    ) -> bool:
-        """Keep replicas within the latest N - assigned room while locked.
-
-        A claim removes its Pod from the Deployment selector, allowing a
-        ReplicaSet backfill. Re-list before each conditional patch because a
-        concurrent release can increase room during the claim batch. False
-        means the allocator lock expired, so the caller must not patch.
-        """
-        if claims <= 0:
-            return True
-        deployment_name = policy.get("deployment_name")
-        if not deployment_name:
-            return True
-        for _ in range(3):
-            if not self.queues.renew_allocator_lock(compute_type_value, lock_token):
-                return False
-            snapshot = self.provider.list_buffer_snapshot(
-                compute_type=compute_type_value,
-            )
-            assigned = int(snapshot["buffer_assigned"])
-            room = max(0, int(policy["N"]) - assigned)
-            current = int(self.provider.read_deployment_replicas(deployment_name))
-            if current <= room:
-                return True
-            if not self.queues.renew_allocator_lock(compute_type_value, lock_token):
-                return False
-            if self.provider.lower_deployment_replicas(
-                deployment_name,
-                current,
-                room,
-            ):
-                logger.info(
-                    "[BufferSlotReturned] compute_type=%s replicas=%s->%s claims=%s "
-                    "assigned=%s room=%s N=%s",
-                    compute_type_value,
-                    current,
-                    room,
-                    claims,
-                    assigned,
-                    room,
-                    policy["N"],
-                )
-                return True
-        logger.warning(
-            "[Warning] operation=buffer_slot_return compute_type=%s claims=%s "
-            "reason=%r",
-            compute_type_value,
-            claims,
-            "replica compare-and-swap retries exhausted",
-        )
-        return True
-
-    def _reserve_compute_pod_for_ticket(
-        self,
-        ticket: Dict,
-        compute_type_value: str,
-        candidate_pods: List[Dict],
-        reserved_pods: set,
-        result: Dict,
-    ) -> Optional[Dict]:
-        ticket_id = ticket["ticket_id"]
-        claim_token = ticket.get("claim_token")
-        user_pod_identity = ticket.get("user_pod") or "unknown"
-
-        selected_candidate = None
-        for candidate in candidate_pods:
-            candidate_name = candidate["name"]
-            if candidate_name in reserved_pods:
-                continue
-            try:
-                self.provider.assign_pod(
-                    candidate_name,
-                    user_pod_identity,
-                    expected_resource_version=candidate.get("resource_version"),
-                    ticket_id=ticket_id,
-                    claim_token=claim_token or "",
-                    expected_annotations=candidate.get("annotations"),
-                )
-            except PodConflictError as exc:
-                ticket_format.log_queue_event(
-                    "debug",
-                    "ComputeContention",
-                    ticket,
-                    include_ticket_fields=(),
-                    compute_pod=candidate_name,
-                    reason=f"Compute contention: {exc}",
-                )
-                continue
-            selected_candidate = candidate
-            compute_pod = candidate_name
-            reserved_pods.add(compute_pod)
-            break
-
-        if not selected_candidate:
-            self.tickets.requeue_ticket(
-                ticket_id,
-                reason="No available compute pods",
-                increment_retry=False,
-                claim_token=claim_token,
-            )
-            result["queued"] += 1
-            return None
-
-        compute_ready_at = selected_candidate.get("ready_at")
-        compute_available_at = self._pop_compute_available_at(compute_pod)
-        compute_pod_ip = selected_candidate.get("ip") or ""
-        if not compute_pod_ip:
-            reserved_pods.discard(compute_pod)
-            if not self._release_before_ticket_transition(
-                compute_pod,
-                ticket_id,
-                "release_missing_compute_ip",
-            ):
-                result["errors"].append(
-                    {
-                        "ticket_id": ticket_id,
-                        "compute_type": compute_type_value,
-                        "error": (
-                            "Compute IP unavailable; Pod cleanup will be "
-                            "retried before the ticket is requeued"
-                        ),
-                    }
-                )
-                return None
-            self.tickets.requeue_ticket(
-                ticket_id,
-                reason="Compute IP unavailable",
-                increment_retry=False,
-                claim_token=claim_token,
-            )
-            ticket_format.log_queue_event(
-                "debug",
-                "Requeued",
-                ticket,
-                include_ticket_fields=(),
-                compute_pod=compute_pod,
-                reason="Compute IP unavailable",
-            )
-            result["queued"] += 1
-            return None
-
-        try:
-            committed = self.tickets.mark_allocating(
-                ticket_id,
-                compute_pod=compute_pod,
-                compute_pod_ip=compute_pod_ip,
-                claimed_by=ticket.get("claimed_by"),
-                claim_token=claim_token,
-                compute_ready_at=compute_ready_at,
-                compute_available_at=compute_available_at,
-            )
-        except Exception as exc:
-            reserved_pods.discard(compute_pod)
-            released = self._release_before_ticket_transition(
-                compute_pod,
-                ticket_id,
-                "reservation_cleanup",
-            )
-            if released:
-                try:
-                    self.tickets.requeue_ticket(
-                        ticket_id,
-                        reason="Compute reservation commit failed",
-                        increment_retry=False,
-                        claim_token=claim_token,
-                    )
-                    result["queued"] += 1
-                except Exception:
-                    result["errors"].append(
-                        {
-                            "ticket_id": ticket_id,
-                            "compute_type": compute_type_value,
-                            "error": (
-                                "Reservation commit failed; stale recovery "
-                                "required"
-                            ),
-                        }
-                    )
-            else:
-                result["errors"].append(
-                    {
-                        "ticket_id": ticket_id,
-                        "compute_type": compute_type_value,
-                        "error": (
-                            "Reservation cleanup failed; ticket remains "
-                            "allocating for stale recovery"
-                        ),
-                    }
-                )
-            logger.warning(
-                "[Warning] operation=reservation_commit ticket_id=%s "
-                "compute_pod=%s reason=%r",
-                ticket_id,
-                compute_pod,
-                str(exc),
-            )
-            return None
-        if not committed or committed.get("status") != "allocating":
-            try:
-                self.provider.release_pod(compute_pod)
-            except Exception:
-                pass
-            reserved_pods.discard(compute_pod)
-            ticket_format.log_queue_event(
-                "debug",
-                "Requeued",
-                committed or ticket,
-                include_ticket_fields=(),
-                compute_pod=compute_pod,
-                reason="Ticket lost ownership before compute commit",
-            )
-            result["errors"].append(
-                {
-                    "ticket_id": ticket_id,
-                    "compute_type": compute_type_value,
-                    "error": "Ticket lost ownership before compute commit",
-                }
-            )
-            return None
-
-        return committed
 
     def _execute_allocated_ticket(self, ticket: Dict) -> Dict:
         ticket_id = ticket.get("ticket_id", "")
@@ -872,14 +879,3 @@ class ComputeAllocator:
                 str(exc),
             )
             return False
-
-    def _pop_compute_available_at(self, compute_pod: str) -> str:
-        try:
-            return self.queues.pop_compute_available_at(compute_pod)
-        except QueueUnavailableError as exc:
-            logger.debug(
-                "[ComputeAvailableLookupSkipped] compute_pod=%s reason=%r",
-                compute_pod,
-                str(exc),
-            )
-            return ""

@@ -8,8 +8,6 @@ overlay="${DEPLOY_OVERLAY}"
 stage_label="${DEPLOY_STAGE_LABEL}"
 buffer_reserve="${BUFFER_RESERVE}"
 buffer_capacity="${BUFFER_CAPACITY}"
-buffer_reserve_annotation='k8s-dynamic-allocator/buffer-reserve'
-buffer_capacity_annotation='k8s-dynamic-allocator/buffer-capacity'
 rendered="${WORKSPACE}/.kda-deploy-${BUILD_NUMBER}.yaml"
 kustomization="${overlay}/kustomization.yaml"
 kustomization_backup="${WORKSPACE}/.kda-deploy-kustomization-${BUILD_NUMBER}.bak"
@@ -40,6 +38,12 @@ for policy_value in "${buffer_reserve}" "${buffer_capacity}"; do
 done
 if [ "${buffer_reserve}" -gt "${buffer_capacity}" ]; then
     echo "[PreflightFailed] buffer policy must satisfy R <= N: R=${buffer_reserve} N=${buffer_capacity}"
+    exit 1
+fi
+# 이 arm 은 요청마다 파드를 만들 수도 있으므로 N=0 이면 어떤 요청도 파드를 받지
+# 못한다. 오류 없이 run 하나를 통째로 버리게 되므로 여기서 막는다(cold arm 과 같다).
+if [ "${buffer_capacity}" -lt 1 ]; then
+    echo "[PreflightFailed] the direct warm buffer needs N>=1: N=${buffer_capacity}"
     exit 1
 fi
 
@@ -223,72 +227,25 @@ apply_stage controller
 kubectl rollout status deployment/controller \
     -n "${namespace}" --timeout=5m
 
-echo '[Deploy] Wait for controller-managed compute-general Deployment'
-attempt=0
-while ! kubectl get deployment/compute-general -n "${namespace}" >/dev/null 2>&1; do
-    attempt=$((attempt + 1))
-    if [ "${attempt}" -ge 60 ]; then
-        echo '[DeployFailed] deployment/compute-general was not created within 120 seconds'
-        exit 1
-    fi
-    sleep 2
-done
-
-# R/N live on the Deployment's metadata annotations. The controller watches
-# them and never overwrites an operator-supplied value, so applying the build
-# parameters here is enough - no controller restart and no pod churn.
-echo "[Deploy] Apply buffer policy R=${buffer_reserve} N=${buffer_capacity}"
-kubectl annotate deployment/compute-general \
-    "${buffer_reserve_annotation}=${buffer_reserve}" \
-    "${buffer_capacity_annotation}=${buffer_capacity}" \
-    -n "${namespace}" --overwrite
-
-# The controller creates compute-general from its manifest only when it is
-# missing, so template and rollout changes in the manifest have to be carried
-# onto the live Deployment here. Keep the current replicas and R/N annotations.
-compute_manifest="${WORKSPACE}/controller/manifests/compute-general.yaml"
-compute_node_selector=$(kubectl create --dry-run=client -f "${compute_manifest}" \
-    -o jsonpath='{.spec.template.spec.nodeSelector}')
-compute_resources=$(kubectl create --dry-run=client -f "${compute_manifest}" \
-    -o jsonpath='{.spec.template.spec.containers[?(@.name=="compute-agent")].resources}')
-compute_scheduling_gates=$(kubectl create --dry-run=client -f "${compute_manifest}" \
-    -o jsonpath='{.spec.template.spec.schedulingGates}')
-compute_template_annotations=$(kubectl create --dry-run=client -f "${compute_manifest}" \
-    -o jsonpath='{.spec.template.metadata.annotations}')
-compute_strategy=$(kubectl create --dry-run=client -f "${compute_manifest}" \
-    -o jsonpath='{.spec.strategy}')
-compute_strategy_type=$(kubectl create --dry-run=client -f "${compute_manifest}" \
-    -o jsonpath='{.spec.strategy.type}')
-compute_max_surge=$(kubectl create --dry-run=client -f "${compute_manifest}" \
-    -o jsonpath='{.spec.strategy.rollingUpdate.maxSurge}')
-compute_max_unavailable=$(kubectl create --dry-run=client -f "${compute_manifest}" \
-    -o jsonpath='{.spec.strategy.rollingUpdate.maxUnavailable}')
-if [ -z "${compute_node_selector}" ] || [ -z "${compute_resources}" ] || \
-   [ -z "${compute_scheduling_gates}" ] || [ -z "${compute_template_annotations}" ] || \
-   [ -z "${compute_strategy}" ]; then
-    echo "[DeployFailed] ${compute_manifest} must set nodeSelector, compute-agent resources, schedulingGates, template annotations, and strategy"
-    exit 1
-fi
-if [ "${compute_scheduling_gates}" != '[{"name":"k8s-dynamic-allocator/warm-slot"}]' ] || \
-   [ "${compute_strategy_type}" != RollingUpdate ] || \
-   [ "${compute_max_surge}" != 0 ] || \
-   [ "${compute_max_unavailable}" != 1 ] || \
-   ! echo "${compute_template_annotations}" | grep -Fq '"k8s-dynamic-allocator/warm-slot-released-at":""' || \
-   ! echo "${compute_template_annotations}" | grep -Fq '"controller.kubernetes.io/pod-deletion-cost":"-100"'; then
-    echo "[DeployFailed] ${compute_manifest} gate, deletion cost, or rollout strategy is unsafe"
-    exit 1
-fi
-echo "[Deploy] Sync compute-general image, scheduling gate, rollout strategy, nodeSelector, and resources"
-# Strategy and the gated template change together. With maxSurge=0 and
-# maxUnavailable=1, the first old Pod can leave before the new gated Pod needs
-# to become Ready; a 0-unavailable rollout would deadlock at the initial R.
-kubectl patch deployment/compute-general -n "${namespace}" --type=strategic \
-    -p "{\"spec\":{\"strategy\":${compute_strategy},\"template\":{\"metadata\":{\"annotations\":${compute_template_annotations}},\"spec\":{\"schedulingGates\":${compute_scheduling_gates},\"nodeSelector\":${compute_node_selector},\"containers\":[{\"name\":\"compute-agent\",\"image\":\"${COMPUTE_POD_IMAGE}\",\"resources\":${compute_resources}}]}}}}"
-
-kubectl rollout status deployment/compute-general \
+# 이 arm 은 Deployment 를 쓰지 않는다. 컨트롤러가 R/N 을 env 에서 읽어 버퍼
+# 파드를 직접 만들고 지운다. 그래서 빌드 파라미터는 Deployment 어노테이션이
+# 아니라 컨트롤러 env 로 들어간다(cold start arm 과 같은 방식). 컨트롤러는 시작할
+# 때 읽으므로 env 를 바꾸면 한 번 더 rollout 한다.
+echo "[Deploy] Apply direct warm buffer policy R=${buffer_reserve} N=${buffer_capacity}"
+kubectl set env deployment/controller -n "${namespace}" \
+    "BUFFER_RESERVE=${buffer_reserve}" \
+    "BUFFER_CAPACITY=${buffer_capacity}"
+kubectl rollout status deployment/controller \
     -n "${namespace}" --timeout=5m
 
-echo '[Smoke] Wait for shared buffer policy to become active'
+# develop arm 의 Deployment 버퍼가 남아 있으면 0 으로 내린다. 지우지는 않는다 -
+# develop 으로 되돌릴 때 그대로 쓴다. 리더도 시작할 때와 주기적으로 같은 일을 하므로,
+# 이 계정에 scale 권한이 없어 실패해도 배포를 멈추지 않는다.
+if kubectl get deployment/compute-general -n "${namespace}" >/dev/null 2>&1; then
+    kubectl scale deployment/compute-general -n "${namespace}" --replicas=0 || echo '[Warning] could not scale compute-general to 0; the controller leader will'
+fi
+
+echo '[Smoke] Wait for the direct warm buffer to report its policy'
 attempt=0
 until kubectl exec -n "${namespace}" deployment/controller -- \
     python -c '
@@ -305,20 +262,19 @@ with urllib.request.urlopen(
 ) as response:
     status = json.load(response)
 
-general = (status.get("buffers") or {}).get("general") or {}
+# Deployment 가 없으므로 정책 캐시·깃발도 없다. 확인할 것은 컨트롤러가 이 arm 으로
+# 돌고 있고 받은 R/N 을 쓰고 있는가다.
 ready = (
-    status.get("policy_ready") is True
-    and general.get("policy_valid") is True
-    and general.get("policy_cached") is True
-    and general.get("R") == expected_r
-    and general.get("N") == expected_n
+    status.get("allocation_mode") == "warm_buffer_direct"
+    and status.get("R") == expected_r
+    and status.get("N") == expected_n
 )
 sys.exit(0 if ready else 1)
 ' "${buffer_reserve}" "${buffer_capacity}" >/dev/null
 do
     attempt=$((attempt + 1))
     if [ "${attempt}" -ge 40 ]; then
-        echo '[SmokeFailed] shared buffer policy was not active within 120 seconds'
+        echo '[SmokeFailed] direct warm buffer policy was not active within 120 seconds'
         kubectl exec -n "${namespace}" deployment/controller -- \
             python -c '
 import json
@@ -353,23 +309,19 @@ echo '[Smoke] Verify deployed images and service readiness'
 actual_controller_image=$(kubectl get deployment/controller \
     -n "${namespace}" \
     -o jsonpath='{.spec.template.spec.containers[?(@.name=="controller")].image}')
-actual_compute_image=$(kubectl get deployment/compute-general \
-    -n "${namespace}" \
-    -o jsonpath='{.spec.template.spec.containers[?(@.name=="compute-agent")].image}')
 actual_swlabssh_image=$(kubectl get deployment/swlabssh \
     -n "${namespace}" \
     -o jsonpath='{.spec.template.spec.containers[?(@.name=="swlabssh")].image}')
 
 test "${actual_controller_image}" = "${CONTROLLER_IMAGE}"
-test "${actual_compute_image}" = "${COMPUTE_POD_IMAGE}"
+# compute 이미지는 Deployment 에 실리지 않는다. 컨트롤러가 그 이미지로 파드를 직접
+# 만들므로 컨트롤러 env 가 기준이다(아래 runtime_compute_image).
 test "${actual_swlabssh_image}" = "${SWLABSSH_IMAGE}"
 
-actual_buffer_reserve=$(kubectl get deployment/compute-general \
-    -n "${namespace}" \
-    -o go-template="{{index .metadata.annotations \"${buffer_reserve_annotation}\"}}")
-actual_buffer_capacity=$(kubectl get deployment/compute-general \
-    -n "${namespace}" \
-    -o go-template="{{index .metadata.annotations \"${buffer_capacity_annotation}\"}}")
+actual_buffer_reserve=$(kubectl exec -n "${namespace}" deployment/controller -- \
+    sh -c 'printf "%s" "$BUFFER_RESERVE"')
+actual_buffer_capacity=$(kubectl exec -n "${namespace}" deployment/controller -- \
+    sh -c 'printf "%s" "$BUFFER_CAPACITY"')
 test "${actual_buffer_reserve}" = "${buffer_reserve}"
 test "${actual_buffer_capacity}" = "${buffer_capacity}"
 
@@ -419,5 +371,5 @@ test "${fluent_bit_desired}" -gt 0
 test "${fluent_bit_ready}" -eq "${fluent_bit_desired}"
 
 echo "[Success] image tag=${IMAGE_TAG}"
-echo "[Success] buffer policy R=${buffer_reserve} N=${buffer_capacity}"
+echo "[Success] direct warm buffer policy R=${buffer_reserve} N=${buffer_capacity}"
 echo "[Success] SSH endpoint=${DEPLOY_SSH_HOST}:${DEPLOY_SSH_PORT}"

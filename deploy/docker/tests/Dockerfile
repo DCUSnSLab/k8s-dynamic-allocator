@@ -30,8 +30,10 @@ RUN pip install --no-cache-dir --retries 10 --timeout 60 pyyaml
 
 # 레이아웃을 저장소 그대로 둬야 한다. 테스트는 __file__ 기준으로
 # parents[1] 에서 controller/services, controller/manifests 를,
-# parents[2] 에서 deploy/scripts/deploy.sh 를 읽는다.
+# parents[2] 에서 deploy/scripts/deploy.sh 와 deploy/base 를 읽는다.
 COPY controller /src/controller
 COPY deploy/scripts /src/deploy/scripts
+# 배포 계약 테스트가 컨트롤러 매니페스트(arm 이름, 동적 R 기본값)도 읽는다.
+COPY deploy/base /src/deploy/base
 
 RUN python -m unittest discover -s controller/tests -t controller/tests -v
