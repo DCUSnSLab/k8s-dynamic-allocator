@@ -31,38 +31,50 @@ class ComputeReleaser:
     def set_release_callback(self, on_released: Callable[[Optional[str]], None]) -> None:
         self._on_released = on_released
 
-    def release_compute_pod(self, compute_pod: str, request_context: Optional[Dict[str, object]] = None) -> Dict:
-        """Release a Compute Pod back to the buffer."""
-        return self._release(compute_pod, request_context, unmount=True)
+    def release_compute_pod(
+        self,
+        compute_pod: str,
+        request_context: Optional[Dict[str, object]] = None,
+        expected_status: Optional[str] = None,
+    ) -> Dict:
+        """Release a Compute Pod back to the buffer.
+
+        expected_status 는 호출자(정리)가 마지막으로 본 파드 상태다. 그 뒤 바뀐 파드는
+        건드리지 않는다(아래 _release_once).
+        """
+        return self._release(compute_pod, request_context, unmount=True, expected_status=expected_status)
 
     def release_unreachable_compute_pod(
         self,
         compute_pod: str,
         request_context: Optional[Dict[str, object]] = None,
+        expected_status: Optional[str] = None,
     ) -> Dict:
         """Release a Compute Pod whose agent is already known to be silent.
 
         Skips the unmount call, which would wait out its full timeout before
         failing anyway. Everything else matches an ordinary release.
         """
-        return self._release(compute_pod, request_context, unmount=False)
+        return self._release(compute_pod, request_context, unmount=False, expected_status=expected_status)
 
     def _release(
         self,
         compute_pod: str,
         request_context: Optional[Dict[str, object]],
         unmount: bool,
+        expected_status: Optional[str] = None,
     ) -> Dict:
         # Tags this thread with the ticket's label so its own log lines attribute
         # correctly; the caller's label comes back once the release is done.
         with request_label_scope():
-            return self._release_with_retries(compute_pod, request_context, unmount)
+            return self._release_with_retries(compute_pod, request_context, unmount, expected_status)
 
     def _release_with_retries(
         self,
         compute_pod: str,
         request_context: Optional[Dict[str, object]],
         unmount: bool,
+        expected_status: Optional[str] = None,
     ) -> Dict:
         release_started_ms = int(time.time() * 1000)
         request_context_value = dict(request_context or {})
@@ -88,6 +100,13 @@ class ComputeReleaser:
                     "status": "success",
                     "message": f"Compute already released: {compute_pod}",
                 }
+
+            # 정리는 몇 초 전의 목록으로 정한다. 그사이 NotReady 였던 idle 이 Ready 로 돌아와
+            # 할당됐으면 그 파드는 이제 다른 요청의 것이다. 방금 읽은 상태로 확인한다(추가
+            # 왕복 없음). 요청 컨텍스트는 지우지 않는다 - 새 주인의 것일 수 있다.
+            pod_status = labels.get(self.provider.LABEL_STATUS)
+            if expected_status and pod_status != expected_status:
+                return self._ignore_release(compute_pod, expected_status, pod_status, "stale_snapshot")
 
             assigned_context = dict(request_context_value)
             # An empty dict means the caller already looked and found nothing.
@@ -129,7 +148,19 @@ class ComputeReleaser:
                         str(exc),
                     )
 
-            released_now = self.provider.release_pod(compute_pod)
+            if pod_status == self.provider.STATUS_IDLE:
+                # idle 은 읽은 버전을 전제로 지운다. 읽은 뒤 할당(claim PATCH)이 끼어들면 버전이
+                # 바뀌어 지워지지 않는다(409). 버전만 바뀐 경우(kubelet 상태 갱신)는 다음 정리가
+                # 다시 본다.
+                released_now = self.provider.delete_idle_pod(
+                    compute_pod,
+                    getattr(pod.metadata, "uid", "") or "",
+                    getattr(pod.metadata, "resource_version", "") or "",
+                )
+                if not released_now:
+                    return self._ignore_release(compute_pod, expected_status or "", pod_status, "changed_before_delete")
+            else:
+                released_now = self.provider.release_pod(compute_pod)
             if not released_now:
                 logger.debug("[Released] compute_pod=%s status=already_released_or_terminating", compute_pod)
                 cleanup_context = True
@@ -166,7 +197,7 @@ class ComputeReleaser:
             for attempt in range(1, self._RELEASE_MAX_ATTEMPTS + 1):
                 try:
                     response = _release_once()
-                    if response.get("status") == "success":
+                    if response.get("status") == "success" and response.get("outcome") != "ignored":
                         self._on_released(released_compute_type)
                     return response
                 except Exception as exc:
@@ -187,6 +218,21 @@ class ComputeReleaser:
         finally:
             if cleanup_context:
                 self.clear_assigned_request_context_best_effort(compute_pod)
+
+    @staticmethod
+    def _ignore_release(compute_pod: str, expected_status: str, pod_status: Optional[str], reason: str) -> Dict:
+        logger.info(
+            "[ReleaseIgnored] compute_pod=%s expected_status=%s pod_status=%s reason=%s",
+            compute_pod,
+            expected_status or "-",
+            pod_status or "-",
+            reason,
+        )
+        return {
+            "status": "success",
+            "outcome": "ignored",
+            "message": f"Release ignored ({reason}): {compute_pod}",
+        }
 
     def get_assigned_request_context(self, compute_pod: str) -> Optional[Dict[str, object]]:
         return self.tickets.get_assigned_request_context(compute_pod)

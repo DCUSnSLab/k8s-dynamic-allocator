@@ -203,20 +203,24 @@ class ComputeManager:
         self,
         compute_pod: str,
         request_context: Optional[Dict[str, object]] = None,
+        expected_status: Optional[str] = None,
     ) -> Dict:
         return self.releaser.release_compute_pod(
             compute_pod=compute_pod,
             request_context=request_context,
+            expected_status=expected_status,
         )
 
     def release_unreachable_compute_pod(
         self,
         compute_pod: str,
         request_context: Optional[Dict[str, object]] = None,
+        expected_status: Optional[str] = None,
     ) -> Dict:
         return self.releaser.release_unreachable_compute_pod(
             compute_pod=compute_pod,
             request_context=request_context,
+            expected_status=expected_status,
         )
 
     def process_wait_queues(self, compute_type: Optional[str] = None) -> Dict:

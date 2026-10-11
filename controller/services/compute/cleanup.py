@@ -73,18 +73,28 @@ class ComputeCleanup:
                     reason,
                 )
                 unready = reason.startswith("not_ready")
+                # 이 목록은 몇 초 전 것이다. 반납이 다시 읽어 상태가 바뀌었으면(예: NotReady
+                # idle 이 회복해 할당됐다) 손대지 않는다.
+                # 상태 라벨이 없는 파드(unknown)는 기대할 상태가 없다.
+                expected_status = pod_info.get("buffer_status")
+                if expected_status not in (self.provider.STATUS_IDLE, self.provider.STATUS_ASSIGNED):
+                    expected_status = None
                 if unready:
                     result = self.compute_manager.release_unreachable_compute_pod(
                         compute_pod,
                         request_context=request_context,
+                        expected_status=expected_status,
                     )
                 else:
                     result = self.compute_manager.release_compute_pod(
                         compute_pod,
                         request_context=request_context,
+                        expected_status=expected_status,
                     )
 
             if result["status"] == "success":
+                if result.get("outcome") == "ignored":
+                    continue
                 released.append(compute_pod)
                 if unready:
                     unready_released.append(compute_pod)
