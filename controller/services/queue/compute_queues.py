@@ -739,22 +739,33 @@ class ComputeQueues:
             count += 1
         return count
 
-    def _pending_create_key(self, compute_type: str) -> str:
-        return f"{self.prefix}:direct-creating:{compute_type}"
+    # 생성 중 예약은 종류별로 따로 둔다. 파드가 아직 없어 어노테이션으로 구분할 수 없고,
+    # 이름도 두 종류가 같은 규칙이다. N 계산은 둘을 합쳐 세고, 리더는 미리 만드는 쪽만
+    # 버퍼로 센다.
+    PENDING_KINDS = ("idle", "request")
 
-    def add_pending_create(self, compute_type: str, pod_name: str) -> None:
-        """만들기로 한 idle 파드 이름을 생성 요청 전에 적는다. N 계산에 들어간다."""
+    def _pending_create_key(self, compute_type: str, kind: str) -> str:
+        if kind not in self.PENDING_KINDS:
+            raise ValueError(f"unknown pending create kind: {kind}")
+        return f"{self.prefix}:direct-creating:{kind}:{compute_type}"
+
+    def add_pending_create(self, compute_type: str, pod_name: str, kind: str) -> None:
+        """만들기로 한 파드 이름을 생성 요청 전에 적는다. N 계산에 들어간다."""
         client = self._redis_client()
         try:
             client.zadd(
-                self._pending_create_key(self.normalize_compute_type(compute_type)),
+                self._pending_create_key(self.normalize_compute_type(compute_type), kind),
                 {pod_name: time.time()},
             )
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to record pending create {pod_name}: {exc}") from exc
 
     def add_pending_creates_if_locked(
-        self, compute_type: str, pod_names: Iterable[str], lock_token: Optional[str]
+        self,
+        compute_type: str,
+        pod_names: Iterable[str],
+        lock_token: Optional[str],
+        kind: str = "idle",
     ) -> bool:
         """할당 락을 아직 쥐고 있을 때만 생성 예약을 한 번에 올린다. 못 올렸으면 False.
 
@@ -784,7 +795,7 @@ class ComputeQueues:
                     script,
                     2,
                     self._lock_key(compute_type_value),
-                    self._pending_create_key(compute_type_value),
+                    self._pending_create_key(compute_type_value, kind),
                     lock_token,
                     repr(time.time()),
                     *names,
@@ -793,7 +804,7 @@ class ComputeQueues:
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to record pending creates: {exc}") from exc
 
-    def refresh_pending_creates(self, compute_type: str, pod_names: Iterable[str]) -> set:
+    def refresh_pending_creates(self, compute_type: str, pod_names: Iterable[str], kind: str) -> set:
         """아직 남아 있는 생성 예약만 시각을 갱신하고, 남아 있던 이름을 돌려준다.
 
         예약을 세는 쪽(pending_creates)은 항상 만료된 것을 먼저 지우고 센다. 그래서
@@ -804,7 +815,7 @@ class ComputeQueues:
         names = [name for name in pod_names if name]
         if not names:
             return set()
-        key = self._pending_create_key(self.normalize_compute_type(compute_type))
+        key = self._pending_create_key(self.normalize_compute_type(compute_type), kind)
         now = time.time()
         client = self._redis_client()
         try:
@@ -821,24 +832,40 @@ class ComputeQueues:
         names = [name for name in pod_names if name]
         if not names:
             return
+        compute_type_value = self.normalize_compute_type(compute_type)
         client = self._redis_client()
         try:
-            client.zrem(self._pending_create_key(self.normalize_compute_type(compute_type)), *names)
+            # 이름은 종류와 관계없이 하나뿐이므로 두 목록에서 모두 지운다.
+            with client.pipeline(transaction=False) as pipe:
+                for kind in self.PENDING_KINDS:
+                    pipe.zrem(self._pending_create_key(compute_type_value, kind), *names)
+                pipe.execute()
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to clear pending creates: {exc}") from exc
 
-    def pending_creates(self, compute_type: str, max_age_seconds: float) -> List[str]:
-        """아직 목록에 안 보였을 수 있는 생성 요청 이름. 상한보다 오래된 것은 버린다.
+    def pending_creates(self, compute_type: str, max_age_seconds: float) -> Dict[str, str]:
+        """아직 목록에 안 보였을 수 있는 생성 요청 {이름: 종류}. 상한보다 오래된 것은 버린다.
 
         응답 없는 생성 요청이 서버에 남아 있을 수 있는 시간의 상한(apiserver 요청
         timeout)이 지나면 그 요청은 끝났다. 그때까지 목록에 없으면 만들어지지 않았다.
         """
-        key = self._pending_create_key(self.normalize_compute_type(compute_type))
+        compute_type_value = self.normalize_compute_type(compute_type)
         cutoff = time.time() - max(0.0, float(max_age_seconds))
         client = self._redis_client()
         try:
-            client.zremrangebyscore(key, "-inf", cutoff)
-            return list(client.zrange(key, 0, -1))
+            # 만료된 것을 먼저 지우고 센다. 그래서 "빈자리로 셌다" 는 곧 "지워졌다" 이다
+            # (refresh_pending_creates 가 지워진 예약을 되살리지 않는 근거).
+            with client.pipeline(transaction=True) as pipe:
+                for kind in self.PENDING_KINDS:
+                    key = self._pending_create_key(compute_type_value, kind)
+                    pipe.zremrangebyscore(key, "-inf", cutoff)
+                    pipe.zrange(key, 0, -1)
+                results = pipe.execute()
+            pending: Dict[str, str] = {}
+            for kind, names in zip(self.PENDING_KINDS, results[1::2]):
+                for name in names:
+                    pending[name] = kind
+            return pending
         except RedisError as exc:
             raise QueueUnavailableError(f"Failed to read pending creates: {exc}") from exc
 

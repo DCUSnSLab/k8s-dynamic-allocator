@@ -72,6 +72,12 @@ class FakePipeline:
     def zscore(self, key, member):
         self.ops.append(("zscore", key, member))
 
+    def zremrangebyscore(self, key, low, high):
+        self.ops.append(("zremrangebyscore", key, high))
+
+    def zrange(self, key, start, end):
+        self.ops.append(("zrange", key))
+
     def execute(self):
         self.client.round_trips += 1
         out = []
@@ -86,6 +92,15 @@ class FakePipeline:
                     changed += int(zset.get(member) != score)
                     zset[member] = score
                 out.append(changed)
+            elif op[0] == "zremrangebyscore":
+                zset = self.client.zsets.setdefault(op[1], {})
+                gone = [m for m, score in zset.items() if score <= op[2]]
+                for m in gone:
+                    del zset[m]
+                out.append(len(gone))
+            elif op[0] == "zrange":
+                zset = self.client.zsets.get(op[1], {})
+                out.append(sorted(zset, key=lambda m: zset[m]))
             elif op[0] == "zscore":
                 out.append(self.client.zsets.get(op[1], {}).get(op[2]))
             elif op[0] == "hgetall":
@@ -168,22 +183,32 @@ class DirectQueueTests(unittest.TestCase):
 class PendingCreateRefreshTests(unittest.TestCase):
     def test_refresh_keeps_only_reservations_that_still_exist(self):
         queue, client = make_queue()
-        key = queue._pending_create_key("general")
+        key = queue._pending_create_key("general", "idle")
         client.zsets[key] = {"warm-a": 100.0}
         with patch.object(time, "time", return_value=200.0):
-            alive = queue.refresh_pending_creates("general", ["warm-a", "warm-gone"])
+            alive = queue.refresh_pending_creates("general", ["warm-a", "warm-gone"], "idle")
         self.assertEqual(alive, {"warm-a"})
         self.assertEqual(client.zsets[key], {"warm-a": 200.0})  # 지워진 것을 되살리지 않는다
         self.assertEqual(client.round_trips, 1)
         self.assertEqual(client.transactions, [True])
 
+    def test_pending_creates_returns_kind_and_drops_expired(self):
+        queue, client = make_queue()
+        client.zsets[queue._pending_create_key("general", "idle")] = {"pod-a": 950.0, "pod-old": 100.0}
+        client.zsets[queue._pending_create_key("general", "request")] = {"pod-b": 990.0}
+        with patch.object(time, "time", return_value=1000.0):
+            pending = queue.pending_creates("general", 60.0)
+        self.assertEqual(pending, {"pod-a": "idle", "pod-b": "request"})
+        self.assertNotIn("pod-old", client.zsets[queue._pending_create_key("general", "idle")])
+        self.assertEqual(client.round_trips, 1)
+
     def test_same_score_refresh_still_counts_as_alive(self):
         """ZADD XX CH 는 점수가 같으면 0 을 돌려준다. 그것을 예약 상실로 보면 안 된다."""
         queue, client = make_queue()
-        key = queue._pending_create_key("general")
+        key = queue._pending_create_key("general", "idle")
         client.zsets[key] = {"warm-a": 300.0}
         with patch.object(time, "time", return_value=300.0):
-            alive = queue.refresh_pending_creates("general", ["warm-a"])
+            alive = queue.refresh_pending_creates("general", ["warm-a"], "idle")
         self.assertEqual(alive, {"warm-a"})
 
 

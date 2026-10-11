@@ -263,7 +263,7 @@ class DirectBufferReconciler:
                 # 락을 아직 쥐고 있을 때만 원자적으로 예약한다.
                 if time.monotonic() - started > self.lock_ttl_seconds / 2.0:
                     record["create_aborted"] = "slow_plan"
-                elif self.queues.add_pending_creates_if_locked(ct, plan["create"], lock_token):
+                elif self.queues.add_pending_creates_if_locked(ct, plan["create"], lock_token, "idle"):
                     to_create = list(plan["create"])
                 else:
                     record["create_aborted"] = "lock_lost"
@@ -335,7 +335,7 @@ class DirectBufferReconciler:
         pending_names = [name for name in pending if name not in all_names]
         pending_set = set(pending_names)
         pending_tickets = sum(1 for name in missing_claims if not name or name not in pending_set)
-        pending_idle = [name for name in pending_names if self.provider.is_idle_name(name)]
+        pending_idle = [name for name in pending_names if pending[name] == "idle"]
         # 생성 요청을 보냈거나 보내는 중인 요청 파드.
         pending_requests = len(pending_names) - len(pending_idle)
 
@@ -477,7 +477,7 @@ class DirectBufferReconciler:
                 )
                 break
             try:
-                alive = self.queues.refresh_pending_creates(ct, remaining)
+                alive = self.queues.refresh_pending_creates(ct, remaining, "idle")
             except Exception as exc:
                 # 예약 상태를 모르면 만들지 않는다. 남은 예약은 상한이 지나면 빠진다.
                 logger.warning(

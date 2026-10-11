@@ -176,6 +176,7 @@ class World:
         self.queue: List[Tuple[int, str]] = []
         self.seq = itertools.count(1)
         self.pending: Dict[str, float] = {}
+        self.pending_kind: Dict[str, str] = {}
         self.lock_token: Optional[str] = None
         self.max_live = 0
         self.violations: List[Tuple[str, int]] = []
@@ -327,9 +328,6 @@ class FakeProvider:
     def template_hash(self, compute_type):
         return self.world.template_hash
 
-    def is_idle_name(self, name):
-        return "-warm-" in name
-
     def request_pod_name(self, ticket):
         return f"compute-general-req-{ticket['ticket_id']}-{ticket.get('retry_count') or 0}"
 
@@ -478,21 +476,23 @@ class FakeQueues:
         with self.world.mu:
             for name in [n for n, at in self.world.pending.items() if at < cutoff]:
                 del self.world.pending[name]
-            return list(self.world.pending)
+            return {name: self.world.pending_kind.get(name, "idle") for name in self.world.pending}
 
-    def add_pending_create(self, compute_type, name):
+    def add_pending_create(self, compute_type, name, kind):
         with self.world.mu:
             self.world.pending[name] = time.time()
+            self.world.pending_kind[name] = kind
 
-    def add_pending_creates_if_locked(self, compute_type, names, lock_token):
+    def add_pending_creates_if_locked(self, compute_type, names, lock_token, kind="idle"):
         with self.world.mu:
             if self.world.lock_token != lock_token:
                 return False
             for name in names:
                 self.world.pending[name] = time.time()
+                self.world.pending_kind[name] = kind
             return True
 
-    def refresh_pending_creates(self, compute_type, names):
+    def refresh_pending_creates(self, compute_type, names, kind):
         # 실제와 같은 계약: 남아 있는 것만 갱신하고, 남아 있던 이름을 돌려준다.
         with self.world.mu:
             alive = {name for name in names if name in self.world.pending}
@@ -728,7 +728,7 @@ class DirectDrainTests(unittest.TestCase):
         world.add_pod("busy", "assigned", {}, ready=True)
         provider, queues, tickets, allocator, _ = make(world)
         # 생성 중인 idle 하나 + 파드가 아직 안 보이는 claim 하나.
-        queues.add_pending_create(CT, "warm-pending")
+        queues.add_pending_create(CT, "warm-pending", "idle")
         world.enqueue(1)
         with world.mu:
             world.tickets["t0001"].update(status="allocating", claim_token="c")
@@ -745,7 +745,7 @@ class DirectDrainTests(unittest.TestCase):
         provider, queues, tickets, allocator, _ = make(world)
         # 생성 중 목록에 남아 있지만 이미 목록에 보이는(지우는 중) 파드.
         world.add_pod("warm-gone", "idle", {}, ready=True)
-        queues.add_pending_create(CT, "warm-gone")
+        queues.add_pending_create(CT, "warm-gone", "idle")
         world.terminate("warm-gone")
         world.enqueue(5)
         with run_detached_threads_inline():
@@ -1342,11 +1342,11 @@ class DirectFaultTests(unittest.TestCase):
         world.enqueue(1)
         original_refresh = queues.refresh_pending_creates
 
-        def reservation_pruned(compute_type, names):
+        def reservation_pruned(compute_type, names, kind):
             with world.mu:
                 for name in names:
                     world.pending.pop(name, None)
-            return original_refresh(compute_type, names)
+            return original_refresh(compute_type, names, kind)
 
         queues.refresh_pending_creates = reservation_pruned
         with run_detached_threads_inline():
@@ -1360,12 +1360,12 @@ class DirectFaultTests(unittest.TestCase):
         world.enqueue(1)
         original_refresh = queues.refresh_pending_creates
 
-        def reservation_and_claim_expired(compute_type, names):
+        def reservation_and_claim_expired(compute_type, names, kind):
             with world.mu:
                 for name in names:
                     world.pending.pop(name, None)
                 world.tickets["t0001"]["stale"] = True
-            return original_refresh(compute_type, names)
+            return original_refresh(compute_type, names, kind)
 
         queues.refresh_pending_creates = reservation_and_claim_expired
         with run_detached_threads_inline():

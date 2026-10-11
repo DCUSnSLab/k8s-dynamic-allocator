@@ -272,7 +272,7 @@ class ComputeAllocator:
                         # 그사이 claim 이 만료돼도(만료된 claim 은 세지 않는다) 자리가
                         # 비지 않는다. 스레드가 소유를 확인하지 못하면 이 이름을 지운다.
                         self.queues.add_pending_create(
-                            compute_type_value, self.provider.request_pod_name(ticket)
+                            compute_type_value, self.provider.request_pod_name(ticket), "request"
                         )
                         new_slots -= 1
                         work.append((ticket, None, None))
@@ -536,7 +536,7 @@ class ComputeAllocator:
         if self._owns_claim(recorded, claim_token):
             # drain 이 락 안에서 올린 예약을 갱신해 상한(생성 응답을 기다릴 수 있는 시간)을
             # 지금부터 센다. 사라진 예약은 되살리지 않는다(XX).
-            alive = pod_name in self.queues.refresh_pending_creates(compute_type, [pod_name])
+            alive = pod_name in self.queues.refresh_pending_creates(compute_type, [pod_name], "request")
             current = self.tickets.get_ticket(ticket_id)
             if self._owns_claim(current, claim_token):
                 if alive:
@@ -544,7 +544,7 @@ class ComputeAllocator:
                 # 예약이 사라져도 claim 이 아직 유효하면 claim 이 자리를 쥐고 있다(파드 없는
                 # claim 으로 센다). 그때는 예약을 다시 올려 확인 뒤의 취소에 대비한다.
                 if not self.queues.is_allocation_stale(current):
-                    self.queues.add_pending_create(compute_type, pod_name)
+                    self.queues.add_pending_create(compute_type, pod_name, "request")
                     return pod_name
         # 만들지 않는다. drain 이 잡아 둔 자리도 돌려준다.
         self.queues.remove_pending_creates(compute_type, [pod_name])

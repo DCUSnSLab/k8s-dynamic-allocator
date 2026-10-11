@@ -248,7 +248,14 @@ class DirectBufferProvider(KubernetesClient):
 
     # ------------------------------------------------------------------ 생성
 
-    IDLE_NAME_PATTERN = re.compile(r"^compute-[a-z0-9-]+-warm-[0-9a-f]{10}$")
+    # 파드 이름은 미리 만든 것과 요청 때 만든 것이 같은 규칙이다: compute-<타입>-<hex 10>.
+    # 어느 경로로 만들었는지는 어노테이션 origin 이 기록한다(분석용). 이름으로 구분하지
+    # 않는다 - 측정과 운영이 같은 코드를 쓴다.
+
+    @staticmethod
+    def _pod_name(compute_type: str, suffix: str) -> str:
+        type_value = re.sub(r"[^a-z0-9-]", "-", compute_type.lower()).strip("-") or "general"
+        return f"compute-{type_value}-{suffix}"
 
     def new_idle_name(self, compute_type: str) -> str:
         """미리 만들 파드의 이름. 요청 전에 정해 N 계산의 "생성 중" 목록에 먼저 올린다.
@@ -256,17 +263,21 @@ class DirectBufferProvider(KubernetesClient):
         무작위 꼬리를 쓴다. 순번은 초기화 때 Redis 와 함께 지워져, 앞 run 의 지워지는
         중인 파드와 이름이 겹칠 수 있다.
         """
-        type_value = re.sub(r"[^a-z0-9-]", "-", compute_type.lower()).strip("-") or "general"
-        return f"compute-{type_value}-warm-{uuid.uuid4().hex[:10]}"
-
-    def is_idle_name(self, pod_name: str) -> bool:
-        """생성 중 목록의 이름이 미리 만드는 파드인지(아니면 요청 파드)."""
-        return bool(self.IDLE_NAME_PATTERN.match(pod_name or ""))
+        return self._pod_name(compute_type, uuid.uuid4().hex[:10])
 
     def request_pod_name(self, ticket: Dict) -> str:
-        """요청 하나에 묶어 만들 파드의 이름. 만들기 전에 티켓과 생성 중 목록에 올린다."""
+        """요청 하나에 묶어 만들 파드의 이름. 만들기 전에 티켓과 생성 중 목록에 올린다.
+
+        할당 락 안의 예약과 생성 스레드가 같은 이름을 알아야 하므로 티켓과 재시도 횟수에서
+        정해진다(해시). 재시도마다 이름이 달라 앞 시도의 파드와 겹치지 않는다.
+        """
         compute_type = self._normalize_compute_type(ticket.get("compute_type"))
-        return self._pod_name_for_ticket(ticket, compute_type)
+        try:
+            retry_count = int(ticket.get("retry_count") or 0)
+        except (TypeError, ValueError):
+            retry_count = 0
+        digest = hashlib.sha256(f"{ticket.get('ticket_id') or ''}:{retry_count}".encode("utf-8")).hexdigest()
+        return self._pod_name(compute_type, digest[:10])
 
     @timing.timed("k8s.create_pod")
     def create_idle_pod(self, compute_type: str, pod_name: str) -> None:
@@ -288,7 +299,7 @@ class DirectBufferProvider(KubernetesClient):
     def create_pod_for_ticket(self, ticket: Dict, pod_name: Optional[str] = None) -> str:
         """요청 하나에 묶인 파드를 만든다(cold start 와 같은 경로)."""
         compute_type = self._normalize_compute_type(ticket.get("compute_type"))
-        pod_name = pod_name or self._pod_name_for_ticket(ticket, compute_type)
+        pod_name = pod_name or self.request_pod_name(ticket)
         user_pod = (ticket.get("user_pod") or "unknown").strip() or "unknown"
         body = self._pod_body(
             compute_type,
@@ -574,21 +585,6 @@ class DirectBufferProvider(KubernetesClient):
         if compute_type:
             parts.append(f"{self.LABEL_COMPUTE_TYPE}={self._normalize_compute_type(compute_type)}")
         return ",".join(parts)
-
-    def _pod_name_for_ticket(self, ticket: Dict, compute_type: str) -> str:
-        ticket_id = str(ticket.get("ticket_id") or "")
-        ticket_short = (ticket.get("ticket_short") or ticket_id[:10] or "unknown").strip().lower()
-        ticket_short = re.sub(r"[^a-z0-9-]", "-", ticket_short).strip("-") or "unknown"
-        try:
-            retry_count = int(ticket.get("retry_count") or 0)
-        except (TypeError, ValueError):
-            retry_count = 0
-        if retry_count > 0:
-            ticket_short = f"{ticket_short}-{retry_count}"
-        compute_type_value = re.sub(r"[^a-z0-9-]", "-", compute_type.lower()).strip("-") or "general"
-        prefix = f"compute-{compute_type_value}-req-"
-        max_suffix = max(1, 63 - len(prefix))
-        return f"{prefix}{ticket_short[:max_suffix]}".strip("-")
 
     def _normalize_compute_type(self, compute_type: Optional[str]) -> str:
         value = (compute_type or settings.DEFAULT_COMPUTE_TYPE or "general").strip().lower()

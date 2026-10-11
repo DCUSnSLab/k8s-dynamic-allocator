@@ -158,6 +158,9 @@ def pod_summary(pod: dict[str, Any]) -> dict[str, Any] | None:
         "uid": metadata.get("uid"),
         "group": group,
         "compute_status": labels.get("compute-status"),
+        # 미리 만든 파드(idle)인지 요청 때 만든 파드(request)인지. 이름은 같은 규칙이라
+        # 이것으로만 구분된다.
+        "origin": (metadata.get("annotations") or {}).get("k8s-dynamic-allocator/origin"),
         "compute_type": labels.get("compute-type"),
         "node": spec.get("nodeName"),
         "phase": status.get("phase"),
