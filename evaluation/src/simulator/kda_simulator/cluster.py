@@ -24,10 +24,10 @@ BUFFER_SETTLE_POLL_SECONDS = 2.0
 # controller follows. The reuse arm hands pods back to that same Deployment
 # instead of deleting them, so it takes R/N exactly as the proposal does.
 DEPLOYMENT_BUFFER_MODES = {"warm_buffer", "warm_buffer_reuse"}
-# Deployment 없이 컨트롤러가 버퍼 파드를 직접 만들고 지우는 arm(exp-warm-buffer).
-# R/N 은 컨트롤러 env 에 있고, 미리 만든 파드는 compute-status=idle 이다. 버퍼 목표는
-# 동적 R 하나뿐이다(끄는 스위치가 없다).
-DIRECT_BUFFER_MODES = {"warm_buffer_direct"}
+# Deployment 없이 컨트롤러가 버퍼 파드를 직접 만들고 지우는 arm(제안 develop, 재사용
+# exp-reuse). R/N 은 컨트롤러 env 에 있고, 미리 만든(또는 되돌린) 파드는
+# compute-status=idle 이다. 버퍼 목표는 동적 R 하나뿐이다(끄는 스위치가 없다).
+DIRECT_BUFFER_MODES = {"warm_buffer_direct", "warm_buffer_direct_reuse"}
 
 
 class ServerSettingsError(RuntimeError):
