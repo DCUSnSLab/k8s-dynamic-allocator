@@ -144,6 +144,11 @@ test -s "${rendered}"
 grep -F "${CONTROLLER_IMAGE}" "${rendered}" >/dev/null
 grep -F "${SWLABSSH_IMAGE}" "${rendered}" >/dev/null
 
+# 이 arm 은 Deployment 가 없어 R/N 을 컨트롤러 env 로 받는다. 적용 전에 넣어 rollout 을
+# 한 번만 한다(적용 뒤 set env 로 바꾸면 두 번 돌고, 그 사이 컨트롤러는 N 없이 뜬다).
+echo "[Render] Direct warm buffer policy R=${buffer_reserve} N=${buffer_capacity}"
+sh "${WORKSPACE}/deploy/scripts/set_buffer_policy.sh" "${rendered}" "${buffer_reserve}" "${buffer_capacity}"
+
 echo '[Validate] Client render and deploy-stage coverage'
 kubectl apply --dry-run=client \
     -n "${namespace}" \
@@ -224,17 +229,6 @@ kubectl rollout status deployment/controller-queue-redis \
     -n "${namespace}" --timeout=5m
 
 apply_stage controller
-kubectl rollout status deployment/controller \
-    -n "${namespace}" --timeout=5m
-
-# 이 arm 은 Deployment 를 쓰지 않는다. 컨트롤러가 R/N 을 env 에서 읽어 버퍼
-# 파드를 직접 만들고 지운다. 그래서 빌드 파라미터는 Deployment 어노테이션이
-# 아니라 컨트롤러 env 로 들어간다(cold start arm 과 같은 방식). 컨트롤러는 시작할
-# 때 읽으므로 env 를 바꾸면 한 번 더 rollout 한다.
-echo "[Deploy] Apply direct warm buffer policy R=${buffer_reserve} N=${buffer_capacity}"
-kubectl set env deployment/controller -n "${namespace}" \
-    "BUFFER_RESERVE=${buffer_reserve}" \
-    "BUFFER_CAPACITY=${buffer_capacity}"
 kubectl rollout status deployment/controller \
     -n "${namespace}" --timeout=5m
 

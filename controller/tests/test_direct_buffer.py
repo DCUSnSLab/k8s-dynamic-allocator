@@ -1199,15 +1199,46 @@ class DirectDeployContractTests(unittest.TestCase):
         self.assertEqual(agent["readinessProbe"]["periodSeconds"], 2)
         self.assertNotIn("schedulingGates", pod["spec"])
 
-    def test_deploy_passes_policy_through_controller_env(self):
+    def test_deploy_passes_policy_through_controller_env_with_one_rollout(self):
         script = (self.REPO / "deploy/scripts/deploy.sh").read_text(encoding="utf-8")
-        self.assertIn('"BUFFER_RESERVE=${buffer_reserve}"', script)
-        self.assertIn('"BUFFER_CAPACITY=${buffer_capacity}"', script)
+        inject = script.index('set_buffer_policy.sh" "${rendered}" "${buffer_reserve}" "${buffer_capacity}"')
+        # 적용보다 먼저 넣는다. 적용 뒤 set env 로 바꾸면 rollout 이 두 번 돈다.
+        self.assertLess(inject, script.index("apply_stage bootstrap"))
+        self.assertNotIn("kubectl set env deployment/controller", script)
         self.assertIn('status.get("allocation_mode") == "warm_buffer_direct"', script)
         # Deployment 버퍼를 되살리거나 정책을 거기에 싣지 않는다.
         self.assertNotIn("kubectl annotate deployment/compute-general", script)
         self.assertNotIn("kubectl patch deployment/compute-general", script)
         self.assertIn("kubectl delete deployment -l app=compute-pod", script)
+
+    def test_policy_injection_sets_both_env_values_exactly_once(self):
+        import shutil
+        import subprocess
+        import tempfile
+
+        shell = shutil.which("sh")
+        if not shell or not shutil.which("awk"):
+            self.skipTest("sh/awk 가 없는 환경")
+        script = str(self.REPO / "deploy/scripts/set_buffer_policy.sh")
+        rendered = "\n".join([
+            "        env:",
+            "        - name: BUFFER_RESERVE",
+            '          value: ""',
+            "        - name: BUFFER_CAPACITY",
+            '          value: ""',
+            "",
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rendered.yaml"
+            path.write_text(rendered, encoding="utf-8")
+            subprocess.run([shell, script, str(path), "2", "40"], check=True)
+            text = path.read_text(encoding="utf-8")
+            self.assertIn('value: "2"', text)
+            self.assertIn('value: "40"', text)
+            # 하나라도 없으면 실패해서 배포를 멈춘다.
+            path.write_text(rendered.split("        - name: BUFFER_CAPACITY")[0], encoding="utf-8")
+            failed = subprocess.run([shell, script, str(path), "2", "40"], capture_output=True)
+            self.assertNotEqual(failed.returncode, 0)
 
     def test_controller_manifest_names_the_arm_and_has_no_policy_switch(self):
         documents = self._load_yaml("deploy/base/controller.yaml")
