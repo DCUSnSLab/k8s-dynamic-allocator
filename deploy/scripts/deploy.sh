@@ -257,7 +257,7 @@ with urllib.request.urlopen(
 # Deployment 가 없으므로 정책 캐시·깃발도 없다. 확인할 것은 컨트롤러가 이 arm 으로
 # 돌고 있고 받은 R/N 을 쓰고 있는가다.
 ready = (
-    status.get("allocation_mode") == "warm_buffer_direct"
+    status.get("allocation_mode") == "warm_buffer_direct_reuse"
     and status.get("R") == expected_r
     and status.get("N") == expected_n
 )

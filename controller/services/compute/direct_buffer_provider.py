@@ -1,4 +1,7 @@
-"""Deployment 없이 컨트롤러가 직접 관리하는 웜 버퍼의 파드 공급자.
+"""Deployment 없이 컨트롤러가 직접 관리하는 웜 버퍼의 파드 공급자(재사용 arm).
+
+반납된 파드는 정리(scrub)한 뒤 버퍼 목표 안이면 idle 로 되돌린다(return_pod). 나머지는
+제안 arm 과 같다.
 
 cold start 공급자(요청마다 파드를 만들고 반납 때 지운다)에 "미리 만들어 둔 파드"
 하나를 더한 것이다. 파드는 두 상태다.
@@ -51,6 +54,10 @@ class AllocationClaimLost(RuntimeError):
     """파드가 뜨는 동안 티켓이 할당 소유권을 잃었다."""
 
 
+class PodReturnConflict(RuntimeError):
+    """되돌리려던 파드가 더는 그 티켓에 묶여 있지 않다(아무것도 바꾸지 않았다)."""
+
+
 MANIFESTS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
     "manifests",
@@ -83,6 +90,10 @@ class DirectBufferProvider(KubernetesClient):
     # 파드를 만든 템플릿(이미지 포함)의 세대. 배포로 템플릿이 바뀌면 옛 세대 idle 은
     # 할당하지 않고 교체한다. 요청에 묶인 파드는 건드리지 않는다.
     ANNOTATION_TEMPLATE_HASH = "k8s-dynamic-allocator/template-hash"
+    # 재사용 횟수와 마지막으로 idle 로 되돌린 시각. 되돌린 파드는 첫 부팅 때부터 계속
+    # Ready 라서, 대기하던 요청이 본 "쓸 수 있게 된 시각" 은 되돌린 시각이다.
+    ANNOTATION_REUSE_COUNT = "k8s-dynamic-allocator/reuse-count"
+    ANNOTATION_AVAILABLE_SINCE = "k8s-dynamic-allocator/available-since"
     ORIGIN_IDLE = "idle"
     ORIGIN_REQUEST = "request"
 
@@ -216,7 +227,8 @@ class DirectBufferProvider(KubernetesClient):
             "allocation_claim_token": annotations.get(self.ANNOTATION_ALLOCATION_CLAIM, ""),
             "phase": getattr(status, "phase", None),
             "ready": ready,
-            "ready_at": self._pod_ready_at(pod) if ready else None,
+            # P_ready 에 들어간다. 되돌린 파드는 되돌린 시각부터 센다.
+            "ready_at": self._pod_available_at(pod) if ready else None,
             "not_ready_since": self._pod_not_ready_since(pod),
             "terminating": getattr(metadata, "deletion_timestamp", None) is not None,
             "ip": getattr(status, "pod_ip", None),
@@ -343,7 +355,73 @@ class DirectBufferProvider(KubernetesClient):
         metadata["annotations"] = merged
         return body
 
-    # ------------------------------------------------------------------ 할당·삭제
+    # ------------------------------------------------------------------ 할당·삭제·되돌리기
+
+    @classmethod
+    def _pod_available_at(cls, pod):
+        """Ready 인 파드가 마지막으로 할당 가능해진 시각(Ready 시각과 되돌린 시각 중 늦은 쪽)."""
+        ready_at = cls._pod_ready_at(pod)
+        annotations = getattr(pod.metadata, "annotations", None) or {}
+        raw = (annotations.get(cls.ANNOTATION_AVAILABLE_SINCE) or "").strip()
+        if not raw:
+            return ready_at
+        try:
+            available_since = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return ready_at
+        if available_since.tzinfo is None:
+            available_since = available_since.replace(tzinfo=timezone.utc)
+        if ready_at is None:
+            return available_since
+        try:
+            return max(ready_at, available_since)
+        except TypeError:
+            # 시간대 없는 Ready 시각과는 비교할 수 없다. 값 하나로 목록 전체를 버리지 않는다.
+            return ready_at
+
+    @staticmethod
+    def _annotation_path(key: str) -> str:
+        # JSON Pointer 이스케이프(RFC 6901): 어노테이션 키에 "/" 가 있다.
+        return "/metadata/annotations/" + key.replace("~", "~0").replace("/", "~1")
+
+    @timing.timed("k8s.patch_return")
+    def return_pod(self, pod_name: str, ticket_id: str, reuse_count: int, available_since: str) -> None:
+        """정리한 assigned 파드를 idle 로 되돌린다. 그사이 다른 티켓으로 넘어갔으면 실패한다.
+
+        티켓 어노테이션을 test 하므로 늦은 반납이 다음 사용자의 파드를 되돌리지 않는다.
+        resourceVersion 은 test 하지 않는다 - 정리하는 동안에도 kubelet 이 상태를 계속
+        써서 이유 없이 실패한다. 할당(claim)은 resourceVersion 을 test 하므로, 되돌린 뒤의
+        할당은 이 변경을 본 목록으로만 이뤄진다. 라벨 값은 idle 이다(available 이 아니다 -
+        남은 Deployment 의 ReplicaSet 이 입양하지 못하게).
+        """
+        ticket_path = self._annotation_path(self.ANNOTATION_ALLOCATION_TICKET)
+        patch = [
+            {"op": "test", "path": "/metadata/labels/compute-status", "value": self.STATUS_ASSIGNED},
+            {"op": "test", "path": ticket_path, "value": ticket_id},
+            {"op": "replace", "path": "/metadata/labels/compute-status", "value": self.STATUS_IDLE},
+            {"op": "replace", "path": "/metadata/labels/assigned-user", "value": ""},
+            # 할당은 티켓과 claim 어노테이션을 늘 함께 쓴다.
+            {"op": "remove", "path": ticket_path},
+            {"op": "remove", "path": self._annotation_path(self.ANNOTATION_ALLOCATION_CLAIM)},
+            {"op": "add", "path": self._annotation_path(self.ANNOTATION_REUSE_COUNT), "value": str(reuse_count)},
+            {"op": "add", "path": self._annotation_path(self.ANNOTATION_AVAILABLE_SINCE), "value": available_since},
+        ]
+        try:
+            self.v1.api_client.call_api(
+                "/api/v1/namespaces/{namespace}/pods/{name}",
+                "PATCH",
+                path_params={"namespace": self.namespace, "name": pod_name},
+                body=patch,
+                header_params={"Content-Type": "application/json-patch+json"},
+                auth_settings=["BearerToken"],
+                _return_http_data_only=True,
+                _preload_content=True,
+                _request_timeout=self.api_request_timeout,
+            )
+        except ApiException as exc:
+            if exc.status in (404, 409, 422):
+                raise PodReturnConflict(f"{pod_name} is no longer assigned to ticket {ticket_id}") from exc
+            raise
 
     @timing.timed("k8s.patch_assign")
     def claim_idle_pod(

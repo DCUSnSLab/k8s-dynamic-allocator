@@ -1210,7 +1210,7 @@ class DirectDeployContractTests(unittest.TestCase):
         # 적용보다 먼저 넣는다. 적용 뒤 set env 로 바꾸면 rollout 이 두 번 돈다.
         self.assertLess(inject, script.index("apply_stage bootstrap"))
         self.assertNotIn("kubectl set env deployment/controller", script)
-        self.assertIn('status.get("allocation_mode") == "warm_buffer_direct"', script)
+        self.assertIn('status.get("allocation_mode") == "warm_buffer_direct_reuse"', script)
         # Deployment 버퍼를 되살리거나 정책을 거기에 싣지 않는다.
         self.assertNotIn("kubectl annotate deployment/compute-general", script)
         self.assertNotIn("kubectl patch deployment/compute-general", script)
@@ -1252,7 +1252,7 @@ class DirectDeployContractTests(unittest.TestCase):
             item["name"]: item.get("value")
             for item in controller["spec"]["template"]["spec"]["containers"][0]["env"]
         }
-        self.assertEqual(env["COMPUTE_ALLOCATION_MODE"], "warm_buffer_direct")
+        self.assertEqual(env["COMPUTE_ALLOCATION_MODE"], "warm_buffer_direct_reuse")
         # 동적 R 하나만 있다. 끄고 켜는 스위치를 다시 들이지 않는다.
         self.assertNotIn("BUFFER_DYNAMIC_RESERVE_ENABLED", env)
         self.assertIn("BUFFER_RESERVE", env)

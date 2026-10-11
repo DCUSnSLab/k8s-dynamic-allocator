@@ -277,6 +277,8 @@ class DirectBufferReconciler:
                     str(exc),
                 )
 
+        if record and self._still_in_charge(generation):
+            self._publish_target(ct, int(record.get("target") or 0))
         created = self._create_idle(ct, to_create, generation)
         deleted = self._delete_idle(to_delete, generation)
         record.update({"created": created, "deleted": deleted})
@@ -323,39 +325,17 @@ class DirectBufferReconciler:
         snapshot = self.provider.snapshot(ct)
         capacity = self.provider.read_capacity(ct)
         reserve = self.provider.read_reserve(ct)
-        all_names = {pod["name"] for pod in snapshot["pods"]}
+        counts = self._demand_counts(ct, snapshot)
         active = snapshot["active_names"]
-
-        # 할당과 같은 순서로 읽는다(claim 먼저, 생성 중 목록 나중). 이유는 할당 쪽 주석.
-        missing_claims = self.queues.allocating_missing_pods(active, ct)
-        pending = self.queues.pending_creates(ct, self.pending_ttl_seconds)
-        seen = [name for name in pending if name in all_names]
-        if seen:
-            self.queues.remove_pending_creates(ct, seen)
-        pending_names = [name for name in pending if name not in all_names]
-        pending_set = set(pending_names)
-        pending_tickets = sum(1 for name in missing_claims if not name or name not in pending_set)
-        pending_idle = [name for name in pending_names if pending[name] == "idle"]
-        # 생성 요청을 보냈거나 보내는 중인 요청 파드.
-        pending_requests = len(pending_names) - len(pending_idle)
-
-        assigned = int(snapshot["assigned"])
-        booting = sum(
-            1
-            for pod in snapshot["pods"]
-            if not pod["terminating"]
-            and pod["buffer_status"] == self.provider.STATUS_ASSIGNED
-            and not pod["ready"]
-        )
-        # 아직 Ready 파드를 받지 못한 요청. Deployment 버퍼에서는 대기(queued)로 남아
-        # 있던 요청이다.
-        in_flight = booting + pending_tickets + pending_requests
-        # Ready 파드를 받아 간 요청. Deployment 버퍼의 assigned 에 해당한다.
-        settled = max(0, assigned - booting)
-        # claim 이 건너뛰는 티켓(클라이언트가 폴링을 멈춤)은 세지 않는다. 그런 티켓
-        # 하나가 큐에 남아 있다고 대기 제한(최대 30분) 내내 미리 만들기를 막으면 안 된다.
-        queued = int(self.queues.claimable_queued_count(ct))
-        demand = queued + in_flight
+        pending_names = counts["pending_names"]
+        pending_tickets = counts["pending_tickets"]
+        pending_idle = counts["pending_idle"]
+        pending_requests = counts["pending_requests"]
+        assigned = counts["assigned"]
+        in_flight = counts["in_flight"]
+        settled = counts["settled"]
+        queued = counts["queued"]
+        demand = counts["demand"]
         # N 이 없으면 하나도 만들지 않는다(설정 누락으로 상한 없는 run 이 되지 않게).
         cap_value = int(capacity) if capacity is not None else 0
         detail = self.policy.desired_detail(reserve, cap_value, settled, demand)
@@ -440,6 +420,108 @@ class DirectBufferReconciler:
             "hold_s": None if hold is None else round(float(hold), 1),
         }
         return {"create": create, "delete": delete, "record": record}
+
+    def _demand_counts(self, ct: str, snapshot: Dict) -> Dict:
+        """버퍼 계산에 쓰는 수. 할당 락 아래에서 부른다(리더의 계획과 반납 판정이 같이 쓴다)."""
+        all_names = {pod["name"] for pod in snapshot["pods"]}
+        active = snapshot["active_names"]
+
+        # 할당과 같은 순서로 읽는다(claim 먼저, 생성 중 목록 나중). 이유는 할당 쪽 주석.
+        missing_claims = self.queues.allocating_missing_pods(active, ct)
+        pending = self.queues.pending_creates(ct, self.pending_ttl_seconds)
+        seen = [name for name in pending if name in all_names]
+        if seen:
+            self.queues.remove_pending_creates(ct, seen)
+        pending_names = [name for name in pending if name not in all_names]
+        pending_set = set(pending_names)
+        pending_tickets = sum(1 for name in missing_claims if not name or name not in pending_set)
+        pending_idle = [name for name in pending_names if pending[name] == "idle"]
+        # 생성 요청을 보냈거나 보내는 중인 요청 파드.
+        pending_requests = len(pending_names) - len(pending_idle)
+
+        assigned = int(snapshot["assigned"])
+        booting = sum(
+            1
+            for pod in snapshot["pods"]
+            if not pod["terminating"]
+            and pod["buffer_status"] == self.provider.STATUS_ASSIGNED
+            and not pod["ready"]
+        )
+        # 아직 Ready 파드를 받지 못한 요청. Deployment 버퍼에서는 대기(queued)로 남아
+        # 있던 요청이다.
+        in_flight = booting + pending_tickets + pending_requests
+        # claim 이 건너뛰는 티켓(클라이언트가 폴링을 멈춤)은 세지 않는다. 그런 티켓
+        # 하나가 큐에 남아 있다고 대기 제한(최대 30분) 내내 미리 만들기를 막으면 안 된다.
+        queued = int(self.queues.claimable_queued_count(ct))
+        return {
+            "pending_names": pending_names,
+            "pending_tickets": pending_tickets,
+            "pending_idle": pending_idle,
+            "pending_requests": pending_requests,
+            "assigned": assigned,
+            "in_flight": in_flight,
+            # Ready 파드를 받아 간 요청. Deployment 버퍼의 assigned 에 해당한다.
+            "settled": max(0, assigned - booting),
+            "queued": queued,
+            "demand": queued + in_flight,
+        }
+
+    def _current_idle(self, ct: str, snapshot: Dict) -> List[Dict]:
+        """버퍼로 세는 idle: Ready 대기 상한을 넘기지 않았고 지금 템플릿 세대인 것."""
+        now = datetime.now(timezone.utc)
+        current_hash = self._template_hash(ct)
+        return [
+            pod for pod in snapshot["idle"]
+            if (pod["ready"] or pod.get("created") is None
+                or (now - pod["created"]).total_seconds() <= self.ready_timeout_seconds)
+            and (not current_hash or pod.get("template_hash") == current_hash)
+        ]
+
+    # ------------------------------------------------------------------ 재사용(반납)
+
+    def return_decision(self, compute_type: str) -> Dict:
+        """반납된 파드 하나를 idle 로 되돌릴지. 호출자가 할당 락을 쥔 채 부른다.
+
+        리더의 계획과 같은 식이다. 다른 점은 이 파드가 받아 간 요청(settled)에서 빠진다는
+        것 하나다. 되돌린 뒤 버퍼(idle + 생성 중 idle + 가는 중인 요청)가 목표 이하면
+        되돌리고, 아니면 지운다(제안과 같다).
+
+        목표의 쿨다운 창 최댓값은 리더의 메모리에 있다. 반납은 어느 복제본에서나 오므로
+        리더가 매 바퀴 적어 둔 목표를 읽는다. 없거나 낡았으면 지금 수요만으로 정한다(창이
+        잡아 두던 만큼은 지운다 - 버퍼를 넘기는 쪽보다 안전하다).
+        """
+        ct = self.queues.normalize_compute_type(compute_type)
+        snapshot = self.provider.snapshot(ct)
+        capacity = self.provider.read_capacity(ct)
+        reserve = self.provider.read_reserve(ct)
+        counts = self._demand_counts(ct, snapshot)
+        cap_value = int(capacity) if capacity is not None else 0
+        settled_after = max(0, counts["settled"] - 1)
+        detail = self.policy.desired_detail(reserve, cap_value, settled_after, counts["demand"])
+        desired = int(detail["desired"])
+        try:
+            published = self.queues.read_buffer_target(ct)
+        except QueueUnavailableError:
+            published = None
+        room_after = max(0, cap_value - settled_after)
+        target = min(max(int(published or 0), desired), room_after)
+        idle_total = len(self._current_idle(ct, snapshot)) + len(counts["pending_idle"]) + counts["in_flight"]
+        return {
+            "keep": idle_total < target,
+            "target": target,
+            "published_target": published,
+            "desired": desired,
+            "idle_total": idle_total,
+            "queued": counts["queued"],
+        }
+
+    def _publish_target(self, ct: str, target: int) -> None:
+        # 반납 판정이 읽는다. 바퀴는 resync 주기마다 적어도 한 번 돈다(거름망도 그 주기를
+        # 넘기지 않는다). 그 몇 배가 지나도 갱신이 없으면 리더가 없는 것이다.
+        try:
+            self.queues.publish_buffer_target(ct, target, ttl_seconds=self.resync_seconds * 3)
+        except Exception as exc:
+            logger.debug("[BufferTargetPublishSkipped] compute_type=%s reason=%r", ct, str(exc))
 
     @staticmethod
     def _deletion_order(pod: Dict):

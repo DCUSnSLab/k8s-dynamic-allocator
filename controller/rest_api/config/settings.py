@@ -139,11 +139,12 @@ CACHES = {
 REDIS_URL = _env_first(('REDIS_URL',), 'redis://localhost:6379/0')
 WAIT_QUEUE_PREFIX = _env_first(('WAIT_QUEUE_PREFIX',), 'kda:waitq')
 DEFAULT_COMPUTE_TYPE = _env_first(('DEFAULT_COMPUTE_TYPE',), 'general')
-# 이 브랜치(exp-warm-buffer)는 Deployment 없이 컨트롤러가 버퍼 파드를 직접 만들고
-# 지우는 비교군이다. 브랜치가 곧 arm 이므로 모드는 상수다 - 환경변수로 읽으면
-# 오타 하나로 다른 arm 이 조용히 배포된다. 상태 API 와 평가 도구가 이 이름으로
-# arm 을 기록한다.
-COMPUTE_ALLOCATION_MODE = 'warm_buffer_direct'
+# 이 브랜치(exp-reuse)는 제안(warm buffer, 컨트롤러 직접 관리)에 재사용을 더한
+# 비교군이다. 사용자가 반납한 파드를 정리(scrub)한 뒤 버퍼 목표 안이면 idle 로 되돌리고,
+# 아니면 지운다. 브랜치가 곧 arm 이므로 모드는 상수다 - 환경변수로 읽으면 오타 하나로
+# 다른 arm 이 조용히 배포된다. 상태 API 와 평가 도구가 이 이름으로 arm 을 기록한다.
+# 옛 Deployment 기반 재사용(warm_buffer_reuse)과 데이터가 섞이지 않게 이름을 달리한다.
+COMPUTE_ALLOCATION_MODE = 'warm_buffer_direct_reuse'
 COMPUTE_POD_IMAGE = _env_first(
     ('COMPUTE_POD_IMAGE',),
     'harbor.cu.ac.kr/k8s_dynamic_allocator/compute_pod:latest',
@@ -268,6 +269,19 @@ COMPUTE_AGENT_MOUNT_TIMEOUT_SECONDS = _env_float_any(
 COMPUTE_AGENT_UNMOUNT_TIMEOUT_SECONDS = _env_float_any(
     ('COMPUTE_AGENT_UNMOUNT_TIMEOUT_SECONDS',),
     COMPUTE_AGENT_TIMEOUT_SECONDS,
+)
+# The controller's wait on /scrub. The agent's own kill deadline is a separate
+# variable (COMPUTE_AGENT_SCRUB_TIMEOUT_SECONDS, 10 s) that this must outlast.
+COMPUTE_AGENT_SCRUB_HTTP_TIMEOUT_SECONDS = _env_float_any(
+    ('COMPUTE_AGENT_SCRUB_HTTP_TIMEOUT_SECONDS',),
+    20.0,
+)
+# A release lock this old belongs to a release that died midway: the scrub wait
+# plus the few API calls after it fit well inside. Cleanup then deletes the Pod
+# the lock still holds, since nothing else would. 0 disables.
+RELEASE_LOCK_STALE_SECONDS = _env_float_any(
+    ('RELEASE_LOCK_STALE_SECONDS',),
+    COMPUTE_AGENT_SCRUB_HTTP_TIMEOUT_SECONDS + 40.0,
 )
 
 LANGUAGE_CODE = 'ko-kr'
