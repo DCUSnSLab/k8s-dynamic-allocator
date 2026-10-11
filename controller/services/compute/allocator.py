@@ -216,10 +216,13 @@ class ComputeAllocator:
 
             # Ready 인 idle 먼저, 그다음 오래된(먼저 부팅을 시작한) 것부터. Ready 였다가
             # NotReady 가 된 파드(에이전트가 죽음)는 내주지 않는다 - 정리가 곧 지운다.
+            # 옛 템플릿 세대(배포 전 이미지)도 내주지 않는다 - 리더가 교체한다.
+            current_hash = self._current_template_hash(compute_type_value)
             idle = sorted(
                 (
                     pod for pod in snapshot["idle"]
-                    if pod["ready"] or pod.get("not_ready_since") is None
+                    if (pod["ready"] or pod.get("not_ready_since") is None)
+                    and (not current_hash or pod.get("template_hash") == current_hash)
                 ),
                 key=lambda pod: (
                     not pod["ready"],
@@ -334,6 +337,16 @@ class ComputeAllocator:
         if not work:
             result["queued"] += 1
         return result
+
+    def _current_template_hash(self, compute_type_value: str) -> str:
+        reader = getattr(self.provider, "template_hash", None)
+        if reader is None:
+            return ""
+        try:
+            return reader(compute_type_value) or ""
+        except Exception:
+            # 세대를 모르면 거르지 않는다(템플릿을 못 읽으면 어차피 새로 만들 수도 없다).
+            return ""
 
     def _claim_idle_for_ticket(
         self, ticket: Dict, idle_iter

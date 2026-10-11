@@ -14,6 +14,8 @@ ReplicaSet 이 주인 없는 파드로 보고 입양해 지우지 못하게 하�
 
 import copy
 import glob
+import hashlib
+import json
 import logging
 import os
 import re
@@ -78,6 +80,9 @@ class DirectBufferProvider(KubernetesClient):
     # idle 로 만든 파드인지 요청 때 만든 파드인지. 분석에서 "미리 만든 파드를 썼나" 를
     # 가른다. 할당해도 바뀌지 않는다.
     ANNOTATION_ORIGIN = "k8s-dynamic-allocator/origin"
+    # 파드를 만든 템플릿(이미지 포함)의 세대. 배포로 템플릿이 바뀌면 옛 세대 idle 은
+    # 할당하지 않고 교체한다. 요청에 묶인 파드는 건드리지 않는다.
+    ANNOTATION_TEMPLATE_HASH = "k8s-dynamic-allocator/template-hash"
     ORIGIN_IDLE = "idle"
     ORIGIN_REQUEST = "request"
 
@@ -85,6 +90,7 @@ class DirectBufferProvider(KubernetesClient):
         super().__init__()
         self.apps_v1 = client.AppsV1Api()
         self._templates_by_type: Dict[str, Dict] = {}
+        self._template_hash_by_type: Dict[str, str] = {}
 
     # ------------------------------------------------------------------ 설정
 
@@ -92,6 +98,7 @@ class DirectBufferProvider(KubernetesClient):
         """파드 템플릿을 읽고 검증한다. 파드는 만들지 않는다(리더의 조정이 만든다)."""
         results = {"created": [], "existing": [], "failed": [], "templates": []}
         self._templates_by_type = {}
+        self._template_hash_by_type = {}
 
         if log_existing:
             capacity = self.read_capacity()
@@ -119,6 +126,7 @@ class DirectBufferProvider(KubernetesClient):
                 override_compute_agent_image(spec, settings.COMPUTE_POD_IMAGE)
                 compute_type = self._validate_pod_template(spec)
                 self._templates_by_type[compute_type] = spec
+                self._template_hash_by_type[compute_type] = self._hash_template(spec)
                 results["templates"].append(
                     {"file": os.path.basename(yaml_file), "compute_type": compute_type}
                 )
@@ -202,6 +210,7 @@ class DirectBufferProvider(KubernetesClient):
             "buffer_status": labels.get(self.LABEL_STATUS, "unknown"),
             "assigned_user": labels.get(self.LABEL_USER, ""),
             "origin": annotations.get(self.ANNOTATION_ORIGIN, ""),
+            "template_hash": annotations.get(self.ANNOTATION_TEMPLATE_HASH, ""),
             "allocation_ticket_id": annotations.get(self.ANNOTATION_ALLOCATION_TICKET, ""),
             "allocation_claim_token": annotations.get(self.ANNOTATION_ALLOCATION_CLAIM, ""),
             "phase": getattr(status, "phase", None),
@@ -324,6 +333,7 @@ class DirectBufferProvider(KubernetesClient):
         labels[self.LABEL_USER] = user
         merged = dict(metadata.get("annotations") or {})
         merged.update(annotations)
+        merged[self.ANNOTATION_TEMPLATE_HASH] = self.template_hash(compute_type)
         metadata["annotations"] = merged
         return body
 
@@ -539,6 +549,17 @@ class DirectBufferProvider(KubernetesClient):
             scaled += 1
             logger.info("[Drained] deployment=%s replicas=0 reason=direct_buffer_mode", name)
         return scaled
+
+    @staticmethod
+    def _hash_template(spec: Dict) -> str:
+        return hashlib.sha256(json.dumps(spec, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+    def template_hash(self, compute_type: str) -> str:
+        """지금 템플릿(이미지 덮어쓰기 포함)의 세대. 파드에 붙은 값과 다르면 옛 세대다."""
+        compute_type_value = self._normalize_compute_type(compute_type)
+        if compute_type_value not in self._template_hash_by_type:
+            self._template_for_compute_type(compute_type_value)
+        return self._template_hash_by_type.get(compute_type_value, "")
 
     def _template_for_compute_type(self, compute_type: str) -> Dict:
         if compute_type not in self._templates_by_type:

@@ -369,23 +369,30 @@ class DirectBufferReconciler:
         room = max(0, cap_value - settled)
         target = min(max(self.policy.window_max(ct) or 0, desired), room)
 
-        idle = snapshot["idle"]
-        idle_total = len(idle) + len(pending_idle) + in_flight
-        free = max(0, cap_value - len(active) - pending_tickets - len(pending_names))
-
-        create: List[str] = []
-        delete: List[Dict] = []
-        hold = None
+        idle_all = snapshot["idle"]
         now = datetime.now(timezone.utc)
         # 끝내 Ready 가 안 되는 idle 은 자리만 쥔다. Ready 대기 상한을 넘기면 지운다
         # (Pending 으로 3분 넘게 남으면 클러스터 경보도 울린다).
         stuck = [
-            pod for pod in idle
+            pod for pod in idle_all
             if not pod["ready"]
             and pod.get("created") is not None
             and (now - pod["created"]).total_seconds() > self.ready_timeout_seconds
         ]
-        delete.extend(stuck)
+        # 배포 전 템플릿(이미지)으로 만든 idle. 할당되지 않으므로 버퍼로 세지 않는다.
+        current_hash = self._template_hash(ct)
+        outdated = [
+            pod for pod in idle_all
+            if pod not in stuck and current_hash and pod.get("template_hash") != current_hash
+        ]
+        idle = [pod for pod in idle_all if pod not in stuck and pod not in outdated]
+        idle_total = len(idle) + len(pending_idle) + in_flight
+        # 지우기 전까지는 stuck·outdated 도 자리를 쥔다(active 에 들어 있다).
+        free = max(0, cap_value - len(active) - pending_tickets - len(pending_names))
+
+        create: List[str] = []
+        delete: List[Dict] = list(stuck)
+        hold = None
 
         if idle_total < target and not queued:
             # 대기 티켓이 있으면 미리 만들지 않는다 - 그 자리는 drain 이 티켓에 묶어 만든다.
@@ -398,14 +405,19 @@ class DirectBufferReconciler:
             if hold is None:
                 excess = min(idle_total - target, len(idle))
                 # 아직 Ready 가 아닌 것(쓸 수 없는 것)부터, 그다음 가장 최근에 만든 것.
-                order = sorted(
-                    (pod for pod in idle if pod not in stuck),
-                    key=lambda pod: (
-                        pod["ready"],
-                        -(pod["created"].timestamp() if pod.get("created") else 0.0),
-                    ),
-                )
-                delete.extend(order[: max(0, excess - len(stuck))])
+                delete.extend(sorted(idle, key=self._deletion_order)[: max(0, excess)])
+
+        if outdated:
+            # 옛 세대 교체는 N 안에서만 한다. 실행 중인 파드는 건드리지 않는다.
+            ready_current = sum(1 for pod in idle if pod["ready"])
+            if queued or ready_current >= target:
+                # 대기가 있으면 옛 세대는 쓰이지 못한 채 자리만 쥔다. 대기가 없으면 새 세대가
+                # 목표만큼 Ready 가 된 뒤다. 어느 쪽이든 이제 지운다.
+                delete.extend(outdated)
+            elif not create and free <= 0:
+                # 자리가 꽉 차 새 세대를 만들 수 없다. 하나씩 지워 자리를 낸다(그동안 버퍼가
+                # 하나 줄어드는 것은 피할 수 없다).
+                delete.append(sorted(outdated, key=self._deletion_order)[0])
 
         record = {
             "demand": demand,
@@ -415,7 +427,10 @@ class DirectBufferReconciler:
             "desired": desired,
             "bound_by": detail.get("bound_by"),
             "target": target,
-            "idle": len(idle),
+            "idle": len(idle_all),
+            "idle_current": len(idle),
+            "outdated": len(outdated),
+            "stuck": len(stuck),
             "idle_ready": len(snapshot["idle_ready"]),
             "pending_idle": len(pending_idle),
             "assigned": assigned,
@@ -428,6 +443,20 @@ class DirectBufferReconciler:
             "hold_s": None if hold is None else round(float(hold), 1),
         }
         return {"create": create, "delete": delete, "record": record}
+
+    @staticmethod
+    def _deletion_order(pod: Dict):
+        return (pod["ready"], -(pod["created"].timestamp() if pod.get("created") else 0.0))
+
+    def _template_hash(self, ct: str) -> str:
+        reader = getattr(self.provider, "template_hash", None)
+        if reader is None:
+            return ""
+        try:
+            return reader(ct) or ""
+        except Exception as exc:
+            logger.warning("[Warning] operation=direct_buffer_template_hash compute_type=%s reason=%r", ct, str(exc))
+            return ""
 
     def _create_idle(self, ct: str, names: List[str], generation: Optional[int] = None) -> int:
         """예약한 이름을 차례로 만든다. 예약이 남아 있는 이름만 만든다.

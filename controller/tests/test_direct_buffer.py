@@ -165,6 +165,7 @@ class World:
 
     def __init__(self, capacity: Optional[int], reserve: int, boot_seconds: float = 0.03):
         self.mu = threading.RLock()
+        self.template_hash = "gen-1"
         self.capacity = capacity
         self.reserve = reserve
         self.boot_seconds = boot_seconds
@@ -188,7 +189,8 @@ class World:
             return [dict(p) for p in self.pods.values() if not p["terminating"]]
 
     def add_pod(self, name: str, status: str, annotations: Dict, *, ready: bool = False,
-                age_seconds: float = 0.0, not_ready_since: Optional[datetime] = None) -> Dict:
+                age_seconds: float = 0.0, not_ready_since: Optional[datetime] = None,
+                template_hash: Optional[str] = None) -> Dict:
         with self.mu:
             if name in self.pods:
                 raise FakeApiException(409, "AlreadyExists")
@@ -202,6 +204,7 @@ class World:
                 "buffer_status": status,
                 "ready": ready,
                 "not_ready_since": not_ready_since,
+                "template_hash": self.template_hash if template_hash is None else template_hash,
                 "terminating": False,
             }
             self.pods[name] = pod
@@ -297,6 +300,7 @@ class FakeProvider:
                     "ready_at": datetime.now(timezone.utc) if p["ready"] else None,
                     "not_ready_since": p.get("not_ready_since"),
                     "ip": "10.0.0.9" if p["ready"] else None,
+                    "template_hash": p.get("template_hash", ""),
                     "terminating": p["terminating"],
                 }
                 for p in self.world.pods.values()
@@ -319,6 +323,9 @@ class FakeProvider:
 
     def new_idle_name(self, compute_type):
         return f"compute-{compute_type}-warm-{next(self.names)}"
+
+    def template_hash(self, compute_type):
+        return self.world.template_hash
 
     def is_idle_name(self, name):
         return "-warm-" in name
@@ -1381,6 +1388,65 @@ class DirectLeadershipTests(unittest.TestCase):
         provider, queues, tickets, allocator, reconciler = make(world)
         reconciler._generation = 5
         reconciler.reconcile_type(CT, generation=4)  # 이전 세대의 바퀴
+        self.assertFalse(any(p["terminating"] for p in world.pods.values()))
+
+
+
+class DirectTemplateGenerationTests(unittest.TestCase):
+    def _live(self, world):
+        return sorted((p["name"], p["template_hash"]) for p in world.live())
+
+    def test_outdated_idle_is_not_handed_out(self):
+        world = World(capacity=5, reserve=1)
+        world.add_pod("warm-old", "idle", {}, ready=True, template_hash="gen-0")
+        provider, queues, tickets, allocator, _ = make(world)
+        world.enqueue(1)
+        with run_detached_threads_inline():
+            allocator.drain_wait_queue_for_type(CT, no_stale)
+        self.assertNotIn("warm-old", world.assignments)
+        self.assertEqual(world.created["request"], 1)
+
+    def test_replacements_are_ready_before_outdated_idle_is_deleted(self):
+        world = World(capacity=10, reserve=2)
+        world.add_pod("warm-old-a", "idle", {}, ready=True, template_hash="gen-0")
+        world.add_pod("warm-old-b", "idle", {}, ready=True, template_hash="gen-0")
+        provider, queues, tickets, allocator, reconciler = make(world)
+        reconciler.reconcile_type(CT)
+        self.assertEqual(world.created["idle"], 2)
+        self.assertFalse(world.pods["warm-old-a"]["terminating"])  # 교체본이 아직 부팅 중
+        self.assertTrue(wait_until(lambda: all(p["ready"] for p in world.live()), world=world))
+        reconciler.reconcile_type(CT)
+        self.assertTrue(world.pods["warm-old-a"]["terminating"])
+        self.assertTrue(world.pods["warm-old-b"]["terminating"])
+        self.assertEqual(world.violations, [])
+
+    def test_full_capacity_replaces_one_at_a_time_without_exceeding_n(self):
+        world = World(capacity=2, reserve=2)
+        world.add_pod("warm-old-a", "idle", {}, ready=True, template_hash="gen-0", age_seconds=2)
+        world.add_pod("warm-old-b", "idle", {}, ready=True, template_hash="gen-0", age_seconds=1)
+        provider, queues, tickets, allocator, reconciler = make(world)
+        for _ in range(12):
+            reconciler.reconcile_type(CT)
+            wait_until(lambda: False, timeout=0.05, world=world)
+            self.assertLessEqual(len(world.live()), 2)
+        self.assertEqual([h for _, h in self._live(world)], ["gen-1", "gen-1"])
+        self.assertEqual(world.violations, [])
+
+    def test_outdated_idle_is_dropped_while_requests_wait(self):
+        world = World(capacity=10, reserve=2)
+        world.add_pod("warm-old", "idle", {}, ready=True, template_hash="gen-0")
+        provider, queues, tickets, allocator, reconciler = make(world)
+        world.enqueue(1)
+        reconciler.reconcile_type(CT)
+        self.assertTrue(world.pods["warm-old"]["terminating"])
+
+    def test_current_generation_buffer_is_left_alone(self):
+        world = World(capacity=10, reserve=2)
+        world.add_pod("warm-a", "idle", {}, ready=True)
+        world.add_pod("warm-b", "idle", {}, ready=True)
+        provider, queues, tickets, allocator, reconciler = make(world)
+        reconciler.reconcile_type(CT)
+        self.assertEqual(world.created["idle"], 0)
         self.assertFalse(any(p["terminating"] for p in world.pods.values()))
 
 
