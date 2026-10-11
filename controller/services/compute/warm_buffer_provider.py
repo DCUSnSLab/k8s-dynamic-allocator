@@ -917,10 +917,31 @@ class WarmBufferProvider(KubernetesClient):
         target = max(0, int(desired))
         if target <= int(expected):
             return False
-        patch = [
-            {"op": "test", "path": "/spec/replicas", "value": int(expected)},
-            {"op": "replace", "path": "/spec/replicas", "value": target},
-        ]
+        if int(expected) == 0:
+            # autoscaling/v1 Scale 의 spec.replicas 는 omitempty 라 0 이면 JSON 에 아예 없다.
+            # 그래서 "test /spec/replicas = 0" 은 경로가 없어 항상 422 로 실패하고, 0 에서는
+            # 영영 올리지 못한다. 10/11 DEV_MOUNTAIN 에서 포화 끝에 assigned 가 N 에 닿아
+            # replicas 가 0 이 된 뒤 52분 동안 공급이 멈췄다(cas_conflict 분당 ~95). 0 일
+            # 때는 resourceVersion 을 조건으로 건다 - 읽은 뒤 누가 바꾸면 버전이 달라져
+            # 실패하므로 같은 CAS 다. add 는 필드가 없으면 넣고 있으면 바꾼다.
+            scale = self.apps_v1.read_namespaced_deployment_scale(
+                name=deployment_name,
+                namespace=self.namespace,
+                _request_timeout=self.api_request_timeout,
+            )
+            current = int(getattr(getattr(scale, "spec", None), "replicas", 0) or 0)
+            version = getattr(getattr(scale, "metadata", None), "resource_version", None) or ""
+            if current != 0 or not version:
+                return False
+            patch = [
+                {"op": "test", "path": "/metadata/resourceVersion", "value": version},
+                {"op": "add", "path": "/spec/replicas", "value": target},
+            ]
+        else:
+            patch = [
+                {"op": "test", "path": "/spec/replicas", "value": int(expected)},
+                {"op": "replace", "path": "/spec/replicas", "value": target},
+            ]
         try:
             self.apps_v1.api_client.call_api(
                 "/apis/apps/v1/namespaces/{namespace}/deployments/{name}/scale",

@@ -113,13 +113,16 @@ class InMemoryPodApi:
                     container = container[int(segment)] if isinstance(container, list) else container[segment]
                 last = segments[-1]
                 key = int(last) if isinstance(container, list) else last
-                actual = container[key]
+                # add 는 대상 멤버가 없어도 된다(RFC 6902). 부모만 있으면 된다.
+                actual = None if operation["op"] == "add" else container[key]
             except (KeyError, IndexError, TypeError, ValueError) as exc:
                 raise ApiException(422) from exc
             if operation["op"] == "test":
                 if actual != operation["value"]:
                     raise ApiException(422)
             elif operation["op"] == "replace":
+                container[key] = operation["value"]
+            elif operation["op"] == "add":
                 container[key] = operation["value"]
             elif operation["op"] == "remove":
                 if isinstance(container, list):
@@ -270,6 +273,45 @@ class WarmSlotGateTests(unittest.TestCase):
         calls = len(api.calls)
         self.assertFalse(provider.raise_deployment_replicas("compute-general", 8, 3))
         self.assertEqual(len(api.calls), calls)
+
+    def test_raise_replicas_from_zero(self):
+        """replicas 0 에서도 올릴 수 있다.
+
+        autoscaling/v1 Scale 의 spec.replicas 는 omitempty 라 0 이면 JSON 에 없다.
+        "test /spec/replicas = 0" 은 경로가 없어 항상 실패해, 10/11 DEV_MOUNTAIN 에서
+        포화 끝에 replicas 가 0 이 된 뒤 52분 동안 공급이 멈췄다.
+        """
+        provider = self.provider()
+        # 서버가 보여 주는 그대로: replicas 가 0 이면 spec 에 키가 없다.
+        api = InMemoryPodApi({"metadata": {"resourceVersion": "41"}, "spec": {}})
+        state = {"version": "41"}
+
+        def read_scale(**kwargs):
+            replicas = api.pod["spec"].get("replicas")
+            return SimpleNamespace(
+                metadata=SimpleNamespace(resource_version=state["version"]),
+                spec=SimpleNamespace(replicas=replicas),
+            )
+
+        provider.apps_v1 = SimpleNamespace(
+            api_client=api, read_namespaced_deployment_scale=read_scale
+        )
+        self.assertTrue(provider.raise_deployment_replicas("compute-general", 0, 6))
+        self.assertEqual(api.pod["spec"]["replicas"], 6)
+
+        # 읽은 뒤 누가 바꿔 버전이 달라졌으면 쓰지 않는다(CAS).
+        api.pod = {"metadata": {"resourceVersion": "42"}, "spec": {}}
+        state["version"] = "41"   # 낡은 읽기
+        self.assertFalse(provider.raise_deployment_replicas("compute-general", 0, 6))
+        self.assertNotIn("replicas", api.pod["spec"])
+
+        # 읽어 보니 이미 0 이 아니면(그사이 올라감) 쓰지 않는다.
+        api.pod = {"metadata": {"resourceVersion": "43"}, "spec": {"replicas": 2}}
+        state["version"] = "43"
+        calls = len(api.calls)
+        self.assertFalse(provider.raise_deployment_replicas("compute-general", 0, 6))
+        self.assertEqual(len(api.calls), calls)
+        self.assertEqual(api.pod["spec"]["replicas"], 2)
 
     def test_manifest_rollout_and_deletion_cost_contract(self):
         provider = self.provider()
