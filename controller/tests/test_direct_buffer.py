@@ -529,6 +529,17 @@ class SimAllocator(ComputeAllocator):
         return {"status": "assigned"}
 
 
+class HoldAllocator(SimAllocator):
+    """세션이 끝나지 않는 할당(자리를 계속 쥔다). 할당 직후 상태를 보는 테스트용."""
+
+    def _execute_allocated_ticket(self, ticket):
+        world = self.provider.world
+        with world.mu:
+            world.tickets[ticket["ticket_id"]]["status"] = "assigned"
+            world.assignments.setdefault(ticket["compute_pod"], []).append(ticket["ticket_id"])
+        return {"status": "assigned"}
+
+
 def make(world: World, create_latency: float = 0.0):
     provider = FakeProvider(world, create_latency=create_latency)
     queues = FakeQueues(world)
@@ -578,7 +589,8 @@ def pod_event(status):
 class DirectDrainTests(unittest.TestCase):
     def test_each_ticket_gets_its_own_new_pod(self):
         world = World(capacity=5)
-        provider, queues, tickets, allocator, reconciler = make(world)
+        provider, queues, tickets, _, reconciler = make(world)
+        allocator = HoldAllocator(provider, queues, tickets)
         world.enqueue(2)
         with run_detached_threads_inline():
             result = allocator.drain_wait_queue_for_type(CT, no_stale)
@@ -586,6 +598,7 @@ class DirectDrainTests(unittest.TestCase):
         self.assertEqual(world.created["request"], 2)
         for ticket_id in ("t0001", "t0002"):
             self.assertEqual(world.tickets[ticket_id]["status"], "assigned")
+        self.assertEqual(sorted(len(owners) for owners in world.assignments.values()), [1, 1])
         # 예약은 목록에 보일 때까지 남고, 리더가 목록에서 보면 뺀다.
         self.assertEqual(len(world.pending), 2)
         reconciler.reconcile_type(CT)
@@ -594,7 +607,8 @@ class DirectDrainTests(unittest.TestCase):
     def test_listed_reservation_does_not_outlive_its_pod(self):
         """세션이 끝나 파드가 사라진 뒤 남은 예약이 자리를 쥐지 않는다(리더가 목록에서 보고 뺐다)."""
         world = World(capacity=1)
-        provider, queues, tickets, allocator, reconciler = make(world)
+        provider, queues, tickets, _, reconciler = make(world)
+        allocator = HoldAllocator(provider, queues, tickets)
         world.enqueue(1)
         with run_detached_threads_inline():
             allocator.drain_wait_queue_for_type(CT, no_stale)
