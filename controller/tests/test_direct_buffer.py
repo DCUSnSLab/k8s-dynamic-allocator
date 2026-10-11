@@ -757,14 +757,19 @@ class DirectDrainTests(unittest.TestCase):
         provider, queues, tickets, allocator, _ = make(world)
         world.enqueue(1)
         original_add = queues.add_pending_create
+        cancelled = []
 
-        def cancel_then_add(compute_type, name):
+        def cancel_then_add(compute_type, name, kind):
             world.cancel("t0001")
-            original_add(compute_type, name)
+            cancelled.append(name)
+            original_add(compute_type, name, kind)
 
         queues.add_pending_create = cancel_then_add
         with run_detached_threads_inline():
             allocator.drain_wait_queue_for_type(CT, no_stale)
+        # 취소가 실제로 일어났고(가짜가 불렸고), 그 몫으로 만들지 않았고, 자리도 돌려줬다.
+        self.assertEqual(len(cancelled), 1)
+        self.assertEqual(world.tickets["t0001"]["status"], "cancelled")
         self.assertEqual(world.created["request"], 0)
         self.assertEqual(world.pending, {})
 
