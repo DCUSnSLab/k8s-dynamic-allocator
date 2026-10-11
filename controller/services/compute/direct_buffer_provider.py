@@ -506,12 +506,11 @@ class DirectBufferProvider(KubernetesClient):
     # ------------------------------------------------------------------ 기타
 
     def drain_buffer_deployments(self) -> int:
-        """남아 있는 Deployment 버퍼(develop 의 warm_buffer arm)를 0 으로 내린다.
+        """다른 arm(develop, reuse)의 compute Deployment 가 있으면 0 으로 내린다.
 
-        이 arm 은 그 파드를 할당하지 않는다. 그대로 두면 노드 자원을 쥔 채 이 run 의
-        점유량에 섞인다. 모드 전환 때 이전 리더가 몇 초 더 살아 다시 올릴 수 있어
-        리더 조정이 주기적으로 다시 확인한다(cold start 와 같은 이유).
-        Deployment 자체는 지우지 않는다 - develop arm 으로 돌아갈 때 그대로 쓴다.
+        이 arm 은 Deployment 를 쓰지 않으므로 배포와 실험 스크립트가 지운다. 그래도 arm
+        전환 때 이전 컨트롤러가 몇 초 더 살아 다시 만들 수 있어, 리더가 주기적으로
+        확인해 그 파드가 노드 자원과 N 을 쥐지 못하게 한다. 지우는 것은 배포 쪽 일이다.
         """
         scaled = 0
         deployments = self.apps_v1.list_namespaced_deployment(

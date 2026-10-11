@@ -183,7 +183,9 @@ class World:
 
     # 파드
     def live(self) -> List[Dict]:
-        return [p for p in self.pods.values() if not p["terminating"]]
+        # 다른 스레드가 파드를 넣고 빼므로 잠금 안에서 복사한다.
+        with self.mu:
+            return [dict(p) for p in self.pods.values() if not p["terminating"]]
 
     def add_pod(self, name: str, status: str, annotations: Dict, *, ready: bool = False,
                 age_seconds: float = 0.0, not_ready_since: Optional[datetime] = None) -> Dict:
@@ -1075,6 +1077,19 @@ class DirectConcurrencyTests(unittest.TestCase):
         ids: List[str] = []
         cancelled = set()
         try:
+            # 실험처럼 R 개가 Ready 로 준비된 상태에서 시작한다. 요청을 바로 몰아넣으면
+            # 첫 바퀴보다 대기가 먼저 생기고, 이 부하(N 을 내내 넘는 몰림)에서는 대기가
+            # 끝까지 비지 않아 설계대로 미리 만들기가 한 번도 일어나지 않는다. 그러면
+            # "미리 만든 파드를 썼나" 가 시작 타이밍에 따라 갈렸다(스레드 전환을 잦게 하면
+            # 40회 중 26회 실패로 재현).
+            initial = min(reserve, capacity or 0)
+            self.assertTrue(
+                wait_until(
+                    lambda: sum(1 for p in world.live() if p["buffer_status"] == "idle" and p["ready"]) >= initial,
+                    timeout=5.0,
+                ),
+                "시작 전 idle 이 Ready 로 준비되지 않았다",
+            )
             remaining = tickets_total
             while remaining > 0:
                 burst = min(remaining, random.choice([1, 1, 2, 5, 8]))
@@ -1165,7 +1180,7 @@ class DirectDeployContractTests(unittest.TestCase):
         # Deployment 버퍼를 되살리거나 정책을 거기에 싣지 않는다.
         self.assertNotIn("kubectl annotate deployment/compute-general", script)
         self.assertNotIn("kubectl patch deployment/compute-general", script)
-        self.assertIn("kubectl scale deployment/compute-general", script)
+        self.assertIn("kubectl delete deployment -l app=compute-pod", script)
 
     def test_controller_manifest_names_the_arm_and_has_no_policy_switch(self):
         documents = self._load_yaml("deploy/base/controller.yaml")

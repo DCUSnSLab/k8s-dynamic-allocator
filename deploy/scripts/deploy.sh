@@ -238,12 +238,10 @@ kubectl set env deployment/controller -n "${namespace}" \
 kubectl rollout status deployment/controller \
     -n "${namespace}" --timeout=5m
 
-# develop arm 의 Deployment 버퍼가 남아 있으면 0 으로 내린다. 지우지는 않는다 -
-# develop 으로 되돌릴 때 그대로 쓴다. 리더도 시작할 때와 주기적으로 같은 일을 하므로,
-# 이 계정에 scale 권한이 없어 실패해도 배포를 멈추지 않는다.
-if kubectl get deployment/compute-general -n "${namespace}" >/dev/null 2>&1; then
-    kubectl scale deployment/compute-general -n "${namespace}" --replicas=0 || echo '[Warning] could not scale compute-general to 0; the controller leader will'
-fi
+# 이 arm 은 compute Deployment 를 쓰지 않는다. 다른 arm(develop, reuse)이 남긴 것이
+# 있으면 지운다 - 남겨 두면 그 파드가 노드 자원과 N 을 쥔다. 컨트롤러 리더도 남은
+# 것을 발견하면 0 으로 내린다. 이 계정에 지울 권한이 없어도 배포는 멈추지 않는다.
+kubectl delete deployment -l app=compute-pod -n "${namespace}" --ignore-not-found || echo '[Warning] could not delete the compute Deployment; the controller leader scales it to 0'
 
 echo '[Smoke] Wait for the direct warm buffer to report its policy'
 attempt=0
