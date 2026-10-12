@@ -84,6 +84,13 @@ spec:
           args: ["python3 ./kubessh/app.py --KubeSSH.config_file=kda_config.py"]
           tty: true
           stdin: true
+          # 세션마다 띄우는 kubectl(Go)은 기본으로 노드 코어 수(40)만큼 스레드를 쓴다.
+          # CPU 한도 안에서는 그 스레드들이 서로 다투기만 해서, 실측으로 1 로 묶으면
+          # kubectl exec 한 번의 CPU 가 0.29 -> 0.14 초, 걸린 시간이 0.32 -> 0.21 초로 준다.
+          # 파이썬 게이트웨이 자체에는 영향이 없다. overlay 의 env 와는 이름으로 합쳐진다.
+          env:
+            - name: GOMAXPROCS
+              value: "1"
           ports:
             - name: ssh
               containerPort: 8022
@@ -105,13 +112,19 @@ spec:
           # held. About 20Mi per session over an 84Mi base, and the worst case
           # here is 100 users x 3 concurrent over 7 Pods, so 2Gi leaves room for
           # that plus the load a failed Pod hands to the survivors.
+          # CPU 는 평균이 아니라 세션 시작 순간에 막혔다. 2026-10-12 확인 run 15 회에서
+          # 파드당 사용은 30 초 최대 0.25 코어인데 600m 한도로 실행 주기의 15~33% 가
+          # throttle 됐다. 순간 사용의 주인은 세션마다 띄우는 kubectl 이다. 위의
+          # GOMAXPROCS=1 로 kubectl 한 번이 1 코어를 넘지 않게 묶고 한도를 1 코어로 두면
+          # 같은 10 분 확인 run 에서 throttle 이 14.7% -> 0.8%, 게이트웨이 CPU 합이
+          # 130 -> 85 코어초로 준다. 요청은 관측된 파드당 최대 0.25 코어에 맞춘다.
           resources:
             requests:
               memory: "512Mi"
-              cpu: "500m"
+              cpu: "250m"
             limits:
               memory: "2Gi"
-              cpu: "600m"
+              cpu: "1"
 ---
 apiVersion: v1
 kind: Service
