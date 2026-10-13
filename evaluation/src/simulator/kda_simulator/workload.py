@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import math
 import random
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .config import (
     EXECUTION_MODE_BASELINE_DIRECT,
@@ -12,6 +13,7 @@ from .config import (
     RUN_COMMAND,
     CommandItem,
     CommandsConfig,
+    JobLengthConfig,
 )
 
 
@@ -23,6 +25,8 @@ class SelectedCommand:
     name: str
     command: str
     remote_command: str
+    # 이 요청의 작업 길이(1 코어 기준 초). 작업 길이를 쓰지 않는 실행은 None.
+    work_seconds: float | None = None
 
 
 class WeightedCommandSelector:
@@ -31,15 +35,23 @@ class WeightedCommandSelector:
         config: CommandsConfig,
         rng: random.Random,
         execution_mode: str = EXECUTION_MODE_KDA,
+        job_length: JobLengthConfig | None = None,
     ) -> None:
         self._config = config
         self._rng = rng
         self._execution_mode = execution_mode
+        self._job_length = job_length
         self._items = list(config.items)
         self._weights = [item.weight for item in self._items]
 
     def choose(self, request_id: str) -> SelectedCommand:
         item = self._rng.choices(self._items, weights=self._weights, k=1)[0]
+        work_seconds = None
+        if self._job_length is not None:
+            # 명령 종류를 고른 뒤 같은 rng 로 길이를 뽑는다. seed 가 같으면 모든 비교군이
+            # 같은 길이를 받는다.
+            work_seconds = draw_work_seconds(self._job_length, self._rng)
+            item = replace(item, command=render_job(item, self._job_length, work_seconds))
         return SelectedCommand(
             name=item.name,
             command=item.command,
@@ -49,7 +61,27 @@ class WeightedCommandSelector:
                 request_id,
                 self._execution_mode,
             ),
+            work_seconds=work_seconds,
         )
+
+
+def draw_work_seconds(job: JobLengthConfig, rng: random.Random) -> float:
+    """잘린 로그정규에서 작업 길이(초)를 뽑는다. 상한을 넘으면 버리고 다시 뽑는다."""
+    mu = math.log(job.median_seconds)
+    while True:
+        value = rng.lognormvariate(mu, job.sigma)
+        if value <= job.cap_seconds:
+            return round(value, 3)
+
+
+def render_job(item: CommandItem, job: JobLengthConfig, work_seconds: float) -> str:
+    """명령 틀의 {units}(일의 양)와 {limit}(실행 시간 제한, 초)을 채운다.
+
+    str.format 을 쓰지 않는다 - 파이썬 코드 안의 다른 중괄호를 건드리지 않게.
+    """
+    units = max(1, round(work_seconds * float(item.units_per_second or 0)))
+    limit = math.ceil(work_seconds * job.time_limit_factor + job.time_limit_slack_seconds)
+    return item.command.replace("{units}", str(units)).replace("{limit}", str(limit))
 
 
 def sanitize_id(value: str) -> str:

@@ -140,11 +140,31 @@ class CommandItem:
     name: str
     weight: float
     command: str
+    # 작업 길이를 쓰는 실행에서 1 코어 1 초에 해내는 일의 양(보정 run 측정값).
+    # command 의 {units} 가 작업 길이 x 이 값으로, {limit} 이 실행 시간 제한(초)으로 바뀐다.
+    units_per_second: float | None = None
 
 
 @dataclass
 class CommandsConfig:
     items: list[CommandItem]
+
+
+@dataclass
+class JobLengthConfig:
+    """요청마다 다른 작업 길이(1 코어 기준 초). 비우면 명령이 정한 대로 돈다.
+
+    로그정규(median_seconds, sigma)에서 뽑고 cap_seconds 를 넘으면 다시 뽑는다(잘린 분포).
+    값은 운영 데이터에서 실험 설정을 만들 때 정해 넣는다 - 여기서 고르지 않는다.
+    실행 시간 제한은 작업 길이 x time_limit_factor + time_limit_slack_seconds 이고,
+    대기열에서 기다린 시간은 세지 않는다(작업 프로세스 안에서 건다).
+    """
+
+    median_seconds: float
+    sigma: float
+    cap_seconds: float
+    time_limit_factor: float
+    time_limit_slack_seconds: float
 
 
 @dataclass
@@ -202,6 +222,7 @@ class SimulatorConfig:
     execution: ExecutionConfig
     idle_culling: IdleCullingConfig
     output: OutputConfig
+    job_length: JobLengthConfig | None = None
 
     def user_names(self) -> list[str]:
         return [f"{self.users.prefix}{idx}" for idx in range(1, self.users.count + 1)]
@@ -240,6 +261,7 @@ def load_config(path: str | Path) -> SimulatorConfig:
             "execution",
             "idle_culling",
             "output",
+            "job_length",
         },
     )
 
@@ -256,6 +278,7 @@ def load_config(path: str | Path) -> SimulatorConfig:
         execution=_load_execution(_optional_section(data, "execution")),
         idle_culling=_load_idle_culling(_optional_section(data, "idle_culling")),
         output=_load_output(_required_section(data, "output")),
+        job_length=_load_job_length(_optional_section(data, "job_length")),
     )
     validate_config(config)
     return config
@@ -470,7 +493,9 @@ def _load_commands(data: dict[str, Any]) -> CommandsConfig:
     items: list[CommandItem] = []
     for index, raw_item in enumerate(raw_items):
         item = _mapping(raw_item, f"commands.items[{index}]")
-        _ensure_allowed(f"commands.items[{index}]", item, {"name", "weight", "command"})
+        _ensure_allowed(
+            f"commands.items[{index}]", item, {"name", "weight", "command", "units_per_second"}
+        )
         items.append(
             CommandItem(
                 name=str(_required_value(item, "name", f"commands.items[{index}]")),
@@ -478,9 +503,23 @@ def _load_commands(data: dict[str, Any]) -> CommandsConfig:
                 command=str(
                     _required_value(item, "command", f"commands.items[{index}]")
                 ),
+                units_per_second=_optional_float(
+                    item.get("units_per_second"), f"commands.items[{index}].units_per_second"
+                ),
             )
         )
     return CommandsConfig(items=items)
+
+
+def _load_job_length(data: dict[str, Any]) -> JobLengthConfig | None:
+    if not data:
+        return None
+    fields = {
+        "median_seconds", "sigma", "cap_seconds", "time_limit_factor", "time_limit_slack_seconds"
+    }
+    _ensure_allowed("job_length", data, fields)
+    values = {name: float(_required_value(data, name, "job_length")) for name in sorted(fields)}
+    return JobLengthConfig(**values)
 
 
 def _load_background_activity(data: dict[str, Any]) -> BackgroundActivityConfig:
@@ -629,6 +668,23 @@ def validate_config(config: SimulatorConfig) -> None:
         raise ValueError("commands.items must contain at least one command")
     if any(item.weight <= 0 for item in config.commands.items):
         raise ValueError("Every command weight must be positive")
+    job = config.job_length
+    if job is not None:
+        if job.median_seconds <= 0 or job.sigma <= 0:
+            raise ValueError("job_length.median_seconds and job_length.sigma must be positive")
+        if job.cap_seconds < job.median_seconds:
+            raise ValueError("job_length.cap_seconds must not be below the median")
+        if job.time_limit_factor < 1 or job.time_limit_slack_seconds < 0:
+            raise ValueError("job_length.time_limit_factor must be >= 1 and the slack >= 0")
+        for item in config.commands.items:
+            if not item.units_per_second or item.units_per_second <= 0:
+                raise ValueError(
+                    f"commands item {item.name} needs a positive units_per_second with job_length"
+                )
+            if "{units}" not in item.command or "{limit}" not in item.command:
+                raise ValueError(
+                    f"commands item {item.name} must use {{units}} and {{limit}} with job_length"
+                )
     if config.background_activity.enabled:
         if config.background_activity.memory_mb < 0:
             raise ValueError("background_activity.memory_mb must be non-negative")

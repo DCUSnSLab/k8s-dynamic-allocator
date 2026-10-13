@@ -17,7 +17,10 @@ TRACE_COLUMNS = [
     "username",
     "command_name",
     "command",
+    "work_seconds",
 ]
+# 작업 길이를 쓰기 전에 만든 trace 에는 이 열이 없다.
+OPTIONAL_TRACE_COLUMNS = {"work_seconds"}
 
 
 @dataclass(frozen=True)
@@ -27,6 +30,7 @@ class TraceEntry:
     username: str
     command_name: str
     command: str
+    work_seconds: float | None = None
 
 
 def generate_trace_entries(
@@ -48,6 +52,7 @@ def generate_trace_entries(
                 username=scheduled.username,
                 command_name=command.name,
                 command=command.command,
+                work_seconds=command.work_seconds,
             )
         )
     return entries
@@ -58,7 +63,7 @@ def read_trace_csv(path: str | Path) -> list[TraceEntry]:
     entries: list[TraceEntry] = []
     with path.open("r", encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh)
-        missing = sorted(set(TRACE_COLUMNS) - set(reader.fieldnames or []))
+        missing = sorted(set(TRACE_COLUMNS) - OPTIONAL_TRACE_COLUMNS - set(reader.fieldnames or []))
         if missing:
             raise ValueError(f"trace file is missing column(s): {', '.join(missing)}")
         for row_number, row in enumerate(reader, start=2):
@@ -70,6 +75,9 @@ def read_trace_csv(path: str | Path) -> list[TraceEntry]:
                         username=str(row["username"]),
                         command_name=str(row["command_name"]),
                         command=str(row["command"]),
+                        work_seconds=(
+                            float(row["work_seconds"]) if row.get("work_seconds") else None
+                        ),
                     )
                 )
             except (TypeError, ValueError) as exc:
@@ -92,6 +100,9 @@ def write_trace_csv(path: str | Path, entries: Iterable[TraceEntry]) -> int:
                     "username": entry.username,
                     "command_name": entry.command_name,
                     "command": entry.command,
+                    "work_seconds": (
+                        "" if entry.work_seconds is None else f"{entry.work_seconds:.3f}"
+                    ),
                 }
             )
             count += 1

@@ -76,7 +76,9 @@ async def main() -> None:
     validate_config(config)
 
     rng = random.Random(config.workload.random_seed)
-    selector = WeightedCommandSelector(config.commands, rng, config.execution.mode)
+    selector = WeightedCommandSelector(
+        config.commands, rng, config.execution.mode, config.job_length
+    )
 
     trace_file = args.trace_file or config.workload.trace_file
     if args.export_trace:
@@ -197,6 +199,7 @@ def build_request_plan_from_trace(
             request_id,
             config.execution.mode,
         ),
+        work_seconds=item.work_seconds,
     )
     return {
         "request_id": request_id,
@@ -506,6 +509,9 @@ async def run_simulation(
             "capacity_slots": config.workload.capacity_slots,
             "slot_seconds": config.workload.slot_seconds,
             "plan": config.workload.piecewise_plan or None,
+            "job_length": (
+                config.job_length.__dict__ if config.job_length is not None else None
+            ),
         },
         "execution": config.execution.__dict__,
         "background_activity": config.background_activity.__dict__,
@@ -648,6 +654,10 @@ async def execute_request(
         "finished_at": finished_at,
         "command_name": command.name,
         "command": command.command,
+        # 이 요청의 작업 길이(1 코어 기준 초). 실제 실행 시간은 stdout 의 KDA_JOB work_s.
+        "work_seconds": command.work_seconds,
+        # 작업 프로세스 안의 실행 시간 제한(signal.alarm)에 걸려 끝났다. SIGALRM 이라 종료 코드 128+14.
+        "job_time_limited": command.work_seconds is not None and result.exit_status == JOB_TIME_LIMIT_EXIT,
         "remote_command": command.remote_command,
         "execution_mode": config.execution.mode,
         "status": status,
@@ -694,6 +704,9 @@ async def execute_request(
             result.discarded_output)[-config.output.command_output_chars:]
     summary.add(record)
     await writer.write(record)
+
+
+JOB_TIME_LIMIT_EXIT = 142
 
 
 def span_ms(start_ms: float | None, end_ms: float | None) -> float | None:
