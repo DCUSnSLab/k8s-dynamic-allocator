@@ -492,6 +492,13 @@ def build_pod_lives(records: Iterable[dict[str, Any]], run_end: datetime) -> lis
             close_span(life, life.deleting_at)
 
     first_snapshot = True
+    # 목록(SNAPSHOT)을 받은 뒤 감시가 붙기까지 1~2 초 틈이 있고, 그 사이 지워진 파드는 DELETED 가
+    # 오지 않는다. 감시는 약 30 분마다 다시 붙으므로 다음 목록에서야 없어진 것을 알게 되는데,
+    # 그 시각으로 닫으면 30 분 동안 살아 있던 것으로 세진다(10/13 COLD_WAVE 에서 상한 40 을 넘은 것처럼 보였다).
+    # 마지막으로 본 곳이 목록이고 그 뒤 감시 이벤트가 있었다면, 그 목록 뒤 첫 감시 이벤트 전에 지워진 것이다.
+    last_seen_in_snapshot: dict[str, datetime] = {}
+    first_watch_after: dict[datetime, datetime] = {}
+    snapshot_at: datetime | None = None
     for record in sorted(records, key=lambda item: item["observed_at"]):
         at = _parse_time(record["observed_at"])
         if record["type"] == "SNAPSHOT":
@@ -499,12 +506,18 @@ def build_pod_lives(records: Iterable[dict[str, Any]], run_end: datetime) -> lis
             for pod in record["pods"]:
                 observe(pod, at, preexisting=first_snapshot)
                 present.add(pod["uid"])
+                last_seen_in_snapshot[pod["uid"]] = at
             first_snapshot = False
             # Deleted while the watch was reconnecting.
             for uid, life in lives.items():
                 if uid not in present:
-                    gone(life, at)
+                    seen = last_seen_in_snapshot.get(uid)
+                    gone(life, first_watch_after.get(seen, at) if seen else at)
+            snapshot_at = at
         elif record.get("pod"):
+            if snapshot_at is not None:
+                first_watch_after.setdefault(snapshot_at, at)
+            last_seen_in_snapshot.pop(record["pod"]["uid"], None)
             life = observe(record["pod"], at)
             if record["type"] == "DELETED":
                 gone(life, at)

@@ -21,6 +21,8 @@ from .config import KUBERNETES_NAMESPACE
 
 RECONNECT_DELAY_SECONDS = 2.0
 STOP_GRACE_SECONDS = 10.0
+# 감시 프로세스를 띄운 뒤 apiserver 에 감시가 붙기를 기다리는 여유. 틈을 메우는 두 번째 목록용이다.
+GAP_SNAPSHOT_DELAY_SECONDS = 5.0
 STREAM_LIMIT_BYTES = 16 * 1024 * 1024
 QUANTITY_RE = re.compile(r"^([0-9.]+)([A-Za-z]*)$")
 MEMORY_UNITS = {
@@ -78,7 +80,14 @@ class PodRecorder:
                 await self._snapshot()
                 if self._stopping:
                     return
-                await self._watch()
+                # 목록을 받은 뒤 감시가 붙기까지의 틈에 지워진 파드는 DELETED 가 오지 않는다.
+                # 감시가 붙은 뒤 목록을 한 번 더 받아, 그 틈에 사라진 파드를 다음 재연결(약 30 분 뒤)까지
+                # 끌고 가지 않게 한다.
+                watch = asyncio.create_task(self._watch())
+                await asyncio.sleep(GAP_SNAPSHOT_DELAY_SECONDS)
+                if not watch.done() and not self._stopping:
+                    await self._snapshot()
+                await watch
             except FileNotFoundError:
                 print("Pod recording disabled: kubectl not found")
                 self._disabled = True
