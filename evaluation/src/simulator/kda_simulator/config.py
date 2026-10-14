@@ -54,7 +54,6 @@ KUBERNETES_NAMESPACE = "kda-test"
 SETUP_MAX_INFLIGHT = 10
 WARMUP_MAX_ATTEMPTS = 6
 WARMUP_RETRY_DELAY_SECONDS = 15.0
-PER_USER_MAX_INFLIGHT = 1
 CONNECT_TIMEOUT_SECONDS = 30.0
 # A dead connection is otherwise noticed only when TCP gives up, minutes later.
 SSH_KEEPALIVE_INTERVAL_SECONDS = 15.0
@@ -99,9 +98,11 @@ class SSHConfig:
 class UsersConfig:
     prefix: str
     count: int
-    # How many commands one user may have running at the same time. The
-    # controller places no per-user limit, so this only shapes the load.
-    max_concurrent_requests: int = PER_USER_MAX_INFLIGHT
+    # 한 사용자가 동시에 진행 중일 수 있는 요청 수(보냈고 아직 끝나지 않은 것).
+    # 보낼 차례인 사용자가 이미 상한이면 진행 중 요청이 상한보다 적은 다른 사용자에게
+    # 보낸다(요청 시각·작업은 그대로라 부하는 줄지 않는다). 컨트롤러에는 사용자 제한이
+    # 없으므로 이것은 사용자 행동의 가정이다. 비우면 제한하지 않는다.
+    max_concurrent_requests: int | None = None
 
 
 @dataclass
@@ -316,8 +317,7 @@ def _load_users(data: dict[str, Any]) -> UsersConfig:
         count=int(_required_value(data, "count", "users")),
         max_concurrent_requests=_optional_int(
             data.get("max_concurrent_requests"), "users.max_concurrent_requests"
-        )
-        or PER_USER_MAX_INFLIGHT,
+        ),
     )
 
 
@@ -632,8 +632,9 @@ def validate_config(config: SimulatorConfig) -> None:
         raise ValueError("ssh.port must be a positive integer")
     if config.users.count <= 0:
         raise ValueError("users.count must be positive")
-    if config.users.max_concurrent_requests <= 0:
-        raise ValueError("users.max_concurrent_requests must be positive")
+    limit = config.users.max_concurrent_requests
+    if limit is not None and limit <= 0:
+        raise ValueError("users.max_concurrent_requests must be positive or null")
     if config.workload.lambda_scope not in {"system", "per_user"}:
         raise ValueError("workload.lambda_scope must be 'system' or 'per_user'")
     if config.workload.duration_minutes is not None and config.workload.duration_minutes <= 0:

@@ -30,7 +30,7 @@ from .config import (
     validate_config,
 )
 from .metrics import AsyncJsonlWriter, SummaryCollector
-from .scheduler import ScheduledRequest, iter_schedule
+from .scheduler import ScheduledRequest, UserConcurrencyLimiter, iter_schedule
 from .trace import (
     TraceEntry,
     generate_trace_entries,
@@ -409,6 +409,13 @@ async def run_simulation(
         # 300 은 안정적이었고 587 에서 swlabssh 가 전부 OOM 으로 죽었다.
         global_sem = _Unlimited()
         last_offset = 0.0
+        # 사용자당 동시 요청 상한. 고른 사용자가 이미 상한이면 다른 사용자에게 보낸다.
+        # 바꿀 사용자를 고르는 rng 는 도착·작업을 뽑은 rng 와 따로 둔다(같은 seed 면 같은 순서).
+        limiter = UserConcurrencyLimiter(
+            config.user_names(),
+            config.users.max_concurrent_requests,
+            random.Random(f"{config.workload.random_seed}-user-limit"),
+        )
 
         for plan in request_plans:
             last_offset = max(last_offset, float(plan["planned_offset_seconds"]))
@@ -416,6 +423,13 @@ async def run_simulation(
             sleep_for = target_mono - time.monotonic()
             if sleep_for > 0:
                 await asyncio.sleep(sleep_for)
+            user, substituted, overflow = limiter.pick(plan["username"])
+            if substituted:
+                summary.user_substituted += 1
+                summary.user_limit_overflow += int(overflow)
+                plan = {**plan, "planned_username": plan["username"], "username": user,
+                        "user_limit_overflow": overflow}
+            limiter.started(user)
             tasks.append(
                 asyncio.create_task(
                     execute_request(
@@ -432,6 +446,7 @@ async def run_simulation(
                     )
                 )
             )
+            tasks[-1].add_done_callback(lambda _task, user=user: limiter.finished(user))
             task_request_ids[tasks[-1]] = plan["request_id"]
 
         if tasks:
@@ -649,6 +664,9 @@ async def execute_request(
         "request_id": plan["request_id"],
         "sequence": plan["sequence"],
         "username": plan["username"],
+        # 사용자당 동시 요청 상한 때문에 다른 사용자에게 보냈으면 원래 계획된 사용자.
+        "planned_username": plan.get("planned_username"),
+        "user_limit_overflow": plan.get("user_limit_overflow", False),
         "planned_offset_seconds": plan["planned_offset_seconds"],
         "started_at": started_at,
         "finished_at": finished_at,

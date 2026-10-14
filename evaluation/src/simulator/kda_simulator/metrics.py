@@ -54,6 +54,9 @@ class SummaryCollector:
     resume_latency_ms: list[float] = field(default_factory=list)
     background_restore_ms: list[float] = field(default_factory=list)
     ticket_missing: int = 0
+    # 사용자당 동시 요청 상한으로 다른 사용자에게 보낸 요청 수, 그중 모두 상한이었던 수.
+    user_substituted: int = 0
+    user_limit_overflow: int = 0
     allocation_missing: int = 0
     ssh_retried: int = 0
     by_command_status: dict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
@@ -95,6 +98,8 @@ class SummaryCollector:
     def to_dict(self) -> dict[str, Any]:
         return {
             "total": self.total,
+            "user_substituted": self.user_substituted,
+            "user_limit_overflow": self.user_limit_overflow,
             "status_counts": dict(self.status_counts),
             "command_counts": dict(self.command_counts),
             "by_command_status": {

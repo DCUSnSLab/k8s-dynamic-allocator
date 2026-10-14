@@ -57,6 +57,41 @@ def _iter_piecewise_schedule(config: SimulatorConfig, rng: random.Random) -> Ite
                 return
 
 
+class UserConcurrencyLimiter:
+    """보내는 순간 사용자별 진행 중 요청(보냈고 아직 끝나지 않은 것)을 세어 상한을 지킨다.
+
+    계획된 사용자가 이미 상한이면 진행 중 요청이 상한보다 적은 사용자 중에서 무작위로
+    고른다. 요청 시각·작업은 바꾸지 않으므로 부하는 그대로다. 모두 상한이면(사용자 수 x
+    상한보다 진행 중 요청이 많을 때) 가장 적은 사용자에게 보내고 overflow 로 알린다.
+    어느 사용자가 받는지는 비교군의 완료 시각에 따라 달라질 수 있다.
+    """
+
+    def __init__(self, users: list[str], limit: int | None, rng: random.Random) -> None:
+        self._users = list(users)
+        self._limit = limit
+        self._rng = rng
+        self._inflight = {user: 0 for user in self._users}
+
+    def pick(self, planned: str) -> tuple[str, bool, bool]:
+        """(보낼 사용자, 다른 사용자로 바꿨나, 모두 상한이었나)"""
+        if self._limit is None or self._inflight.get(planned, 0) < self._limit:
+            return planned, False, False
+        free = [user for user in self._users if self._inflight[user] < self._limit]
+        if free:
+            return self._rng.choice(free), True, False
+        least = min(self._inflight.values())
+        return self._rng.choice([u for u in self._users if self._inflight[u] == least]), True, True
+
+    def started(self, user: str) -> None:
+        self._inflight[user] = self._inflight.get(user, 0) + 1
+
+    def finished(self, user: str) -> None:
+        self._inflight[user] = max(0, self._inflight.get(user, 0) - 1)
+
+    def inflight(self, user: str) -> int:
+        return self._inflight.get(user, 0)
+
+
 def _apply_scope(config: SimulatorConfig, lambda_per_minute: float) -> float:
     if config.workload.lambda_scope == "per_user":
         return lambda_per_minute * config.users.count

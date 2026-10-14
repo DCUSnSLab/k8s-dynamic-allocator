@@ -237,10 +237,8 @@ class SSHUserSession:
         self.username = username
         self._connection: asyncssh.SSHClientConnection | None = None
         self._connect_lock = asyncio.Lock()
-        # 설정값은 기록으로만 남긴다. 동시 요청 수는 더 이상 제한하지 않는다 -
-        # 열린 모델에서 부하는 λ 가 정하고, 클라이언트가 묶으면 설정한 λ 가 아니라
-        # 시스템 처리 속도가 부하를 정하게 된다.
-        self._max_concurrent = config.users.max_concurrent_requests
+        # 사용자당 동시 요청 상한은 여기서 막지 않는다(막으면 요청이 늦게 나가 설정한 λ 가
+        # 깨진다). 보내기 전에 main 의 UserConcurrencyLimiter 가 다른 사용자에게 돌린다.
         # Re-running is only safe where the command is a process in the user's own
         # pod. In kda mode it would submit a second ticket for work that may have
         # completed with only its output lost, so that case is reported instead.
